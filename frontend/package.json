@@ -2,18 +2,30 @@
   "name": "ai-dj-frontend",
   "version": "0.0.0",
   "private": true,
-  "description": "AI DJ frontend (Next.js 15, App Router)",
   "engines": {
     "node": ">=20 <21"
   },
   "scripts": {
-    "dev": "next dev",
-    "build": "next build",
+    "dev": "next dev --turbopack",
+    "build": "next build --turbopack",
     "start": "next start",
-    "lint": "next lint",
-    "test": "vitest",
-    "test:e2e": "playwright test"
+    "lint": "eslint"
   },
-  "dependencies": {},
-  "devDependencies": {}
+  "dependencies": {
+    "react": "19.1.0",
+    "react-dom": "19.1.0",
+    "next": "15.5.18",
+    "@tanstack/react-query": "^5.59.0"
+  },
+  "devDependencies": {
+    "typescript": "^5",
+    "@types/node": "^20",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "@tailwindcss/postcss": "^4",
+    "tailwindcss": "^4",
+    "eslint": "^9",
+    "eslint-config-next": "15.5.18",
+    "@eslint/eslintrc": "^3"
+  }
 }
