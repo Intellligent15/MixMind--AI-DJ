@@ -1,2 +1,22 @@
-# Placeholder. Filled in during Phase 1 (infra skeleton).
-# Dev-only overrides (volume mounts for hot-reload, exposed debug ports, etc.).
+# Dev overrides: hot-reload mounts and reload flag on the backend.
+# Use: docker compose -f docker-compose.yml -f docker-compose.dev.yml up
+
+services:
+  backend:
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+    volumes:
+      - ./backend/app:/app/app
+      - ./backend/alembic:/app/alembic
+      - ./backend/alembic.ini:/app/alembic.ini
+      - ./cache:/app/cache
+
+  frontend:
+    command: ["npm", "run", "dev"]
+    volumes:
+      - ./frontend/app:/app/app
+      - ./frontend/components:/app/components
+      - ./frontend/lib:/app/lib
+      - ./frontend/public:/app/public
+      - ./frontend/next.config.ts:/app/next.config.ts
+      - ./frontend/tsconfig.json:/app/tsconfig.json
+      - ./frontend/postcss.config.mjs:/app/postcss.config.mjs

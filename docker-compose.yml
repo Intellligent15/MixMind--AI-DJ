@@ -1,3 +1,63 @@
-# Placeholder. Filled in during Phase 1 (infra skeleton).
-# Services: postgres (16-alpine), redis (7-alpine), backend (FastAPI), frontend (Next.js).
-# The Celery worker is NOT defined here on macOS — it runs natively on the host for MPS access.
+# AI DJ — base compose stack.
+#
+# Note: the Celery worker is intentionally NOT defined here on macOS.
+# It runs natively via start-dev.sh so it can access MPS (and later rubberband-cli).
+# On a Linux host, the worker can be added to this file with no other changes.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: aidj
+      POSTGRES_PASSWORD: aidj
+      POSTGRES_DB: aidj
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aidj -d aidj"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+  backend:
+    build:
+      context: ./backend
+    environment:
+      DATABASE_URL: postgresql+psycopg://aidj:aidj@postgres:5432/aidj
+      REDIS_URL: redis://redis:6379/0
+      LOG_LEVEL: INFO
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./cache:/app/cache
+
+  frontend:
+    build:
+      context: ./frontend
+    environment:
+      # Server-side fetches from the frontend container use docker network DNS.
+      BACKEND_URL: http://backend:8000
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+
+volumes:
+  postgres_data:
