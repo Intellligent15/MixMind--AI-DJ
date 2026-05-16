@@ -1,0 +1,3 @@
+# Placeholder. Filled in during Phase 1 (infra skeleton).
+# Services: postgres (16-alpine), redis (7-alpine), backend (FastAPI), frontend (Next.js).
+# The Celery worker is NOT defined here on macOS — it runs natively on the host for MPS access.

@@ -1,0 +1,19 @@
+{
+  "name": "ai-dj-frontend",
+  "version": "0.0.0",
+  "private": true,
+  "description": "AI DJ frontend (Next.js 15, App Router)",
+  "engines": {
+    "node": ">=20 <21"
+  },
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint",
+    "test": "vitest",
+    "test:e2e": "playwright test"
+  },
+  "dependencies": {},
+  "devDependencies": {}
+}
