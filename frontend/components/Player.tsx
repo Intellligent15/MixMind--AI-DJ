@@ -57,8 +57,6 @@ export function Player() {
         const s = q.state.data;
         if (!s) return 1000;
         if (s.status === "failed") return false;
-        // Keep polling until we have at least downloaded (good enough for
-        // playback) — finer-grained statuses can change too but won't gate us.
         if (isPlayable(s) && s.status !== "downloaded") return false;
         return 1000;
       },
@@ -75,16 +73,14 @@ export function Player() {
   const [isPlaying, setIsPlaying] = useState(false);
   const [position, setPosition] = useState(0);
   const [duration, setDuration] = useState(0);
+  const [autoplayBlocked, setAutoplayBlocked] = useState(false);
 
-  const audioRef = useRef<HTMLAudioElement | null>(null);
   const waveContainerRef = useRef<HTMLDivElement | null>(null);
   const wsRef = useRef<WaveSurfer | null>(null);
 
   const current = songs[currentIdx];
   const upcoming = songs[currentIdx + 1];
 
-  // Find the next playable index from a starting point. Skips over songs
-  // whose status is failed or that haven't reached the downloaded gate.
   const findNextPlayable = useCallback(
     (from: number): number | null => {
       for (let i = from; i < songs.length; i++) {
@@ -110,47 +106,6 @@ export function Player() {
     }
   }, [songs, currentIdx, findNextPlayable]);
 
-  // Drive the audio element manually whenever the current song changes:
-  // a reactive `src=` prop on <audio> is unreliable across browsers (and
-  // doesn't always trigger a reload when WaveSurfer is wrapping the
-  // element via the `media` option). Setting .src + calling .load() then
-  // .play() guarantees the new track plays. WaveSurfer is recreated in
-  // the same effect so its waveform always matches the loaded src.
-  const currentId = current?.id;
-  const currentPlayable = current ? isPlayable(current) : false;
-  useEffect(() => {
-    const audio = audioRef.current;
-    const container = waveContainerRef.current;
-    if (!audio || !container || !currentId || !currentPlayable) return;
-
-    const newSrc = api.audioUrl(currentId);
-    if (audio.src !== newSrc) {
-      audio.src = newSrc;
-      audio.load();
-    }
-    audio.play().catch(() => {
-      // Browser autoplay policy may block us before the first user gesture;
-      // the Play button will recover.
-    });
-
-    const ws = WaveSurfer.create({
-      container,
-      waveColor: "#94a3b8",
-      progressColor: "#0ea5e9",
-      cursorColor: "#0ea5e9",
-      height: 72,
-      barWidth: 1,
-      barGap: 1,
-      barHeight: 0.6,
-      media: audio,
-    });
-    wsRef.current = ws;
-    return () => {
-      ws.destroy();
-      wsRef.current = null;
-    };
-  }, [currentId, currentPlayable]);
-
   const advance = useCallback(() => {
     const next = findNextPlayable(currentIdx + 1);
     if (next == null) {
@@ -169,12 +124,73 @@ export function Player() {
     setCurrentIdx(next);
   }, [currentIdx, findNextPlayable, songs]);
 
+  // Stash advance in a ref so the WaveSurfer effect can call it without
+  // including `advance` in its deps (which would tear down + recreate the
+  // WaveSurfer instance every time currentIdx changes, defeating the point).
+  const advanceRef = useRef(advance);
+  useEffect(() => {
+    advanceRef.current = advance;
+  }, [advance]);
+
+  // WaveSurfer is the sole audio source: its built-in MediaElement backend
+  // handles streaming + playback, and its events drive our UI state. We no
+  // longer keep a separate <audio>, which was racing with WaveSurfer's
+  // `media` option whenever the src changed.
+  const currentId = current?.id;
+  const currentPlayable = current ? isPlayable(current) : false;
+  useEffect(() => {
+    if (!waveContainerRef.current || !currentId || !currentPlayable) return;
+
+    setPosition(0);
+    setDuration(0);
+
+    const ws = WaveSurfer.create({
+      container: waveContainerRef.current,
+      waveColor: "#94a3b8",
+      progressColor: "#0ea5e9",
+      cursorColor: "#0ea5e9",
+      height: 72,
+      barWidth: 1,
+      barGap: 1,
+      barHeight: 0.6,
+      url: api.audioUrl(currentId),
+    });
+    wsRef.current = ws;
+
+    const offReady = ws.on("ready", () => {
+      setDuration(ws.getDuration());
+      // Try to autoplay. Browsers block this without a recent user gesture
+      // (which we've broken via setTimeout + router.push from /processing).
+      ws.play().then(
+        () => setAutoplayBlocked(false),
+        () => setAutoplayBlocked(true),
+      );
+    });
+    const offPlay = ws.on("play", () => {
+      setIsPlaying(true);
+      setAutoplayBlocked(false);
+    });
+    const offPause = ws.on("pause", () => setIsPlaying(false));
+    const offTime = ws.on("timeupdate", (t: number) => setPosition(t));
+    const offFinish = ws.on("finish", () => advanceRef.current());
+
+    return () => {
+      offReady();
+      offPlay();
+      offPause();
+      offTime();
+      offFinish();
+      ws.destroy();
+      wsRef.current = null;
+    };
+  }, [currentId, currentPlayable]);
+
   const togglePlay = useCallback(() => {
-    const a = audioRef.current;
-    if (!a || !current || !isPlayable(current)) return;
-    if (a.paused) a.play();
-    else a.pause();
-  }, [current]);
+    const ws = wsRef.current;
+    if (!ws) return;
+    if (ws.isPlaying()) ws.pause();
+    else ws.play().catch(() => setAutoplayBlocked(true));
+  }, []);
 
   if (queueQuery.isLoading) {
     return <p className="text-sm opacity-70">Loading…</p>;
@@ -227,16 +243,18 @@ export function Player() {
         </div>
       </section>
 
-      <div ref={waveContainerRef} className="border rounded p-2" />
-
-      <audio
-        ref={audioRef}
-        onPlay={() => setIsPlaying(true)}
-        onPause={() => setIsPlaying(false)}
-        onLoadedMetadata={(e) => setDuration(e.currentTarget.duration)}
-        onTimeUpdate={(e) => setPosition(e.currentTarget.currentTime)}
-        onEnded={advance}
-      />
+      <div className="relative">
+        <div ref={waveContainerRef} className="border rounded p-2" />
+        {autoplayBlocked && !isPlaying && (
+          <button
+            type="button"
+            onClick={togglePlay}
+            className="absolute inset-0 flex items-center justify-center rounded bg-black/40 text-white text-sm font-medium"
+          >
+            Click to start playback
+          </button>
+        )}
+      </div>
 
       <section className="flex items-center gap-4">
         <button
