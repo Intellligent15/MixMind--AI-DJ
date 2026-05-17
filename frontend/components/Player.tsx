@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import Link from "next/link";
 import { useQueries, useQuery } from "@tanstack/react-query";
 import WaveSurfer from "wavesurfer.js";
 import {
@@ -208,9 +209,9 @@ export function Player() {
     return (
       <p className="text-sm opacity-70">
         No locked queue. Build and lock one on the{" "}
-        <a href="/" className="underline">
+        <Link href="/" className="underline">
           home page
-        </a>
+        </Link>
         .
       </p>
     );
@@ -219,9 +220,9 @@ export function Player() {
     return (
       <p className="text-sm opacity-70">
         End of queue. Build a new one on the{" "}
-        <a href="/" className="underline">
+        <Link href="/" className="underline">
           home page
-        </a>
+        </Link>
         .
       </p>
     );

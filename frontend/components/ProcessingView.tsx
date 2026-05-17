@@ -1,12 +1,20 @@
 "use client";
 
-import { useEffect, useMemo } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useQueries, useQuery } from "@tanstack/react-query";
-import { api, isStatusError, type Queue, type Song, type SongStatus } from "@/lib/api";
+import {
+  api,
+  isStatusError,
+  type Queue,
+  type Song,
+  type SongStatus,
+  type Stems,
+} from "@/lib/api";
 
 // Songs at or past this point in the pipeline are considered "ready enough"
-// for the playback gate. Phase 4 only goes as far as analyzed.
+// for the playback gate. Stems aren't required for hard-cut playback.
 const PLAYABLE_STATUSES: ReadonlyArray<SongStatus> = [
   "analyzed",
   "separating",
@@ -17,19 +25,38 @@ const PLAYABLE_STATUSES: ReadonlyArray<SongStatus> = [
 // Phase 7+ will replace this gate with "first transition rendered".
 const GATE_ANALYZED = 2;
 
-const PIPELINE_STEPS: { key: SongStatus; label: string }[] = [
+// Logical pipeline progression. "separated" isn't a SongStatus — it's
+// derived from the presence of a Stems row (song.status flips back to
+// `analyzed` when the worker finishes separating).
+type PipelineStep =
+  | "pending"
+  | "downloading"
+  | "downloaded"
+  | "analyzing"
+  | "analyzed"
+  | "separating"
+  | "separated";
+
+const PIPELINE_STEPS: { key: PipelineStep; label: string }[] = [
   { key: "pending", label: "queued" },
   { key: "downloading", label: "downloading" },
   { key: "downloaded", label: "downloaded" },
   { key: "analyzing", label: "analyzing" },
   { key: "analyzed", label: "analyzed" },
+  { key: "separating", label: "separating" },
+  { key: "separated", label: "separated" },
 ];
 
-function stepIndex(status: SongStatus): number {
-  // Maps post-Phase-4 statuses back to "analyzed" so progress bars don't go
-  // backwards in Phase 5+.
+function stepIndex(status: SongStatus, hasStems: boolean): number {
   if (status === "failed") return -1;
-  if (PLAYABLE_STATUSES.includes(status)) return PIPELINE_STEPS.length - 1;
+  if (hasStems) return PIPELINE_STEPS.length - 1; // "separated"
+  if (status === "separating") {
+    return PIPELINE_STEPS.findIndex((s) => s.key === "separating");
+  }
+  // analyzed/ready without stems sit at the "analyzed" step.
+  if (status === "analyzed" || status === "ready" || status === "transcribing") {
+    return PIPELINE_STEPS.findIndex((s) => s.key === "analyzed");
+  }
   return PIPELINE_STEPS.findIndex((s) => s.key === status);
 }
 
@@ -39,6 +66,12 @@ function statusBadgeClass(status: SongStatus): string {
   if (status === "downloaded") return "bg-blue-500/20";
   return "bg-yellow-500/20";
 }
+
+// Songs whose status sits at `separating` for longer than this get a
+// yellow "worker may be down" warning. The native Celery worker is the
+// only thing that can pick up the job; if it isn't running, the message
+// just sits in Redis indefinitely.
+const SEPARATING_WARN_MS = 120_000;
 
 export function ProcessingView() {
   const router = useRouter();
@@ -78,6 +111,59 @@ export function ProcessingView() {
     [songQueries, items]
   );
 
+  // Per-song stems lookup. 404 just means "not separated yet" — surface
+  // that as a non-error null so the UI can treat it as "no stems row".
+  const stemsQueries = useQueries({
+    queries: songs.map((song) => ({
+      queryKey: ["stems", song.id],
+      queryFn: async (): Promise<Stems | null> => {
+        try {
+          return await api.getStems(song.id);
+        } catch (err) {
+          if (isStatusError(err, 404)) return null;
+          throw err;
+        }
+      },
+      retry: false,
+      // Refetch while we know separation is in flight; otherwise leave alone.
+      refetchInterval: (q: { state: { data?: Stems | null } }) => {
+        if (q.state.data) return false;
+        return song.status === "separating" ? 1500 : false;
+      },
+    })),
+  });
+
+  // Track when we first observed each song in `separating` so we can
+  // surface the "worker may be down" hint after SEPARATING_WARN_MS.
+  const separatingSinceRef = useRef<Map<string, number>>(new Map());
+  const [, forceTick] = useState(0);
+  useEffect(() => {
+    const now = Date.now();
+    let dirty = false;
+    const seen = separatingSinceRef.current;
+    for (const s of songs) {
+      if (s.status === "separating") {
+        if (!seen.has(s.id)) {
+          seen.set(s.id, now);
+          dirty = true;
+        }
+      } else if (seen.has(s.id)) {
+        seen.delete(s.id);
+        dirty = true;
+      }
+    }
+    if (dirty) forceTick((n) => n + 1);
+  }, [songs]);
+
+  // Re-render once per 5s while any song is still separating, so the
+  // warning appears even if nothing else changes.
+  useEffect(() => {
+    const anySeparating = songs.some((s) => s.status === "separating");
+    if (!anySeparating) return;
+    const t = setInterval(() => forceTick((n) => n + 1), 5000);
+    return () => clearInterval(t);
+  }, [songs]);
+
   const analyzedHeadCount = useMemo(() => {
     let n = 0;
     for (const s of songs) {
@@ -105,9 +191,9 @@ export function ProcessingView() {
     return (
       <p className="text-sm opacity-70">
         No queue exists. Start building one on the{" "}
-        <a href="/" className="underline">
+        <Link href="/" className="underline">
           home page
-        </a>
+        </Link>
         .
       </p>
     );
@@ -116,9 +202,9 @@ export function ProcessingView() {
     return (
       <p className="text-sm opacity-70">
         Queue not locked yet. Go back to{" "}
-        <a href="/" className="underline">
+        <Link href="/" className="underline">
           /
-        </a>{" "}
+        </Link>{" "}
         and click Done.
       </p>
     );
@@ -142,14 +228,22 @@ export function ProcessingView() {
 
       <ul className="flex flex-col gap-3">
         {songs.map((song, idx) => {
-          const step = stepIndex(song.status);
+          const hasStems = !!stemsQueries[idx]?.data;
+          const step = stepIndex(song.status, hasStems);
           const pct =
             step < 0
               ? 0
               : (step / (PIPELINE_STEPS.length - 1)) * 100;
+          const stepLabel =
+            step < 0 ? "failed" : PIPELINE_STEPS[step].label;
           // Queue items are unique even when the same song is queued twice;
           // fall back to a composite if the item isn't there yet.
           const key = items[idx]?.id ?? `${song.id}:${idx}`;
+          const separatingSince = separatingSinceRef.current.get(song.id);
+          const separatingStuck =
+            song.status === "separating" &&
+            separatingSince !== undefined &&
+            Date.now() - separatingSince > SEPARATING_WARN_MS;
           return (
             <li key={key} className="border rounded p-3 flex flex-col gap-2">
               <div className="flex items-center gap-3">
@@ -171,7 +265,7 @@ export function ProcessingView() {
                 <span
                   className={`text-xs px-2 py-1 rounded ${statusBadgeClass(song.status)}`}
                 >
-                  {song.status}
+                  {stepLabel}
                 </span>
               </div>
               <div className="h-1 bg-black/10 dark:bg-white/10 rounded overflow-hidden">
@@ -184,6 +278,14 @@ export function ProcessingView() {
                   style={{ width: `${song.status === "failed" ? 100 : pct}%` }}
                 />
               </div>
+              {separatingStuck && (
+                <p className="text-xs text-amber-700 dark:text-amber-400">
+                  Separation has been pending for &gt;
+                  {Math.floor(SEPARATING_WARN_MS / 1000)}s. Demucs runs on the
+                  native worker (MPS) — check that <code>./start-dev.sh</code>{" "}
+                  is running.
+                </p>
+              )}
             </li>
           );
         })}
