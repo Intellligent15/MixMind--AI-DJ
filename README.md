@@ -6,7 +6,7 @@ See [ai-dj-spec.md](ai-dj-spec.md) for the full project specification.
 
 ## Status
 
-**Phase 1 complete** — infrastructure skeleton is up. See [docs/the notes](docs/the notes) for what was built and what deviated from the spec.
+**Phase 2 complete** — YouTube search, downloads, and raw audio playback are working end-to-end. See [docs/the notes](docs/the notes). Phase 1 notes: [docs/the notes](docs/the notes).
 
 Build phases are listed in the spec under **Build Phase Order**.
 
@@ -31,9 +31,11 @@ docs/       Phase completion notes and reference docs
 Prereqs (one-time):
 
 ```bash
-brew install uv fnm docker
+brew install uv fnm docker ffmpeg
 fnm install 20
 ```
+
+`ffmpeg` is used by the native worker for the yt-dlp WAV extraction step.
 
 Then from the repo root:
 
@@ -45,8 +47,18 @@ cp .env.example .env          # stub keys are fine for Phase 1
 Verify everything is talking:
 
 ```bash
-curl localhost:8000/health    # -> {"status":"ok","db":"ok","redis":"ok"}
-open http://localhost:3000    # renders the health payload
+curl localhost:8000/health           # -> {"status":"ok","db":"ok","redis":"ok"}
+open http://localhost:3000           # search + library UI
+open http://localhost:3000/health    # backend health payload (Phase 1 smoke test)
+```
+
+Add a song from the browser, or via curl:
+
+```bash
+curl 'localhost:8000/api/search?q=daft+punk+one+more+time&limit=3'
+curl -X POST localhost:8000/api/songs -H 'content-type: application/json' \
+  -d '{"youtube_video_id":"jNQXAC9IVRw","title":"Me at the zoo",
+       "artist":"jawed","duration_seconds":19,"thumbnail_url":""}'
 ```
 
 Send a no-op task through the native worker:
