@@ -1,0 +1,174 @@
+from __future__ import annotations
+
+import uuid
+
+from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from app.api.deps import get_db
+from app.models import Queue, QueueItem, Song, SongStatus
+from app.schemas import QueueItemAdd, QueueRead, QueueReorder
+from app.workers.download import download_song
+
+router = APIRouter(prefix="/api/queues", tags=["queues"])
+
+
+QUEUE_CAP = 20
+
+
+def _compact_positions(db: Session, queue_id: uuid.UUID) -> None:
+    """Re-pack item positions to be 0..N-1 in their current order."""
+    items = list(
+        db.scalars(
+            select(QueueItem)
+            .where(QueueItem.queue_id == queue_id)
+            .order_by(QueueItem.position)
+        ).all()
+    )
+    # Two passes to avoid colliding with the (queue_id, position) unique
+    # constraint while we shuffle.
+    for idx, item in enumerate(items):
+        item.position = -1000 - idx
+    db.flush()
+    for idx, item in enumerate(items):
+        item.position = idx
+    db.flush()
+
+
+@router.post("", response_model=QueueRead, status_code=status.HTTP_201_CREATED)
+def create_queue(db: Session = Depends(get_db)) -> Queue:
+    existing_unlocked = db.scalar(
+        select(Queue).where(Queue.locked.is_(False)).order_by(Queue.created_at.desc())
+    )
+    if existing_unlocked is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="an unlocked queue already exists",
+        )
+    queue = Queue()
+    db.add(queue)
+    db.commit()
+    db.refresh(queue)
+    return queue
+
+
+@router.get("/current", response_model=QueueRead)
+def get_current_queue(db: Session = Depends(get_db)) -> Queue:
+    queue = db.scalar(
+        select(Queue).where(Queue.locked.is_(False)).order_by(Queue.created_at.desc())
+    )
+    if queue is None:
+        queue = db.scalar(select(Queue).order_by(Queue.created_at.desc()))
+    if queue is None:
+        raise HTTPException(status_code=404, detail="no queue exists")
+    return queue
+
+
+@router.get("/{queue_id}", response_model=QueueRead)
+def get_queue(queue_id: uuid.UUID, db: Session = Depends(get_db)) -> Queue:
+    queue = db.get(Queue, queue_id)
+    if queue is None:
+        raise HTTPException(status_code=404, detail="queue not found")
+    return queue
+
+
+@router.post(
+    "/{queue_id}/items",
+    response_model=QueueRead,
+    status_code=status.HTTP_201_CREATED,
+)
+def add_queue_item(
+    queue_id: uuid.UUID, payload: QueueItemAdd, db: Session = Depends(get_db)
+) -> Queue:
+    queue = db.get(Queue, queue_id)
+    if queue is None:
+        raise HTTPException(status_code=404, detail="queue not found")
+    if queue.locked:
+        raise HTTPException(status_code=409, detail="queue is locked")
+
+    song = db.get(Song, payload.song_id)
+    if song is None:
+        raise HTTPException(status_code=404, detail="song not found")
+
+    current_count = len(queue.items)
+    if current_count >= QUEUE_CAP:
+        raise HTTPException(
+            status_code=409,
+            detail=f"queue is full (cap={QUEUE_CAP})",
+        )
+
+    item = QueueItem(
+        queue_id=queue_id,
+        song_id=song.id,
+        position=current_count,
+    )
+    db.add(item)
+    db.commit()
+
+    # Per spec Pipeline Flow: adding a song kicks off a low-priority download.
+    # Phase 4 ships without distinct priorities; the lock handler re-checks and
+    # only enqueues for songs not yet downloaded.
+    if song.status == SongStatus.pending:
+        download_song.delay(str(song.id))
+
+    db.refresh(queue)
+    return queue
+
+
+@router.delete(
+    "/{queue_id}/items/{item_id}",
+    response_model=QueueRead,
+)
+def remove_queue_item(
+    queue_id: uuid.UUID, item_id: uuid.UUID, db: Session = Depends(get_db)
+) -> Queue:
+    queue = db.get(Queue, queue_id)
+    if queue is None:
+        raise HTTPException(status_code=404, detail="queue not found")
+    if queue.locked:
+        raise HTTPException(status_code=409, detail="queue is locked")
+
+    item = db.get(QueueItem, item_id)
+    if item is None or item.queue_id != queue_id:
+        raise HTTPException(status_code=404, detail="queue item not found")
+
+    db.delete(item)
+    db.flush()
+    _compact_positions(db, queue_id)
+    db.commit()
+    db.refresh(queue)
+    return queue
+
+
+@router.patch(
+    "/{queue_id}/items",
+    response_model=QueueRead,
+)
+def reorder_queue_items(
+    queue_id: uuid.UUID, payload: QueueReorder, db: Session = Depends(get_db)
+) -> Queue:
+    queue = db.get(Queue, queue_id)
+    if queue is None:
+        raise HTTPException(status_code=404, detail="queue not found")
+    if queue.locked:
+        raise HTTPException(status_code=409, detail="queue is locked")
+
+    current_ids = {item.id for item in queue.items}
+    requested_ids = list(payload.ordered_item_ids)
+    if set(requested_ids) != current_ids or len(requested_ids) != len(current_ids):
+        raise HTTPException(
+            status_code=400,
+            detail="ordered_item_ids must be a permutation of the queue's items",
+        )
+
+    by_id = {item.id: item for item in queue.items}
+    # Two-pass shuffle to avoid the unique (queue_id, position) collision.
+    for idx, item_id in enumerate(requested_ids):
+        by_id[item_id].position = -1000 - idx
+    db.flush()
+    for idx, item_id in enumerate(requested_ids):
+        by_id[item_id].position = idx
+    db.commit()
+    db.refresh(queue)
+    return queue
