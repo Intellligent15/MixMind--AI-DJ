@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 
 from app.api.deps import get_db
 from app.main import app
-from app.models import Analysis, Song, SongStatus
+from app.models import Analysis, Song, SongStatus, Stems, StemsStatus
 from app.services.storage import LocalFilesystemStorage
 
 
@@ -249,3 +249,122 @@ def test_get_analysis_404_when_not_yet_analyzed(db_session: Session):
     r = client.get(f"/api/songs/{song.id}/analysis")
     assert r.status_code == 404
     assert "analysis" in r.json()["detail"].lower()
+
+
+def _analyzed_song(db: Session, vid: str = "analyzed") -> Song:
+    song = _downloaded_song(db, vid=vid)
+    song.status = SongStatus.analyzed
+    db.flush()
+    return song
+
+
+def _stems_row(db: Session, song: Song, **overrides) -> Stems:
+    vid = song.youtube_video_id
+    base = dict(
+        song_id=song.id,
+        model_name="htdemucs_ft",
+        status=StemsStatus.separated,
+        vocals_path=f"stems/{vid}/vocals.wav",
+        drums_path=f"stems/{vid}/drums.wav",
+        bass_path=f"stems/{vid}/bass.wav",
+        other_path=f"stems/{vid}/other.wav",
+        vocal_rms=0.2,
+    )
+    base.update(overrides)
+    row = Stems(**base)
+    db.add(row)
+    db.flush()
+    return row
+
+
+def test_trigger_separate_enqueues_when_analyzed(db_session: Session):
+    song = _analyzed_song(db_session, vid="sep-ok")
+    client = _client(db_session)
+    with patch("app.api.songs.separate_stems.delay") as delay:
+        r = client.post(f"/api/songs/{song.id}/separate")
+    assert r.status_code == 202
+    delay.assert_called_once_with(str(song.id))
+
+
+def test_trigger_separate_404_unknown_song(db_session: Session):
+    client = _client(db_session)
+    r = client.post("/api/songs/00000000-0000-0000-0000-000000000000/separate")
+    assert r.status_code == 404
+
+
+def test_trigger_separate_409_when_not_analyzed(db_session: Session):
+    song = _downloaded_song(db_session, vid="sep-too-early")
+    client = _client(db_session)
+    with patch("app.api.songs.separate_stems.delay") as delay:
+        r = client.post(f"/api/songs/{song.id}/separate")
+    assert r.status_code == 409
+    delay.assert_not_called()
+
+
+def test_get_stems_returns_row(db_session: Session):
+    song = _analyzed_song(db_session, vid="hasstems")
+    _stems_row(db_session, song)
+    client = _client(db_session)
+    r = client.get(f"/api/songs/{song.id}/stems")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["model_name"] == "htdemucs_ft"
+    assert body["status"] == "separated"
+    assert body["vocals_path"].endswith("/vocals.wav")
+    assert body["vocal_rms"] == 0.2
+
+
+def test_get_stems_404_song_not_found(db_session: Session):
+    client = _client(db_session)
+    r = client.get("/api/songs/00000000-0000-0000-0000-000000000000/stems")
+    assert r.status_code == 404
+
+
+def test_get_stems_404_when_not_separated(db_session: Session):
+    song = _analyzed_song(db_session, vid="no-stems-yet")
+    client = _client(db_session)
+    r = client.get(f"/api/songs/{song.id}/stems")
+    assert r.status_code == 404
+
+
+def test_get_stem_audio_streams_file(
+    db_session: Session, tmp_storage: LocalFilesystemStorage
+):
+    song = _analyzed_song(db_session, vid="streamstems")
+    _stems_row(db_session, song)
+    key = f"stems/{song.youtube_video_id}/vocals.wav"
+    tmp_storage.path(key).parent.mkdir(parents=True, exist_ok=True)
+    tmp_storage.path(key).write_bytes(b"RIFF" + b"\x00" * 50)
+
+    client = _client(db_session)
+    r = client.get(f"/api/songs/{song.id}/stems/vocals")
+    assert r.status_code == 200
+    assert r.headers["content-type"] == "audio/wav"
+    assert r.content.startswith(b"RIFF")
+
+
+def test_get_stem_audio_404_unknown_stem_name(db_session: Session):
+    song = _analyzed_song(db_session, vid="badname")
+    _stems_row(db_session, song)
+    client = _client(db_session)
+    r = client.get(f"/api/songs/{song.id}/stems/cowbell")
+    assert r.status_code == 404
+
+
+def test_get_stem_audio_410_when_file_missing(
+    db_session: Session, tmp_storage: LocalFilesystemStorage
+):
+    assert tmp_storage
+    song = _analyzed_song(db_session, vid="ghost-stems")
+    _stems_row(db_session, song)
+    client = _client(db_session)
+    r = client.get(f"/api/songs/{song.id}/stems/drums")
+    assert r.status_code == 410
+
+
+def test_get_stem_audio_409_when_path_null(db_session: Session):
+    song = _analyzed_song(db_session, vid="partial-stems")
+    _stems_row(db_session, song, vocals_path=None)
+    client = _client(db_session)
+    r = client.get(f"/api/songs/{song.id}/stems/vocals")
+    assert r.status_code == 409
