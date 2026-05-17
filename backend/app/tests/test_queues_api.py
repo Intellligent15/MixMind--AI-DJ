@@ -1,0 +1,341 @@
+from __future__ import annotations
+
+from unittest.mock import patch
+
+import pytest
+from fastapi.testclient import TestClient
+from sqlalchemy.orm import Session
+
+from app.api.deps import get_db
+from app.main import app
+from app.models import Queue, QueueItem, Song, SongStatus
+
+
+def _client(db_session: Session) -> TestClient:
+    def override_db():
+        yield db_session
+
+    app.dependency_overrides[get_db] = override_db
+    return TestClient(app)
+
+
+def teardown_function():
+    app.dependency_overrides.clear()
+
+
+def _make_song(db: Session, vid: str, status: SongStatus = SongStatus.pending) -> Song:
+    song = Song(
+        youtube_video_id=vid,
+        title=f"song-{vid}",
+        artist="art",
+        duration_seconds=120.0,
+        thumbnail_url=None,
+        audio_path=f"audio/{vid}.wav" if status != SongStatus.pending else None,
+        status=status,
+    )
+    db.add(song)
+    db.flush()
+    return song
+
+
+# --- create / current --------------------------------------------------------
+
+
+def test_create_queue(db_session: Session):
+    client = _client(db_session)
+    r = client.post("/api/queues")
+    assert r.status_code == 201
+    body = r.json()
+    assert body["locked"] is False
+    assert body["items"] == []
+    assert body["locked_at"] is None
+
+
+def test_create_queue_409_if_unlocked_exists(db_session: Session):
+    client = _client(db_session)
+    client.post("/api/queues")
+    r = client.post("/api/queues")
+    assert r.status_code == 409
+
+
+def test_get_current_prefers_unlocked(db_session: Session):
+    locked = Queue(locked=True)
+    unlocked = Queue(locked=False)
+    db_session.add_all([locked, unlocked])
+    db_session.flush()
+    client = _client(db_session)
+    r = client.get("/api/queues/current")
+    assert r.status_code == 200
+    assert r.json()["id"] == str(unlocked.id)
+
+
+def test_get_current_falls_back_to_locked(db_session: Session):
+    locked = Queue(locked=True)
+    db_session.add(locked)
+    db_session.flush()
+    client = _client(db_session)
+    r = client.get("/api/queues/current")
+    assert r.status_code == 200
+    assert r.json()["id"] == str(locked.id)
+
+
+def test_get_current_404_when_none(db_session: Session):
+    client = _client(db_session)
+    r = client.get("/api/queues/current")
+    assert r.status_code == 404
+
+
+# --- add items ---------------------------------------------------------------
+
+
+def test_add_item_appends_in_position_order(db_session: Session):
+    queue = Queue()
+    s1 = _make_song(db_session, "v1")
+    s2 = _make_song(db_session, "v2")
+    db_session.add(queue)
+    db_session.flush()
+    client = _client(db_session)
+    with patch("app.api.queues.download_song.delay"):
+        r1 = client.post(
+            f"/api/queues/{queue.id}/items", json={"song_id": str(s1.id)}
+        )
+        r2 = client.post(
+            f"/api/queues/{queue.id}/items", json={"song_id": str(s2.id)}
+        )
+    assert r1.status_code == 201
+    assert r2.status_code == 201
+    positions = [item["position"] for item in r2.json()["items"]]
+    assert positions == [0, 1]
+    song_ids = [item["song"]["id"] for item in r2.json()["items"]]
+    assert song_ids == [str(s1.id), str(s2.id)]
+
+
+def test_add_item_allows_duplicate_song(db_session: Session):
+    queue = Queue()
+    song = _make_song(db_session, "dup")
+    db_session.add(queue)
+    db_session.flush()
+    client = _client(db_session)
+    with patch("app.api.queues.download_song.delay"):
+        client.post(f"/api/queues/{queue.id}/items", json={"song_id": str(song.id)})
+        r = client.post(
+            f"/api/queues/{queue.id}/items", json={"song_id": str(song.id)}
+        )
+    assert r.status_code == 201
+    items = r.json()["items"]
+    assert len(items) == 2
+    assert items[0]["song"]["id"] == items[1]["song"]["id"]
+    assert items[0]["id"] != items[1]["id"]
+
+
+def test_add_item_enqueues_download_only_for_pending(db_session: Session):
+    queue = Queue()
+    pending = _make_song(db_session, "pending-vid")
+    downloaded = _make_song(db_session, "downloaded-vid", SongStatus.downloaded)
+    db_session.add(queue)
+    db_session.flush()
+    client = _client(db_session)
+    with patch("app.api.queues.download_song.delay") as delay:
+        client.post(
+            f"/api/queues/{queue.id}/items", json={"song_id": str(pending.id)}
+        )
+        client.post(
+            f"/api/queues/{queue.id}/items", json={"song_id": str(downloaded.id)}
+        )
+    delay.assert_called_once_with(str(pending.id))
+
+
+def test_add_item_409_when_locked(db_session: Session):
+    queue = Queue(locked=True)
+    song = _make_song(db_session, "v1")
+    db_session.add(queue)
+    db_session.flush()
+    client = _client(db_session)
+    r = client.post(f"/api/queues/{queue.id}/items", json={"song_id": str(song.id)})
+    assert r.status_code == 409
+
+
+def test_add_item_404_unknown_song(db_session: Session):
+    queue = Queue()
+    db_session.add(queue)
+    db_session.flush()
+    client = _client(db_session)
+    r = client.post(
+        f"/api/queues/{queue.id}/items",
+        json={"song_id": "00000000-0000-0000-0000-000000000000"},
+    )
+    assert r.status_code == 404
+
+
+def test_add_item_409_when_full(db_session: Session):
+    queue = Queue()
+    db_session.add(queue)
+    db_session.flush()
+    songs = [_make_song(db_session, f"v{i}") for i in range(21)]
+    client = _client(db_session)
+    with patch("app.api.queues.download_song.delay"):
+        for s in songs[:20]:
+            r = client.post(
+                f"/api/queues/{queue.id}/items", json={"song_id": str(s.id)}
+            )
+            assert r.status_code == 201
+        r = client.post(
+            f"/api/queues/{queue.id}/items", json={"song_id": str(songs[20].id)}
+        )
+    assert r.status_code == 409
+
+
+# --- remove ------------------------------------------------------------------
+
+
+def test_remove_item_compacts_positions(db_session: Session):
+    queue = Queue()
+    db_session.add(queue)
+    songs = [_make_song(db_session, f"r{i}") for i in range(3)]
+    db_session.flush()
+    items = [
+        QueueItem(queue_id=queue.id, song_id=s.id, position=i)
+        for i, s in enumerate(songs)
+    ]
+    db_session.add_all(items)
+    db_session.flush()
+
+    client = _client(db_session)
+    r = client.delete(f"/api/queues/{queue.id}/items/{items[0].id}")
+    assert r.status_code == 200
+    positions = [item["position"] for item in r.json()["items"]]
+    assert positions == [0, 1]
+    remaining_song_ids = [item["song"]["id"] for item in r.json()["items"]]
+    assert remaining_song_ids == [str(songs[1].id), str(songs[2].id)]
+
+
+def test_remove_item_409_when_locked(db_session: Session):
+    queue = Queue(locked=True)
+    db_session.add(queue)
+    song = _make_song(db_session, "vL")
+    db_session.flush()
+    item = QueueItem(queue_id=queue.id, song_id=song.id, position=0)
+    db_session.add(item)
+    db_session.flush()
+    client = _client(db_session)
+    r = client.delete(f"/api/queues/{queue.id}/items/{item.id}")
+    assert r.status_code == 409
+
+
+# --- reorder -----------------------------------------------------------------
+
+
+def test_reorder_items(db_session: Session):
+    queue = Queue()
+    db_session.add(queue)
+    songs = [_make_song(db_session, f"o{i}") for i in range(3)]
+    db_session.flush()
+    items = [
+        QueueItem(queue_id=queue.id, song_id=s.id, position=i)
+        for i, s in enumerate(songs)
+    ]
+    db_session.add_all(items)
+    db_session.flush()
+
+    reversed_ids = [str(items[2].id), str(items[1].id), str(items[0].id)]
+    client = _client(db_session)
+    r = client.patch(
+        f"/api/queues/{queue.id}/items",
+        json={"ordered_item_ids": reversed_ids},
+    )
+    assert r.status_code == 200
+    body_ids = [item["id"] for item in r.json()["items"]]
+    assert body_ids == reversed_ids
+    positions = [item["position"] for item in r.json()["items"]]
+    assert positions == [0, 1, 2]
+
+
+def test_reorder_400_on_mismatched_ids(db_session: Session):
+    queue = Queue()
+    db_session.add(queue)
+    songs = [_make_song(db_session, f"m{i}") for i in range(2)]
+    db_session.flush()
+    items = [
+        QueueItem(queue_id=queue.id, song_id=s.id, position=i)
+        for i, s in enumerate(songs)
+    ]
+    db_session.add_all(items)
+    db_session.flush()
+
+    client = _client(db_session)
+    # Drop one item id
+    r = client.patch(
+        f"/api/queues/{queue.id}/items",
+        json={"ordered_item_ids": [str(items[0].id)]},
+    )
+    assert r.status_code == 400
+
+
+# --- lock --------------------------------------------------------------------
+
+
+def test_lock_fans_out_pipeline_by_song_status(db_session: Session):
+    queue = Queue()
+    db_session.add(queue)
+    pending = _make_song(db_session, "p1")
+    downloaded = _make_song(db_session, "d1", SongStatus.downloaded)
+    analyzed = _make_song(db_session, "a1", SongStatus.analyzed)
+    db_session.flush()
+    for i, s in enumerate([pending, downloaded, analyzed]):
+        db_session.add(
+            QueueItem(queue_id=queue.id, song_id=s.id, position=i)
+        )
+    db_session.flush()
+
+    client = _client(db_session)
+    with patch("app.api.queues.chain") as chain_mock, patch(
+        "app.api.queues.analyze_song"
+    ) as analyze_mock, patch(
+        "app.api.queues.download_song"
+    ) as download_mock:
+        # chain(...).delay() must be callable
+        chain_mock.return_value.delay.return_value = None
+        analyze_mock.delay.return_value = None
+        download_mock.s.return_value = "download-sig"
+        analyze_mock.si.return_value = "analyze-sig"
+
+        r = client.post(f"/api/queues/{queue.id}/lock")
+
+    assert r.status_code == 202
+    assert r.json()["locked"] is True
+    assert r.json()["locked_at"] is not None
+
+    # pending -> chain(download, analyze)
+    chain_mock.assert_called_once_with("download-sig", "analyze-sig")
+    chain_mock.return_value.delay.assert_called_once()
+    download_mock.s.assert_called_once_with(str(pending.id))
+    analyze_mock.si.assert_called_once_with(str(pending.id))
+    # downloaded -> analyze_song.delay
+    analyze_mock.delay.assert_called_once_with(str(downloaded.id))
+
+
+def test_lock_409_if_empty(db_session: Session):
+    queue = Queue()
+    db_session.add(queue)
+    db_session.flush()
+    client = _client(db_session)
+    r = client.post(f"/api/queues/{queue.id}/lock")
+    assert r.status_code == 409
+
+
+def test_lock_409_if_already_locked(db_session: Session):
+    queue = Queue(locked=True)
+    db_session.add(queue)
+    song = _make_song(db_session, "L1")
+    db_session.flush()
+    db_session.add(QueueItem(queue_id=queue.id, song_id=song.id, position=0))
+    db_session.flush()
+    client = _client(db_session)
+    r = client.post(f"/api/queues/{queue.id}/lock")
+    assert r.status_code == 409
+
+
+def test_lock_404_unknown_queue(db_session: Session):
+    client = _client(db_session)
+    r = client.post("/api/queues/00000000-0000-0000-0000-000000000000/lock")
+    assert r.status_code == 404
