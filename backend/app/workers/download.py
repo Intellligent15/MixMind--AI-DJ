@@ -3,6 +3,8 @@ from __future__ import annotations
 import logging
 import uuid
 
+from sqlalchemy import update
+
 from app.core.db import SessionLocal
 from app.models import Song, SongStatus
 from app.services.storage import get_storage
@@ -11,14 +13,24 @@ from app.workers import celery_app
 
 logger = logging.getLogger(__name__)
 
+# Statuses we can transition into `downloading`. A song already mid-download
+# or already downloaded is left alone — preventing two parallel tasks from
+# racing on the same audio file.
+CLAIMABLE_STATUSES = (SongStatus.pending, SongStatus.failed)
+
 
 @celery_app.task(name="app.workers.download.download_song")
-def download_song(song_id: str) -> str:
+def download_song(song_id: str) -> str | None:
     """Download the audio for a Song to local storage.
 
+    Idempotent under concurrent dispatch: the pending/failed -> downloading
+    transition is an atomic SQL UPDATE that only one task can win. Losers
+    log and return the existing audio_path (which may be None if another
+    task is mid-download). The winner proceeds to yt-dlp.
+
     Transitions: pending/failed -> downloading -> downloaded (or failed).
-    Returns the absolute audio path on success. Re-raises on failure after
-    marking the row failed so Celery records the error.
+    Returns the storage key on success, or None if the call was a no-op
+    because another dispatch already owned the download.
     """
     song_uuid = uuid.UUID(song_id)
     storage = get_storage()
@@ -27,9 +39,28 @@ def download_song(song_id: str) -> str:
     with SessionLocal() as db:
         song = db.get(Song, song_uuid)
         if song is None:
-            raise RuntimeError(f"Song {song_id} not found")
-        song.status = SongStatus.downloading
+            # Can happen if a song was deleted between dispatch and pickup,
+            # or if stale tasks survive in the broker after a DB reset.
+            logger.warning("download_song: song %s not found, skipping", song_id)
+            return None
+
+        claim = db.execute(
+            update(Song)
+            .where(Song.id == song_uuid)
+            .where(Song.status.in_(CLAIMABLE_STATUSES))
+            .values(status=SongStatus.downloading)
+        )
         db.commit()
+
+        if claim.rowcount == 0:
+            db.refresh(song)
+            logger.info(
+                "download_song: %s already %s, skipping duplicate dispatch",
+                song_id,
+                song.status.value,
+            )
+            return song.audio_path
+
         video_id = song.youtube_video_id
 
     key = f"audio/{video_id}.wav"
@@ -37,7 +68,7 @@ def download_song(song_id: str) -> str:
 
     try:
         yt.download(video_id, dest)
-    except Exception as exc:
+    except Exception:
         logger.exception("download failed for %s", video_id)
         with SessionLocal() as db:
             song = db.get(Song, song_uuid)

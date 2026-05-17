@@ -3,6 +3,8 @@ from __future__ import annotations
 import logging
 import uuid
 
+from sqlalchemy import update
+
 from app.core.db import SessionLocal
 from app.models import Analysis, Song, SongStatus
 from app.services.analysis.service import AnalysisService
@@ -11,13 +13,23 @@ from app.workers import celery_app
 
 logger = logging.getLogger(__name__)
 
+# Statuses we can transition into `analyzing`. Mirrors the API gate so
+# manual re-analyze and recovery from a failed run both work.
+CLAIMABLE_STATUSES = (SongStatus.downloaded, SongStatus.analyzed, SongStatus.failed)
+
 
 @celery_app.task(name="app.workers.analyze.analyze_song")
-def analyze_song(song_id: str) -> str:
+def analyze_song(song_id: str) -> str | None:
     """Run the analysis pipeline for a downloaded Song.
 
-    Transitions: downloaded -> analyzing -> analyzed (or failed).
-    Re-running on a song that already has an Analysis row overwrites it.
+    Idempotent under concurrent dispatch: the transition into `analyzing`
+    is an atomic SQL UPDATE that only one task can win. Losers log and
+    return without touching the row, leaving the winner to produce the
+    Analysis.
+
+    Transitions: downloaded/analyzed/failed -> analyzing -> analyzed
+    (or failed). Re-running on a song that already has an Analysis row
+    overwrites it.
     """
     song_uuid = uuid.UUID(song_id)
     storage = get_storage()
@@ -26,16 +38,32 @@ def analyze_song(song_id: str) -> str:
     with SessionLocal() as db:
         song = db.get(Song, song_uuid)
         if song is None:
-            raise RuntimeError(f"Song {song_id} not found")
-        if song.status not in (SongStatus.downloaded, SongStatus.analyzed, SongStatus.failed):
-            raise RuntimeError(
-                f"Song {song_id} not ready for analysis (status={song.status.value})"
-            )
+            logger.warning("analyze_song: song %s not found, skipping", song_id)
+            return None
         if not song.audio_path:
-            raise RuntimeError(f"Song {song_id} has no audio_path")
-        audio_key = song.audio_path
-        song.status = SongStatus.analyzing
+            logger.warning(
+                "analyze_song: song %s has no audio_path yet, skipping", song_id
+            )
+            return None
+
+        claim = db.execute(
+            update(Song)
+            .where(Song.id == song_uuid)
+            .where(Song.status.in_(CLAIMABLE_STATUSES))
+            .values(status=SongStatus.analyzing)
+        )
         db.commit()
+
+        if claim.rowcount == 0:
+            db.refresh(song)
+            logger.info(
+                "analyze_song: %s already %s, skipping duplicate dispatch",
+                song_id,
+                song.status.value,
+            )
+            return None
+
+        audio_key = song.audio_path
 
     audio_path = storage.path(audio_key)
 

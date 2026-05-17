@@ -128,21 +128,25 @@ def test_add_item_allows_duplicate_song(db_session: Session):
     assert items[0]["id"] != items[1]["id"]
 
 
-def test_add_item_enqueues_download_only_for_pending(db_session: Session):
+def test_add_item_does_not_dispatch_download(db_session: Session):
+    # POST /api/songs already dispatches download_song on song creation, and
+    # POST /lock catches anything still pending. The queue add handler must
+    # not re-dispatch — that previously raced with the songs-API dispatch.
     queue = Queue()
     pending = _make_song(db_session, "pending-vid")
     downloaded = _make_song(db_session, "downloaded-vid", SongStatus.downloaded)
     db_session.add(queue)
     db_session.flush()
     client = _client(db_session)
-    with patch("app.api.queues.download_song.delay") as delay:
+    with patch("app.api.queues.download_song") as download_mock:
         client.post(
             f"/api/queues/{queue.id}/items", json={"song_id": str(pending.id)}
         )
         client.post(
             f"/api/queues/{queue.id}/items", json={"song_id": str(downloaded.id)}
         )
-    delay.assert_called_once_with(str(pending.id))
+    download_mock.delay.assert_not_called()
+    download_mock.s.assert_not_called()
 
 
 def test_add_item_409_when_locked(db_session: Session):

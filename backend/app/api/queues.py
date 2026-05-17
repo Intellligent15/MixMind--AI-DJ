@@ -109,11 +109,11 @@ def add_queue_item(
     db.add(item)
     db.commit()
 
-    # Per spec Pipeline Flow: adding a song kicks off a low-priority download.
-    # Phase 4 ships without distinct priorities; the lock handler re-checks and
-    # only enqueues for songs not yet downloaded.
-    if song.status == SongStatus.pending:
-        download_song.delay(str(song.id))
+    # NOTE: POST /api/songs already dispatches download_song on song
+    # creation, and POST /lock catches anything still pending. Dispatching
+    # again here used to race with the songs-API dispatch — two parallel
+    # yt-dlp processes writing the same .wav, one would fail and mark the
+    # song failed even though the audio file was on disk.
 
     db.refresh(queue)
     return queue

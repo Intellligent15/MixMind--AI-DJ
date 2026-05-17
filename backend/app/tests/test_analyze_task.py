@@ -121,32 +121,61 @@ def test_analyze_song_marks_failed_on_error(downloaded_song: str, tmp_path: Path
         )
 
 
-def test_analyze_song_rejects_wrong_status(downloaded_song: str):
+def test_analyze_song_skips_wrong_status(downloaded_song: str):
+    """A song still pending/downloading is silently skipped — the worker
+    doesn't raise. The atomic claim will fail rowcount == 0."""
     sid = uuid.UUID(downloaded_song)
     with SessionLocal() as db:
         song = db.get(Song, sid)
         song.status = SongStatus.pending
         db.commit()
 
+    service = MagicMock()
+    with (
+        patch("app.workers.analyze.get_storage", return_value=MagicMock()),
+        patch("app.workers.analyze.AnalysisService", return_value=service),
+    ):
+        from app.workers.analyze import analyze_song
+
+        result = analyze_song(downloaded_song)
+
+    assert result is None
+    service.analyze.assert_not_called()
+
+
+def test_analyze_song_missing_row_logs_and_returns():
     with (
         patch("app.workers.analyze.get_storage", return_value=MagicMock()),
         patch("app.workers.analyze.AnalysisService", return_value=MagicMock()),
     ):
         from app.workers.analyze import analyze_song
 
-        with pytest.raises(RuntimeError, match="not ready"):
-            analyze_song(downloaded_song)
+        assert analyze_song(str(uuid.uuid4())) is None
 
 
-def test_analyze_song_missing_row_raises():
+def test_analyze_song_skips_if_already_analyzing(downloaded_song: str):
+    """Concurrent dispatch: the loser sees status=analyzing and bails."""
+    sid = uuid.UUID(downloaded_song)
+    with SessionLocal() as db:
+        song = db.get(Song, sid)
+        song.status = SongStatus.analyzing
+        db.commit()
+
+    service = MagicMock()
     with (
         patch("app.workers.analyze.get_storage", return_value=MagicMock()),
-        patch("app.workers.analyze.AnalysisService", return_value=MagicMock()),
+        patch("app.workers.analyze.AnalysisService", return_value=service),
     ):
         from app.workers.analyze import analyze_song
 
-        with pytest.raises(RuntimeError, match="not found"):
-            analyze_song(str(uuid.uuid4()))
+        result = analyze_song(downloaded_song)
+
+    assert result is None
+    service.analyze.assert_not_called()
+    with SessionLocal() as db:
+        row = db.get(Song, sid)
+        assert row is not None
+        assert row.status == SongStatus.analyzing
 
 
 def test_analyze_song_replaces_existing_analysis(downloaded_song: str, tmp_path: Path):
