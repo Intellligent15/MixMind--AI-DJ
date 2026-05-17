@@ -49,8 +49,11 @@ def download_song(song_id: str) -> str:
     with SessionLocal() as db:
         song = db.get(Song, song_uuid)
         assert song is not None
-        song.audio_path = str(dest)
+        # Store the logical storage key, not the absolute filesystem path.
+        # The host worker and the dockerized backend resolve this key
+        # against different roots (./cache vs /app/cache).
+        song.audio_path = key
         song.status = SongStatus.downloaded
         db.commit()
 
-    return str(dest)
+    return key

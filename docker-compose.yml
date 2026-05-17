@@ -37,6 +37,8 @@ services:
     environment:
       DATABASE_URL: postgresql+psycopg://aidj:aidj@postgres:5432/aidj
       REDIS_URL: redis://redis:6379/0
+      STORAGE_BACKEND: local
+      LOCAL_STORAGE_PATH: /app/cache
       LOG_LEVEL: INFO
     ports:
       - "8000:8000"
@@ -54,6 +56,9 @@ services:
     environment:
       # Server-side fetches from the frontend container use docker network DNS.
       BACKEND_URL: http://backend:8000
+      # Browser-side fetches go directly from the user's browser to the host
+      # backend port. NEXT_PUBLIC_ prefix bakes this into the client bundle.
+      NEXT_PUBLIC_API_BASE: http://localhost:8000
     ports:
       - "3000:3000"
     depends_on:

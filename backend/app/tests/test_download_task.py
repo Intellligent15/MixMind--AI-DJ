@@ -60,15 +60,14 @@ def test_download_song_happy_path(song_id: str, tmp_path: Path):
 
         result = download_song(song_id)
 
-    assert result == str(dest)
-
     with SessionLocal() as db:
         import uuid
 
         row = db.get(Song, uuid.UUID(song_id))
         assert row is not None
         assert row.status == SongStatus.downloaded
-        assert row.audio_path == str(dest)
+        assert row.audio_path == f"audio/{row.youtube_video_id}.wav"
+        assert result == row.audio_path
 
 
 def test_download_song_marks_failed_on_error(song_id: str, tmp_path: Path):

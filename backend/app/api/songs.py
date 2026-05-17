@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import uuid
-from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import FileResponse
@@ -11,6 +10,7 @@ from sqlalchemy.orm import Session
 from app.api.deps import get_db
 from app.models import Song, SongStatus
 from app.schemas import SongCreate, SongRead
+from app.services.storage import get_storage
 from app.workers.download import download_song
 
 router = APIRouter(prefix="/api/songs", tags=["songs"])
@@ -64,7 +64,7 @@ def get_song_audio(song_id: uuid.UUID, db: Session = Depends(get_db)) -> FileRes
             status_code=409,
             detail=f"audio not available (status={song.status.value})",
         )
-    path = Path(song.audio_path)
+    path = get_storage().path(song.audio_path)
     if not path.exists():
         raise HTTPException(status_code=410, detail="audio file missing on disk")
     return FileResponse(path, media_type="audio/wav", filename=path.name)

@@ -3,12 +3,14 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_db
 from app.main import app
 from app.models import Song, SongStatus
+from app.services.storage import LocalFilesystemStorage
 
 
 def _client(db_session: Session) -> TestClient:
@@ -98,9 +100,19 @@ def test_audio_409_when_not_downloaded(db_session: Session):
     assert r.status_code == 409
 
 
-def test_audio_streams_file_with_range_support(db_session: Session, tmp_path: Path):
-    audio = tmp_path / "abc123.wav"
-    audio.write_bytes(b"RIFF" + b"\x00" * 100)
+@pytest.fixture
+def tmp_storage(tmp_path: Path):
+    storage = LocalFilesystemStorage(tmp_path)
+    with patch("app.api.songs.get_storage", return_value=storage):
+        yield storage
+
+
+def test_audio_streams_file_with_range_support(
+    db_session: Session, tmp_storage: LocalFilesystemStorage
+):
+    key = "audio/abc123.wav"
+    tmp_storage.path(key).parent.mkdir(parents=True, exist_ok=True)
+    tmp_storage.path(key).write_bytes(b"RIFF" + b"\x00" * 100)
 
     song = Song(
         youtube_video_id="abc123",
@@ -108,7 +120,7 @@ def test_audio_streams_file_with_range_support(db_session: Session, tmp_path: Pa
         artist=None,
         duration_seconds=10.0,
         thumbnail_url=None,
-        audio_path=str(audio),
+        audio_path=key,
         status=SongStatus.downloaded,
     )
     db_session.add(song)
@@ -128,14 +140,17 @@ def test_audio_streams_file_with_range_support(db_session: Session, tmp_path: Pa
     assert r.content == b"\x00\x00\x00\x00"
 
 
-def test_audio_410_when_file_missing(db_session: Session, tmp_path: Path):
+def test_audio_410_when_file_missing(
+    db_session: Session, tmp_storage: LocalFilesystemStorage
+):
+    assert tmp_storage  # fixture patches get_storage in the songs router
     song = Song(
         youtube_video_id="abc",
         title="T",
         artist=None,
         duration_seconds=1.0,
         thumbnail_url=None,
-        audio_path=str(tmp_path / "does-not-exist.wav"),
+        audio_path="audio/does-not-exist.wav",
         status=SongStatus.downloaded,
     )
     db_session.add(song)

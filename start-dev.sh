@@ -12,6 +12,12 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$REPO_ROOT"
 
+# yt-dlp uses ffmpeg for the WAV extraction postprocessor on the host worker.
+if ! command -v ffmpeg >/dev/null 2>&1; then
+  echo "ERROR: ffmpeg not found on PATH. Install with: brew install ffmpeg" >&2
+  exit 1
+fi
+
 echo "==> Starting Docker services (postgres, redis, backend, frontend)..."
 docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --build
 
@@ -26,11 +32,21 @@ for i in {1..30}; do
   sleep 1
 done
 
+cd backend
+
+# Make the host worker share the same cache directory the dockerized backend
+# mounts (./cache at the repo root). Without this, the worker's CWD changes
+# to backend/ and a relative LOCAL_STORAGE_PATH would land in backend/cache/
+# — invisible to the container that serves the audio.
+export LOCAL_STORAGE_PATH="${LOCAL_STORAGE_PATH:-$REPO_ROOT/cache}"
+
+echo "==> Applying database migrations..."
+uv run alembic upgrade head
+
 echo "==> Starting native Celery worker (Ctrl-C to stop)..."
 echo "    Backend:  http://localhost:8000/health"
 echo "    Frontend: http://localhost:3000"
 echo "    Stop docker stack with: ./stop-dev.sh"
 echo
 
-cd backend
 exec uv run celery -A app.workers worker --loglevel=info
