@@ -50,6 +50,28 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return res.json() as Promise<T>;
 }
 
+export type Section = {
+  start: number;
+  end: number;
+  label: string;
+};
+
+export type Analysis = {
+  id: string;
+  song_id: string;
+  bpm: number;
+  key: string;
+  camelot_key: string;
+  time_signature: number;
+  beat_grid: number[];
+  downbeats: number[];
+  sections: Section[];
+  energy_curve: number[];
+  vocal_segments: number[][];
+  created_at: string;
+  updated_at: string;
+};
+
 export const api = {
   search: (q: string, limit = 10) =>
     request<SearchResult[]>(
@@ -63,4 +85,7 @@ export const api = {
     }),
   getSong: (id: string) => request<Song>(`/api/songs/${id}`),
   audioUrl: (id: string) => `${API_BASE}/api/songs/${id}/audio`,
+  triggerAnalyze: (id: string) =>
+    request<Song>(`/api/songs/${id}/analyze`, { method: "POST" }),
+  getAnalysis: (id: string) => request<Analysis>(`/api/songs/${id}/analysis`),
 };

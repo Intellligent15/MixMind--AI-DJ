@@ -1,13 +1,15 @@
 "use client";
 
-import { useQuery } from "@tanstack/react-query";
+import Link from "next/link";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, type Song } from "@/lib/api";
 
 function isTerminal(status: Song["status"]): boolean {
-  return status === "downloaded" || status === "failed";
+  return status === "analyzed" || status === "ready" || status === "failed";
 }
 
 export function DownloadedSongs() {
+  const qc = useQueryClient();
   const songs = useQuery({
     queryKey: ["songs"],
     queryFn: api.listSongs,
@@ -16,6 +18,11 @@ export function DownloadedSongs() {
       if (!data) return 1000;
       return data.some((s) => !isTerminal(s.status)) ? 1000 : false;
     },
+  });
+
+  const analyze = useMutation({
+    mutationFn: (id: string) => api.triggerAnalyze(id),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["songs"] }),
   });
 
   return (
@@ -46,15 +53,19 @@ export function DownloadedSongs() {
                   "text-xs px-2 py-1 rounded " +
                   (s.status === "failed"
                     ? "bg-red-500/20"
-                    : s.status === "downloaded"
+                    : s.status === "analyzed" || s.status === "ready"
                       ? "bg-green-500/20"
-                      : "bg-yellow-500/20")
+                      : s.status === "downloaded"
+                        ? "bg-blue-500/20"
+                        : "bg-yellow-500/20")
                 }
               >
                 {s.status}
               </span>
             </div>
-            {s.status === "downloaded" && (
+            {(s.status === "downloaded" ||
+              s.status === "analyzed" ||
+              s.status === "ready") && (
               <audio
                 controls
                 preload="none"
@@ -62,6 +73,36 @@ export function DownloadedSongs() {
                 className="w-full"
               />
             )}
+            <div className="flex gap-2">
+              {s.status === "downloaded" && (
+                <button
+                  type="button"
+                  onClick={() => analyze.mutate(s.id)}
+                  disabled={analyze.isPending}
+                  className="text-sm border rounded px-3 py-1 hover:bg-black/5 dark:hover:bg-white/10 disabled:opacity-50"
+                >
+                  Analyze
+                </button>
+              )}
+              {s.status === "failed" && (
+                <button
+                  type="button"
+                  onClick={() => analyze.mutate(s.id)}
+                  disabled={analyze.isPending}
+                  className="text-sm border rounded px-3 py-1 hover:bg-black/5 dark:hover:bg-white/10 disabled:opacity-50"
+                >
+                  Retry analyze
+                </button>
+              )}
+              {(s.status === "analyzed" || s.status === "ready") && (
+                <Link
+                  href={`/songs/${s.id}/debug`}
+                  className="text-sm border rounded px-3 py-1 hover:bg-black/5 dark:hover:bg-white/10"
+                >
+                  Debug
+                </Link>
+              )}
+            </div>
           </li>
         ))}
       </ul>
