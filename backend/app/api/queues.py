@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import uuid
+from datetime import datetime, timezone
 
+from celery import chain
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -9,6 +11,7 @@ from sqlalchemy.orm import Session
 from app.api.deps import get_db
 from app.models import Queue, QueueItem, Song, SongStatus
 from app.schemas import QueueItemAdd, QueueRead, QueueReorder
+from app.workers.analyze import analyze_song
 from app.workers.download import download_song
 
 router = APIRouter(prefix="/api/queues", tags=["queues"])
@@ -171,4 +174,48 @@ def reorder_queue_items(
         by_id[item_id].position = idx
     db.commit()
     db.refresh(queue)
+    return queue
+
+
+def _enqueue_pipeline_for_song(song: Song) -> None:
+    """Kick off whatever pipeline stages a song still needs.
+
+    Phase 4 only knows about download + analyze. Later phases will extend
+    this fan-out with stems / transcription / mix planning.
+    """
+    sid = str(song.id)
+    if song.status in (SongStatus.pending, SongStatus.failed) and not song.audio_path:
+        # Download then analyze. .si() ignores the upstream return value so
+        # analyze_song doesn't receive download_song's return as an arg.
+        chain(download_song.s(sid), analyze_song.si(sid)).delay()
+    elif song.status in (SongStatus.downloaded, SongStatus.failed):
+        analyze_song.delay(sid)
+    # analyzed / later: nothing to do.
+
+
+@router.post(
+    "/{queue_id}/lock",
+    response_model=QueueRead,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def lock_queue(queue_id: uuid.UUID, db: Session = Depends(get_db)) -> Queue:
+    queue = db.get(Queue, queue_id)
+    if queue is None:
+        raise HTTPException(status_code=404, detail="queue not found")
+    if queue.locked:
+        raise HTTPException(status_code=409, detail="queue is already locked")
+    if not queue.items:
+        raise HTTPException(status_code=409, detail="queue is empty")
+
+    queue.locked = True
+    queue.locked_at = datetime.now(timezone.utc)
+    # Snapshot songs while the session is open; we'll enqueue after commit
+    # so a transient task-broker failure doesn't roll back the lock.
+    songs_to_pipeline = [item.song for item in queue.items]
+    db.commit()
+    db.refresh(queue)
+
+    for song in songs_to_pipeline:
+        _enqueue_pipeline_for_song(song)
+
     return queue
