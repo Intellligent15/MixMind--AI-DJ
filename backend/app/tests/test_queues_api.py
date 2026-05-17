@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 
 from app.api.deps import get_db
 from app.main import app
-from app.models import Queue, QueueItem, Song, SongStatus
+from app.models import Queue, QueueItem, Song, SongStatus, Stems, StemsStatus
 
 
 def _client(db_session: Session) -> TestClient:
@@ -278,14 +278,33 @@ def test_reorder_400_on_mismatched_ids(db_session: Session):
 # --- lock --------------------------------------------------------------------
 
 
+def _add_stems_row(db: Session, song: Song) -> Stems:
+    row = Stems(
+        song_id=song.id,
+        model_name="htdemucs_ft",
+        status=StemsStatus.separated,
+        vocals_path=f"stems/{song.youtube_video_id}/vocals.wav",
+        drums_path=f"stems/{song.youtube_video_id}/drums.wav",
+        bass_path=f"stems/{song.youtube_video_id}/bass.wav",
+        other_path=f"stems/{song.youtube_video_id}/other.wav",
+        vocal_rms=0.1,
+    )
+    db.add(row)
+    db.flush()
+    return row
+
+
 def test_lock_fans_out_pipeline_by_song_status(db_session: Session):
     queue = Queue()
     db_session.add(queue)
     pending = _make_song(db_session, "p1")
     downloaded = _make_song(db_session, "d1", SongStatus.downloaded)
     analyzed = _make_song(db_session, "a1", SongStatus.analyzed)
+    # Already-fully-processed song (analyzed AND has stems) — nothing to do.
+    done = _make_song(db_session, "z1", SongStatus.analyzed)
+    _add_stems_row(db_session, done)
     db_session.flush()
-    for i, s in enumerate([pending, downloaded, analyzed]):
+    for i, s in enumerate([pending, downloaded, analyzed, done]):
         db_session.add(
             QueueItem(queue_id=queue.id, song_id=s.id, position=i)
         )
@@ -296,12 +315,16 @@ def test_lock_fans_out_pipeline_by_song_status(db_session: Session):
         "app.api.queues.analyze_song"
     ) as analyze_mock, patch(
         "app.api.queues.download_song"
-    ) as download_mock:
-        # chain(...).delay() must be callable
+    ) as download_mock, patch(
+        "app.api.queues.separate_stems"
+    ) as separate_mock:
         chain_mock.return_value.delay.return_value = None
         analyze_mock.delay.return_value = None
-        download_mock.s.return_value = "download-sig"
-        analyze_mock.si.return_value = "analyze-sig"
+        separate_mock.delay.return_value = None
+        download_mock.s.return_value = "d-sig"
+        analyze_mock.s.return_value = "a-sig"
+        analyze_mock.si.return_value = "a-isig"
+        separate_mock.si.return_value = "s-isig"
 
         r = client.post(f"/api/queues/{queue.id}/lock")
 
@@ -309,13 +332,25 @@ def test_lock_fans_out_pipeline_by_song_status(db_session: Session):
     assert r.json()["locked"] is True
     assert r.json()["locked_at"] is not None
 
-    # pending -> chain(download, analyze)
-    chain_mock.assert_called_once_with("download-sig", "analyze-sig")
-    chain_mock.return_value.delay.assert_called_once()
+    # pending -> chain(download, analyze.si, separate.si).delay()
+    # downloaded -> chain(analyze, separate.si).delay()
+    # analyzed (no stems) -> separate.delay()
+    # done (analyzed + stems) -> no dispatch
+    chain_mock.assert_any_call("d-sig", "a-isig", "s-isig")
+    chain_mock.assert_any_call("a-sig", "s-isig")
+    assert chain_mock.call_count == 2
+    # Each chain composition is followed by .delay()
+    assert chain_mock.return_value.delay.call_count == 2
+
     download_mock.s.assert_called_once_with(str(pending.id))
+    # analyze.si used for pending's chain, analyze.s used for downloaded's
     analyze_mock.si.assert_called_once_with(str(pending.id))
-    # downloaded -> analyze_song.delay
-    analyze_mock.delay.assert_called_once_with(str(downloaded.id))
+    analyze_mock.s.assert_called_once_with(str(downloaded.id))
+    # separate.si used in both chains, .delay used for analyzed-no-stems
+    assert separate_mock.si.call_count == 2
+    separate_mock.delay.assert_called_once_with(str(analyzed.id))
+    # done is fully processed — nothing more
+    analyze_mock.delay.assert_not_called()
 
 
 def test_lock_409_if_empty(db_session: Session):

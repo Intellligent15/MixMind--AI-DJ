@@ -9,10 +9,11 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_db
-from app.models import Queue, QueueItem, Song, SongStatus
+from app.models import Queue, QueueItem, Song, SongStatus, Stems
 from app.schemas import QueueItemAdd, QueueRead, QueueReorder
 from app.workers.analyze import analyze_song
 from app.workers.download import download_song
+from app.workers.separate import separate_stems
 
 router = APIRouter(prefix="/api/queues", tags=["queues"])
 
@@ -177,20 +178,44 @@ def reorder_queue_items(
     return queue
 
 
-def _enqueue_pipeline_for_song(song: Song) -> None:
+def _enqueue_pipeline_for_song(song: Song, db: Session) -> None:
     """Kick off whatever pipeline stages a song still needs.
 
-    Phase 4 only knows about download + analyze. Later phases will extend
-    this fan-out with stems / transcription / mix planning.
+    Phase 5 extends Phase 4 with stem separation. The chain length depends
+    on what the song already has:
+      pending/failed-no-audio  -> download -> analyze -> separate
+      downloaded/failed-w-audio -> analyze -> separate
+      analyzed (no stems row)   -> separate
+      analyzed (has stems row)  -> nothing
+
+    Later phases will extend this with transcription, lyrics, mix planning.
     """
     sid = str(song.id)
+    # Has the song already cleared the separation stage? One Stems row
+    # per song; presence means we've already separated (or are mid-flight).
+    has_stems = (
+        db.scalar(select(Stems.id).where(Stems.song_id == song.id)) is not None
+    )
+
     if song.status in (SongStatus.pending, SongStatus.failed) and not song.audio_path:
-        # Download then analyze. .si() ignores the upstream return value so
-        # analyze_song doesn't receive download_song's return as an arg.
-        chain(download_song.s(sid), analyze_song.si(sid)).delay()
+        # download -> analyze -> separate. .si() ignores upstream returns
+        # so each task only sees its own song_id arg.
+        if has_stems:
+            chain(download_song.s(sid), analyze_song.si(sid)).delay()
+        else:
+            chain(
+                download_song.s(sid),
+                analyze_song.si(sid),
+                separate_stems.si(sid),
+            ).delay()
     elif song.status in (SongStatus.downloaded, SongStatus.failed):
-        analyze_song.delay(sid)
-    # analyzed / later: nothing to do.
+        if has_stems:
+            analyze_song.delay(sid)
+        else:
+            chain(analyze_song.s(sid), separate_stems.si(sid)).delay()
+    elif song.status in (SongStatus.analyzed, SongStatus.ready) and not has_stems:
+        separate_stems.delay(sid)
+    # analyzed/ready with stems already: nothing to do.
 
 
 @router.post(
@@ -216,6 +241,6 @@ def lock_queue(queue_id: uuid.UUID, db: Session = Depends(get_db)) -> Queue:
     db.refresh(queue)
 
     for song in songs_to_pipeline:
-        _enqueue_pipeline_for_song(song)
+        _enqueue_pipeline_for_song(song, db)
 
     return queue
