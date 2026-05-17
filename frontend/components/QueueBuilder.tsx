@@ -24,6 +24,14 @@ import { api, isStatusError, type Queue, type SearchResult } from "@/lib/api";
 import { QueueItemRow } from "./QueueItemRow";
 
 const QUEUE_CAP = 20;
+const NON_TERMINAL: ReadonlySet<string> = new Set([
+  "pending",
+  "downloading",
+  "downloaded",
+  "analyzing",
+  "separating",
+  "transcribing",
+]);
 
 function useCurrentQueue() {
   const qc = useQueryClient();
@@ -36,6 +44,16 @@ function useCurrentQueue() {
         if (isStatusError(err, 404)) return null;
         throw err;
       }
+    },
+    // Poll while the queue is unlocked and any song is mid-pipeline, so
+    // status pills update without the user having to interact.
+    refetchInterval: (q) => {
+      const data = q.state.data as Queue | null | undefined;
+      if (data === undefined) return 1000;
+      if (data === null) return false;
+      if (data.locked) return false;
+      const anyMoving = data.items.some((i) => NON_TERMINAL.has(i.song.status));
+      return anyMoving ? 1500 : false;
     },
   });
 
@@ -211,8 +229,54 @@ export function QueueBuilder() {
     reorder.mutate(next);
   }
 
+  const startNew = useMutation({
+    mutationFn: () => api.createQueue(),
+    onSuccess: (q) => qc.setQueryData(["queue", "current"], q),
+  });
+
   if (queue.isLoading || !queue.data) {
     return <p className="text-sm opacity-70">Loading queue…</p>;
+  }
+
+  // The current queue is locked — show the resume CTAs instead of a builder
+  // that would 409 on every mutation. User can also start a fresh queue.
+  if (queue.data.locked) {
+    return (
+      <div className="flex flex-col gap-4">
+        <p className="text-sm opacity-70">
+          The current queue is locked ({queue.data.items.length} song
+          {queue.data.items.length === 1 ? "" : "s"}). Pick up where you left
+          off or start a new one.
+        </p>
+        <div className="flex flex-wrap gap-3">
+          <a
+            href="/processing"
+            className="border rounded px-4 py-2 text-sm hover:bg-black/5 dark:hover:bg-white/10"
+          >
+            Open processing view
+          </a>
+          <a
+            href="/player"
+            className="border rounded px-4 py-2 text-sm hover:bg-black/5 dark:hover:bg-white/10"
+          >
+            Open player
+          </a>
+          <button
+            type="button"
+            onClick={() => startNew.mutate()}
+            disabled={startNew.isPending}
+            className="border rounded px-4 py-2 text-sm hover:bg-black/5 dark:hover:bg-white/10 disabled:opacity-50"
+          >
+            {startNew.isPending ? "Creating…" : "Start a new queue"}
+          </button>
+        </div>
+        {startNew.error && (
+          <p className="text-sm text-red-600">
+            {(startNew.error as Error).message}
+          </p>
+        )}
+      </div>
+    );
   }
 
   const items = itemsInOrder;
