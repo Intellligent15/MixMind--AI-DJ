@@ -4,6 +4,7 @@ import logging
 from dataclasses import dataclass
 from pathlib import Path
 
+import soundfile as sf
 import torch
 import torchaudio
 from demucs.apply import apply_model
@@ -100,6 +101,13 @@ class StemSeparationService:
 
     @staticmethod
     def write_stem(tensor: torch.Tensor, sample_rate: int, dest: Path) -> None:
-        """Persist a single stem tensor as a WAV file."""
+        """Persist a single stem tensor as a 16-bit PCM WAV.
+
+        Demucs gives us (channels, samples); soundfile wants (samples,
+        channels). torchaudio.save in 2.11+ requires TorchCodec, which we
+        don't want to pull in just to write WAVs — soundfile is already
+        on the dep list via librosa.
+        """
         dest.parent.mkdir(parents=True, exist_ok=True)
-        torchaudio.save(str(dest), tensor, sample_rate)
+        audio = tensor.detach().cpu().numpy().T  # (samples, channels)
+        sf.write(str(dest), audio, sample_rate, subtype="PCM_16")
