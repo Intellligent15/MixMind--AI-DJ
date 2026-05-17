@@ -113,11 +113,23 @@ class LibrosaLaplacianDetector(SectionDetector):
         )
 
         # Snap first section to t=0 and last section to the track duration so
-        # there are no implicit gaps in the timeline.
+        # there are no implicit gaps in the timeline. Then drop any
+        # zero/negative-duration tail sections caused by librosa's beat-frame
+        # times slightly exceeding the audio duration. Repeat the snap on
+        # each removal so the last surviving section still ends at duration.
+        if not sections:
+            return [Section(start=0.0, end=float(duration), label="section_1")]
         sections[0] = Section(start=0.0, end=sections[0].end, label=sections[0].label)
         sections[-1] = Section(
             start=sections[-1].start, end=float(duration), label=sections[-1].label
         )
+        while len(sections) > 1 and sections[-1].end <= sections[-1].start:
+            sections.pop()
+            sections[-1] = Section(
+                start=sections[-1].start,
+                end=float(duration),
+                label=sections[-1].label,
+            )
         return sections
 
 
