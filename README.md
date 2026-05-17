@@ -6,7 +6,7 @@ See [ai-dj-spec.md](ai-dj-spec.md) for the full project specification.
 
 ## Status
 
-**Phase 2 complete** — YouTube search, downloads, and raw audio playback are working end-to-end. See [docs/the notes](docs/the notes). Phase 1 notes: [docs/the notes](docs/the notes).
+**Phase 3 complete** — analysis pipeline (BPM, key, beats, downbeats, sections, energy curve) wired end-to-end, with a per-song debug view (waveform + beat markers + section bands). See [docs/the notes](docs/the notes). Prior phases: [Phase 2](docs/the notes), [Phase 1](docs/the notes).
 
 Build phases are listed in the spec under **Build Phase Order**.
 
