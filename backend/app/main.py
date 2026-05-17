@@ -2,6 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api import search as search_api
+from app.api import songs as songs_api
 from app.core.db import check_db
 from app.core.redis_client import check_redis
 
@@ -15,6 +16,7 @@ app.add_middleware(
 )
 
 app.include_router(search_api.router)
+app.include_router(songs_api.router)
 
 
 @app.get("/health")

@@ -6,7 +6,7 @@ celery_app = Celery(
     "ai_dj",
     broker=settings.redis_url,
     backend=settings.redis_url,
-    include=["app.workers.ping"],
+    include=["app.workers.ping", "app.workers.download"],
 )
 
 celery_app.conf.update(

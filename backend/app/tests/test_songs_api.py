@@ -1,0 +1,146 @@
+from __future__ import annotations
+
+from pathlib import Path
+from unittest.mock import patch
+
+from fastapi.testclient import TestClient
+from sqlalchemy.orm import Session
+
+from app.api.deps import get_db
+from app.main import app
+from app.models import Song, SongStatus
+
+
+def _client(db_session: Session) -> TestClient:
+    def override_db():
+        yield db_session
+
+    app.dependency_overrides[get_db] = override_db
+    return TestClient(app)
+
+
+def teardown_function():
+    app.dependency_overrides.clear()
+
+
+def _payload(**overrides):
+    base = {
+        "youtube_video_id": "abc123",
+        "title": "A Song",
+        "artist": "An Artist",
+        "duration_seconds": 200.0,
+        "thumbnail_url": "https://t/thumb.jpg",
+    }
+    base.update(overrides)
+    return base
+
+
+def test_create_song_persists_and_enqueues(db_session: Session):
+    client = _client(db_session)
+    with patch("app.api.songs.download_song.delay") as delay:
+        r = client.post("/api/songs", json=_payload())
+    assert r.status_code == 201
+    body = r.json()
+    assert body["youtube_video_id"] == "abc123"
+    assert body["status"] == "pending"
+    delay.assert_called_once_with(body["id"])
+
+    row = db_session.get(Song, body["id"])
+    assert row is not None
+    assert row.title == "A Song"
+
+
+def test_create_song_dedupes_on_youtube_id(db_session: Session):
+    client = _client(db_session)
+    with patch("app.api.songs.download_song.delay") as delay:
+        r1 = client.post("/api/songs", json=_payload())
+        r2 = client.post("/api/songs", json=_payload(title="different title"))
+    assert r1.status_code == 201
+    assert r2.status_code == 201
+    assert r1.json()["id"] == r2.json()["id"]
+    # title stays as the original — dedupe returns existing row unchanged
+    assert r2.json()["title"] == "A Song"
+    # download enqueued only once
+    delay.assert_called_once()
+
+
+def test_get_song_returns_row(db_session: Session):
+    client = _client(db_session)
+    with patch("app.api.songs.download_song.delay"):
+        created = client.post("/api/songs", json=_payload()).json()
+    r = client.get(f"/api/songs/{created['id']}")
+    assert r.status_code == 200
+    assert r.json()["id"] == created["id"]
+
+
+def test_get_song_404(db_session: Session):
+    client = _client(db_session)
+    r = client.get("/api/songs/00000000-0000-0000-0000-000000000000")
+    assert r.status_code == 404
+
+
+def test_list_songs(db_session: Session):
+    client = _client(db_session)
+    with patch("app.api.songs.download_song.delay"):
+        client.post("/api/songs", json=_payload())
+        client.post("/api/songs", json=_payload(youtube_video_id="def", title="Two"))
+    r = client.get("/api/songs")
+    assert r.status_code == 200
+    titles = [s["title"] for s in r.json()]
+    assert set(titles) >= {"A Song", "Two"}
+
+
+def test_audio_409_when_not_downloaded(db_session: Session):
+    client = _client(db_session)
+    with patch("app.api.songs.download_song.delay"):
+        created = client.post("/api/songs", json=_payload()).json()
+    r = client.get(f"/api/songs/{created['id']}/audio")
+    assert r.status_code == 409
+
+
+def test_audio_streams_file_with_range_support(db_session: Session, tmp_path: Path):
+    audio = tmp_path / "abc123.wav"
+    audio.write_bytes(b"RIFF" + b"\x00" * 100)
+
+    song = Song(
+        youtube_video_id="abc123",
+        title="A Song",
+        artist=None,
+        duration_seconds=10.0,
+        thumbnail_url=None,
+        audio_path=str(audio),
+        status=SongStatus.downloaded,
+    )
+    db_session.add(song)
+    db_session.flush()
+
+    client = _client(db_session)
+    r = client.get(f"/api/songs/{song.id}/audio")
+    assert r.status_code == 200
+    assert r.headers["content-type"] == "audio/wav"
+    assert r.headers.get("accept-ranges") == "bytes"
+    assert r.content.startswith(b"RIFF")
+
+    r = client.get(
+        f"/api/songs/{song.id}/audio", headers={"Range": "bytes=4-7"}
+    )
+    assert r.status_code == 206
+    assert r.content == b"\x00\x00\x00\x00"
+
+
+def test_audio_410_when_file_missing(db_session: Session, tmp_path: Path):
+    song = Song(
+        youtube_video_id="abc",
+        title="T",
+        artist=None,
+        duration_seconds=1.0,
+        thumbnail_url=None,
+        audio_path=str(tmp_path / "does-not-exist.wav"),
+        status=SongStatus.downloaded,
+    )
+    db_session.add(song)
+    db_session.flush()
+
+    client = _client(db_session)
+    r = client.get(f"/api/songs/{song.id}/audio")
+    assert r.status_code == 410
