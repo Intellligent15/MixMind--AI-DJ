@@ -60,7 +60,7 @@ def get_song_audio(song_id: uuid.UUID, db: Session = Depends(get_db)) -> FileRes
     song = db.get(Song, song_id)
     if song is None:
         raise HTTPException(status_code=404, detail="song not found")
-    if song.status != SongStatus.downloaded or not song.audio_path:
+    if song.status in (SongStatus.pending, SongStatus.downloading) or not song.audio_path:
         raise HTTPException(
             status_code=409,
             detail=f"audio not available (status={song.status.value})",

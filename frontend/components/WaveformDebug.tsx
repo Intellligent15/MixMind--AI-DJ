@@ -47,6 +47,7 @@ export function WaveformDebug({
       height: 96,
       barWidth: 1,
       barGap: 1,
+      barHeight: 0.6,
       url: audioUrl,
     });
     wsRef.current = ws;
