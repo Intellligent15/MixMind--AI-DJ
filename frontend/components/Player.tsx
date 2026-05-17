@@ -136,10 +136,14 @@ export function Player() {
   // handles streaming + playback, and its events drive our UI state. We no
   // longer keep a separate <audio>, which was racing with WaveSurfer's
   // `media` option whenever the src changed.
-  const currentId = current?.id;
+  //
+  // The effect deps on currentIdx, not the song id, so that queueing the
+  // same song twice still produces a fresh WaveSurfer for each position —
+  // otherwise advancing from item N to item N+1 of the same song would be
+  // a no-op (currentId unchanged ⇒ effect doesn't re-run).
   const currentPlayable = current ? isPlayable(current) : false;
   useEffect(() => {
-    if (!waveContainerRef.current || !currentId || !currentPlayable) return;
+    if (!waveContainerRef.current || !current || !currentPlayable) return;
 
     setPosition(0);
     setDuration(0);
@@ -153,7 +157,7 @@ export function Player() {
       barWidth: 1,
       barGap: 1,
       barHeight: 0.6,
-      url: api.audioUrl(currentId),
+      url: api.audioUrl(current.id),
     });
     wsRef.current = ws;
 
@@ -183,7 +187,12 @@ export function Player() {
       ws.destroy();
       wsRef.current = null;
     };
-  }, [currentId, currentPlayable]);
+    // Include current?.id so the effect re-runs if the song at this position
+    // changes; gate on currentPlayable so we recreate WS when a previously
+    // not-yet-downloaded slot becomes available. We deliberately do NOT
+    // depend on `current` as a whole — that would tear WS down every time a
+    // status pill ticks via polling.
+  }, [currentIdx, current?.id, currentPlayable]);
 
   const togglePlay = useCallback(() => {
     const ws = wsRef.current;

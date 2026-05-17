@@ -147,8 +147,11 @@ export function ProcessingView() {
             step < 0
               ? 0
               : (step / (PIPELINE_STEPS.length - 1)) * 100;
+          // Queue items are unique even when the same song is queued twice;
+          // fall back to a composite if the item isn't there yet.
+          const key = items[idx]?.id ?? `${song.id}:${idx}`;
           return (
-            <li key={song.id} className="border rounded p-3 flex flex-col gap-2">
+            <li key={key} className="border rounded p-3 flex flex-col gap-2">
               <div className="flex items-center gap-3">
                 <span className="opacity-60 w-6 tabular-nums">{idx + 1}</span>
                 {song.thumbnail_url && (
