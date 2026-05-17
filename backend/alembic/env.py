@@ -6,6 +6,8 @@ from sqlalchemy import pool
 from alembic import context
 
 from app.core.config import settings
+from app.core.db import Base
+from app import models  # noqa: F401 — register models on Base.metadata
 
 config = context.config
 config.set_main_option("sqlalchemy.url", settings.database_url)
@@ -13,8 +15,7 @@ config.set_main_option("sqlalchemy.url", settings.database_url)
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-# Models will be imported here once they exist; target_metadata stays None until then.
-target_metadata = None
+target_metadata = Base.metadata
 
 # other values from the config, defined by the needs of env.py,
 # can be acquired:
