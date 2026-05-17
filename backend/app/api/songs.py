@@ -8,9 +8,10 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_db
-from app.models import Song, SongStatus
-from app.schemas import SongCreate, SongRead
+from app.models import Analysis, Song, SongStatus
+from app.schemas import AnalysisRead, SongCreate, SongRead
 from app.services.storage import get_storage
+from app.workers.analyze import analyze_song
 from app.workers.download import download_song
 
 router = APIRouter(prefix="/api/songs", tags=["songs"])
@@ -68,3 +69,32 @@ def get_song_audio(song_id: uuid.UUID, db: Session = Depends(get_db)) -> FileRes
     if not path.exists():
         raise HTTPException(status_code=410, detail="audio file missing on disk")
     return FileResponse(path, media_type="audio/wav", filename=path.name)
+
+
+@router.post(
+    "/{song_id}/analyze",
+    response_model=SongRead,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def trigger_analyze_song(song_id: uuid.UUID, db: Session = Depends(get_db)) -> Song:
+    song = db.get(Song, song_id)
+    if song is None:
+        raise HTTPException(status_code=404, detail="song not found")
+    if song.status not in (SongStatus.downloaded, SongStatus.analyzed, SongStatus.failed):
+        raise HTTPException(
+            status_code=409,
+            detail=f"song not ready for analysis (status={song.status.value})",
+        )
+    analyze_song.delay(str(song.id))
+    return song
+
+
+@router.get("/{song_id}/analysis", response_model=AnalysisRead)
+def get_song_analysis(song_id: uuid.UUID, db: Session = Depends(get_db)) -> Analysis:
+    song = db.get(Song, song_id)
+    if song is None:
+        raise HTTPException(status_code=404, detail="song not found")
+    analysis = db.scalar(select(Analysis).where(Analysis.song_id == song_id))
+    if analysis is None:
+        raise HTTPException(status_code=404, detail="analysis not available")
+    return analysis

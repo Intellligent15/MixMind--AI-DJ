@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 
 from app.api.deps import get_db
 from app.main import app
-from app.models import Song, SongStatus
+from app.models import Analysis, Song, SongStatus
 from app.services.storage import LocalFilesystemStorage
 
 
@@ -159,3 +159,93 @@ def test_audio_410_when_file_missing(
     client = _client(db_session)
     r = client.get(f"/api/songs/{song.id}/audio")
     assert r.status_code == 410
+
+
+def _downloaded_song(db: Session, vid: str = "downloaded") -> Song:
+    song = Song(
+        youtube_video_id=vid,
+        title="T",
+        artist=None,
+        duration_seconds=10.0,
+        thumbnail_url=None,
+        audio_path=f"audio/{vid}.wav",
+        status=SongStatus.downloaded,
+    )
+    db.add(song)
+    db.flush()
+    return song
+
+
+def test_trigger_analyze_enqueues_when_downloaded(db_session: Session):
+    song = _downloaded_song(db_session)
+    client = _client(db_session)
+    with patch("app.api.songs.analyze_song.delay") as delay:
+        r = client.post(f"/api/songs/{song.id}/analyze")
+    assert r.status_code == 202
+    delay.assert_called_once_with(str(song.id))
+
+
+def test_trigger_analyze_404_unknown_song(db_session: Session):
+    client = _client(db_session)
+    r = client.post("/api/songs/00000000-0000-0000-0000-000000000000/analyze")
+    assert r.status_code == 404
+
+
+def test_trigger_analyze_409_when_not_downloaded(db_session: Session):
+    song = Song(
+        youtube_video_id="not-yet",
+        title="T",
+        artist=None,
+        duration_seconds=10.0,
+        thumbnail_url=None,
+        status=SongStatus.pending,
+    )
+    db_session.add(song)
+    db_session.flush()
+    client = _client(db_session)
+    with patch("app.api.songs.analyze_song.delay") as delay:
+        r = client.post(f"/api/songs/{song.id}/analyze")
+    assert r.status_code == 409
+    delay.assert_not_called()
+
+
+def test_get_analysis_returns_row(db_session: Session):
+    song = _downloaded_song(db_session, vid="hasanalysis")
+    db_session.add(
+        Analysis(
+            song_id=song.id,
+            bpm=120.0,
+            key="C",
+            camelot_key="8B",
+            time_signature=4,
+            beat_grid=[0.0, 0.5],
+            downbeats=[0.0],
+            sections=[{"start": 0.0, "end": 10.0, "label": "section_1"}],
+            energy_curve=[0.1, 0.2],
+            vocal_segments=[],
+        )
+    )
+    db_session.flush()
+    client = _client(db_session)
+    r = client.get(f"/api/songs/{song.id}/analysis")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["bpm"] == 120.0
+    assert body["camelot_key"] == "8B"
+    assert body["sections"] == [
+        {"start": 0.0, "end": 10.0, "label": "section_1"}
+    ]
+
+
+def test_get_analysis_404_song_not_found(db_session: Session):
+    client = _client(db_session)
+    r = client.get("/api/songs/00000000-0000-0000-0000-000000000000/analysis")
+    assert r.status_code == 404
+
+
+def test_get_analysis_404_when_not_yet_analyzed(db_session: Session):
+    song = _downloaded_song(db_session, vid="no-analysis")
+    client = _client(db_session)
+    r = client.get(f"/api/songs/{song.id}/analysis")
+    assert r.status_code == 404
+    assert "analysis" in r.json()["detail"].lower()
