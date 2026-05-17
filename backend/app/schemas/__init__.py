@@ -1,6 +1,7 @@
 from app.schemas.analysis import AnalysisRead, SectionSchema
 from app.schemas.queue import QueueItemAdd, QueueItemRead, QueueRead, QueueReorder
 from app.schemas.song import SearchResultSchema, SongCreate, SongRead
+from app.schemas.stems import StemsRead
 
 __all__ = [
     "AnalysisRead",
@@ -12,4 +13,5 @@ __all__ = [
     "SearchResultSchema",
     "SongCreate",
     "SongRead",
+    "StemsRead",
 ]
