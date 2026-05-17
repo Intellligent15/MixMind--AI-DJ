@@ -6,7 +6,7 @@ See [ai-dj-spec.md](ai-dj-spec.md) for the full project specification.
 
 ## Status
 
-**Phase 3 complete** — analysis pipeline (BPM, key, beats, downbeats, sections, energy curve) wired end-to-end, with a per-song debug view (waveform + beat markers + section bands). See [docs/the notes](docs/the notes). Prior phases: [Phase 2](docs/the notes), [Phase 1](docs/the notes).
+**Phase 4 complete** — queue UI (dnd-kit) at `/`, library at `/library`, processing view gated on first 2 songs analyzed, fullscreen player shell with back-to-back hard-cut playback. See [docs/the notes](docs/the notes). Prior phases: [Phase 3](docs/the notes), [Phase 2](docs/the notes), [Phase 1](docs/the notes).
 
 Build phases are listed in the spec under **Build Phase Order**.
 
