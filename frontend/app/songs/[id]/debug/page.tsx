@@ -1,9 +1,10 @@
 "use client";
 
 import Link from "next/link";
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { use } from "react";
-import { api } from "@/lib/api";
+import { api, isStatusError } from "@/lib/api";
+import { StemsDebug } from "@/components/StemsDebug";
 import { WaveformDebug } from "@/components/WaveformDebug";
 
 export default function SongDebugPage({
@@ -13,15 +14,40 @@ export default function SongDebugPage({
 }) {
   const { id } = use(params);
 
+  const qc = useQueryClient();
   const songQ = useQuery({
     queryKey: ["song", id],
     queryFn: () => api.getSong(id),
+    // Poll while separation is mid-flight so the stems panel appears as
+    // soon as the worker finishes.
+    refetchInterval: (q) =>
+      q.state.data?.status === "separating" ? 1500 : false,
   });
   const analysisQ = useQuery({
     queryKey: ["analysis", id],
     queryFn: () => api.getAnalysis(id),
     retry: false,
   });
+  const stemsQ = useQuery({
+    queryKey: ["stems", id],
+    queryFn: () => api.getStems(id),
+    retry: false,
+    // Once a song flips out of separating, refetch stems once to pick the
+    // new row up. Cheap because the query is otherwise idle.
+    refetchInterval: (q) => {
+      if (q.state.data) return false;
+      return songQ.data?.status === "separating" ? 1500 : false;
+    },
+  });
+  const separate = useMutation({
+    mutationFn: () => api.triggerSeparate(id),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["song", id] });
+    },
+  });
+  const stemsAvailable = !!stemsQ.data;
+  const stemsMissing404 =
+    !stemsQ.data && isStatusError(stemsQ.error, 404);
 
   return (
     <main className="min-h-screen max-w-5xl mx-auto p-8 flex flex-col gap-6 font-mono">
@@ -87,6 +113,33 @@ export default function SongDebugPage({
             analysis={analysisQ.data}
             audioUrl={api.audioUrl(id)}
           />
+
+          {stemsAvailable && (
+            <StemsDebug songId={id} stems={stemsQ.data!} />
+          )}
+          {!stemsAvailable && (
+            <section className="flex items-center justify-between border rounded p-3">
+              <p className="text-sm opacity-80">
+                {songQ.data.status === "separating"
+                  ? "Separating stems… (this typically takes ~30s per minute of audio on MPS)"
+                  : stemsMissing404
+                    ? "No stems yet. Run Demucs to separate vocals, drums, bass, and other."
+                    : `Stems unavailable: ${(stemsQ.error as Error)?.message ?? "unknown error"}`}
+              </p>
+              <button
+                type="button"
+                onClick={() => separate.mutate()}
+                disabled={
+                  separate.isPending || songQ.data.status === "separating"
+                }
+                className="text-sm border rounded px-3 py-1 hover:bg-black/5 dark:hover:bg-white/10 disabled:opacity-50"
+              >
+                {separate.isPending || songQ.data.status === "separating"
+                  ? "Separating…"
+                  : "Separate stems"}
+              </button>
+            </section>
+          )}
 
           <section className="flex flex-col gap-2">
             <h2 className="font-semibold">Sections</h2>

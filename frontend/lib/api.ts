@@ -72,6 +72,25 @@ export type Analysis = {
   updated_at: string;
 };
 
+export const STEM_NAMES = ["vocals", "drums", "bass", "other"] as const;
+export type StemName = (typeof STEM_NAMES)[number];
+
+export type StemsStatus = "pending" | "separating" | "separated" | "failed";
+
+export type Stems = {
+  id: string;
+  song_id: string;
+  model_name: string;
+  status: StemsStatus;
+  vocals_path: string | null;
+  drums_path: string | null;
+  bass_path: string | null;
+  other_path: string | null;
+  vocal_rms: number | null;
+  created_at: string;
+  updated_at: string;
+};
+
 export type QueueItem = {
   id: string;
   queue_id: string;
@@ -103,6 +122,12 @@ export const api = {
   triggerAnalyze: (id: string) =>
     request<Song>(`/api/songs/${id}/analyze`, { method: "POST" }),
   getAnalysis: (id: string) => request<Analysis>(`/api/songs/${id}/analysis`),
+
+  triggerSeparate: (id: string) =>
+    request<Song>(`/api/songs/${id}/separate`, { method: "POST" }),
+  getStems: (id: string) => request<Stems>(`/api/songs/${id}/stems`),
+  stemAudioUrl: (id: string, name: StemName) =>
+    `${API_BASE}/api/songs/${id}/stems/${name}`,
 
   getCurrentQueue: () => request<Queue>(`/api/queues/current`),
   createQueue: () => request<Queue>(`/api/queues`, { method: "POST" }),
