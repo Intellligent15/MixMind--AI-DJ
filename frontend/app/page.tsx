@@ -1,15 +1,16 @@
-import { SearchPanel } from "@/components/SearchPanel";
-import { DownloadedSongs } from "@/components/DownloadedSongs";
+import { NavHeader } from "@/components/NavHeader";
 
 export default function HomePage() {
   return (
-    <main className="min-h-screen max-w-4xl mx-auto p-8 flex flex-col gap-8 font-mono">
-      <header className="flex items-baseline justify-between">
-        <h1 className="text-3xl font-bold">AI DJ</h1>
-        <p className="text-xs opacity-70">Phase 3 — analysis pipeline</p>
-      </header>
-      <SearchPanel />
-      <DownloadedSongs />
+    <main className="min-h-screen max-w-5xl mx-auto p-8 flex flex-col gap-8 font-mono">
+      <NavHeader subtitle="Phase 4 — queue" />
+      <p className="text-sm opacity-70">
+        Queue builder lands in the next commit. Head to{" "}
+        <a href="/library" className="underline">
+          /library
+        </a>{" "}
+        for now.
+      </p>
     </main>
   );
 }

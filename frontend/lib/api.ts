@@ -72,6 +72,21 @@ export type Analysis = {
   updated_at: string;
 };
 
+export type QueueItem = {
+  id: string;
+  queue_id: string;
+  position: number;
+  song: Song;
+};
+
+export type Queue = {
+  id: string;
+  locked: boolean;
+  created_at: string;
+  locked_at: string | null;
+  items: QueueItem[];
+};
+
 export const api = {
   search: (q: string, limit = 10) =>
     request<SearchResult[]>(
@@ -88,4 +103,29 @@ export const api = {
   triggerAnalyze: (id: string) =>
     request<Song>(`/api/songs/${id}/analyze`, { method: "POST" }),
   getAnalysis: (id: string) => request<Analysis>(`/api/songs/${id}/analysis`),
+
+  getCurrentQueue: () => request<Queue>(`/api/queues/current`),
+  createQueue: () => request<Queue>(`/api/queues`, { method: "POST" }),
+  addToQueue: (queueId: string, songId: string) =>
+    request<Queue>(`/api/queues/${queueId}/items`, {
+      method: "POST",
+      body: JSON.stringify({ song_id: songId }),
+    }),
+  removeFromQueue: (queueId: string, itemId: string) =>
+    request<Queue>(`/api/queues/${queueId}/items/${itemId}`, {
+      method: "DELETE",
+    }),
+  reorderQueue: (queueId: string, orderedItemIds: string[]) =>
+    request<Queue>(`/api/queues/${queueId}/items`, {
+      method: "PATCH",
+      body: JSON.stringify({ ordered_item_ids: orderedItemIds }),
+    }),
+  lockQueue: (queueId: string) =>
+    request<Queue>(`/api/queues/${queueId}/lock`, { method: "POST" }),
 };
+
+// Distinguishes a `request()` 4xx/5xx from a network error so callers can
+// branch on status (e.g. /current returning 404 means "no queue yet").
+export function isStatusError(err: unknown, code: number): boolean {
+  return err instanceof Error && err.message.startsWith(`${code} `);
+}
