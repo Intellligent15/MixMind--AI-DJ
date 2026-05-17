@@ -14,7 +14,10 @@ import pytest
 
 from app.services.analysis.sections.base import Section
 from app.services.analysis.sections.factory import get_section_detector
-from app.services.analysis.sections.librosa_laplacian import LibrosaLaplacianDetector
+from app.services.analysis.sections.librosa_laplacian import (
+    LibrosaLaplacianDetector,
+    _merge_short_sections,
+)
 
 SR = 22050
 
@@ -86,3 +89,78 @@ def test_section_to_dict_is_json_friendly():
     s = Section(start=1.0, end=2.5, label="section_3")
     d = s.to_dict()
     assert d == {"start": 1.0, "end": 2.5, "label": "section_3"}
+
+
+def test_merge_short_absorbs_into_longer_neighbour():
+    # Short middle section flanked by a long left and short-but-longer right;
+    # the left is longer so the short one should merge left.
+    sections = [
+        Section(0.0, 20.0, "section_1"),
+        Section(20.0, 23.0, "section_2"),  # 3s — under the 8s floor
+        Section(23.0, 35.0, "section_3"),
+    ]
+    out = _merge_short_sections(sections, min_seconds=8.0)
+    assert len(out) == 2
+    assert out[0] == Section(0.0, 23.0, "section_1")  # absorbed left
+    assert out[1] == Section(23.0, 35.0, "section_3")
+
+
+def test_merge_short_picks_longer_of_two_neighbours():
+    sections = [
+        Section(0.0, 10.0, "A"),
+        Section(10.0, 12.0, "B"),
+        Section(12.0, 40.0, "C"),  # longer than the left neighbour
+    ]
+    out = _merge_short_sections(sections, min_seconds=8.0)
+    assert out == [
+        Section(0.0, 10.0, "A"),
+        Section(10.0, 40.0, "C"),
+    ]
+
+
+def test_merge_short_handles_edges():
+    # Short leading section has only a right neighbour.
+    sections = [
+        Section(0.0, 3.0, "intro"),
+        Section(3.0, 30.0, "main"),
+    ]
+    out = _merge_short_sections(sections, min_seconds=8.0)
+    assert out == [Section(0.0, 30.0, "main")]
+
+
+def test_merge_short_cascades_until_clean():
+    # Several short sections in a row should all dissolve.
+    sections = [
+        Section(0.0, 20.0, "A"),
+        Section(20.0, 22.0, "B"),
+        Section(22.0, 24.0, "C"),
+        Section(24.0, 26.0, "D"),
+        Section(26.0, 50.0, "E"),
+    ]
+    out = _merge_short_sections(sections, min_seconds=8.0)
+    durations = [s.end - s.start for s in out]
+    assert all(d >= 8.0 for d in durations)
+    # No gaps, full timeline preserved.
+    assert out[0].start == 0.0
+    assert out[-1].end == 50.0
+    for prev, nxt in zip(out, out[1:]):
+        assert nxt.start == prev.end
+
+
+def test_merge_short_never_empties_input():
+    # If the whole track is shorter than the threshold, return the one section.
+    sections = [Section(0.0, 5.0, "tiny")]
+    out = _merge_short_sections(sections, min_seconds=8.0)
+    assert out == sections
+
+
+def test_merge_short_coalesces_adjacent_same_label_after_merge():
+    # [A, short, A] — merging the short into either neighbour creates
+    # adjacent same-label sections which should collapse into one.
+    sections = [
+        Section(0.0, 20.0, "A"),
+        Section(20.0, 22.0, "B"),
+        Section(22.0, 50.0, "A"),
+    ]
+    out = _merge_short_sections(sections, min_seconds=8.0)
+    assert out == [Section(0.0, 50.0, "A")]

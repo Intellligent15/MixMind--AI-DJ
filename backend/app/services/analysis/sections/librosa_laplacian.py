@@ -16,20 +16,30 @@ from pathlib import Path
 
 import librosa
 import numpy as np
+import scipy.signal
 import scipy.sparse
 from sklearn.cluster import KMeans
 
 from app.services.analysis.sections.base import Section, SectionDetector
 
 _DEFAULT_SR = 22050
-_K_MIN = 4
-_K_MAX = 10
+_K_MIN = 3
+_K_MAX = 6
+_MIN_SECTION_SECONDS = 8.0
 
 
 class LibrosaLaplacianDetector(SectionDetector):
-    def __init__(self, k_min: int = _K_MIN, k_max: int = _K_MAX) -> None:
+    def __init__(
+        self,
+        k_min: int = _K_MIN,
+        k_max: int = _K_MAX,
+        median_filter_size: int = 15,
+        min_section_seconds: float = _MIN_SECTION_SECONDS,
+    ) -> None:
         self.k_min = k_min
         self.k_max = k_max
+        self.median_filter_size = median_filter_size
+        self.min_section_seconds = min_section_seconds
 
     def detect_file(self, path: Path) -> list[Section]:
         y, sr = librosa.load(str(path), sr=_DEFAULT_SR, mono=True)
@@ -86,6 +96,8 @@ class LibrosaLaplacianDetector(SectionDetector):
         embedding = embedding / norms
 
         labels = KMeans(n_clusters=k, n_init=10, random_state=0).fit_predict(embedding)
+        if self.median_filter_size > 1:
+            labels = scipy.signal.medfilt(labels, kernel_size=self.median_filter_size).astype(int)
 
         # Convert beat-frame labels into time-domain segments.
         beat_times = librosa.frames_to_time(beats, sr=sr)
@@ -130,7 +142,73 @@ class LibrosaLaplacianDetector(SectionDetector):
                 end=float(duration),
                 label=sections[-1].label,
             )
+
+        # Merge any section shorter than min_section_seconds into the longer of
+        # its two neighbours (or the only neighbour if at an edge). This kills
+        # the residual flicker the median filter doesn't catch — genuine
+        # structural sections in pop/electronic are 16-60s, so an 8s floor
+        # erases noise without touching real boundaries. Merging adopts the
+        # neighbour's label so structurally similar runs stay grouped.
+        sections = _merge_short_sections(sections, self.min_section_seconds)
+
         return sections
+
+
+def _merge_short_sections(
+    sections: list[Section], min_seconds: float
+) -> list[Section]:
+    """Iteratively absorb sub-min-duration sections into their longer neighbour.
+
+    Each iteration finds the shortest under-threshold section and merges it
+    with whichever neighbour is longer (or the only neighbour at the edges).
+    The merged result keeps the neighbour's label so labels stay meaningful.
+    Loop terminates when no section is under the threshold, or only one
+    section remains.
+    """
+    while len(sections) > 1:
+        durations = [s.end - s.start for s in sections]
+        shortest_idx = min(range(len(sections)), key=lambda i: durations[i])
+        if durations[shortest_idx] >= min_seconds:
+            break
+
+        if shortest_idx == 0:
+            target = 1
+        elif shortest_idx == len(sections) - 1:
+            target = shortest_idx - 1
+        else:
+            left = shortest_idx - 1
+            right = shortest_idx + 1
+            target = left if durations[left] >= durations[right] else right
+
+        if target < shortest_idx:
+            merged = Section(
+                start=sections[target].start,
+                end=sections[shortest_idx].end,
+                label=sections[target].label,
+            )
+            sections = sections[:target] + [merged] + sections[shortest_idx + 1 :]
+        else:
+            merged = Section(
+                start=sections[shortest_idx].start,
+                end=sections[target].end,
+                label=sections[target].label,
+            )
+            sections = sections[:shortest_idx] + [merged] + sections[target + 1 :]
+
+        # A merge can produce adjacent same-label neighbours (e.g. [A, short_X, A]
+        # collapses to [A, A]). Coalesce them so the section list stays canonical.
+        sections = _coalesce_adjacent(sections)
+    return sections
+
+
+def _coalesce_adjacent(sections: list[Section]) -> list[Section]:
+    out: list[Section] = []
+    for s in sections:
+        if out and out[-1].label == s.label and out[-1].end == s.start:
+            out[-1] = Section(start=out[-1].start, end=s.end, label=out[-1].label)
+        else:
+            out.append(s)
+    return out
 
 
 def _choose_k(eigvals: np.ndarray, k_min: int, k_max: int) -> int:
