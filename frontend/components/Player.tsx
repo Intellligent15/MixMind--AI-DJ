@@ -110,18 +110,31 @@ export function Player() {
     }
   }, [songs, currentIdx, findNextPlayable]);
 
-  // WaveSurfer follows the audio element so the waveform's playhead stays in
-  // sync with whatever <audio> is doing. Recreated when the current song
-  // changes (the audio element's src changes too, so WaveSurfer needs to
-  // re-render the waveform anyway).
+  // Drive the audio element manually whenever the current song changes:
+  // a reactive `src=` prop on <audio> is unreliable across browsers (and
+  // doesn't always trigger a reload when WaveSurfer is wrapping the
+  // element via the `media` option). Setting .src + calling .load() then
+  // .play() guarantees the new track plays. WaveSurfer is recreated in
+  // the same effect so its waveform always matches the loaded src.
   const currentId = current?.id;
   const currentPlayable = current ? isPlayable(current) : false;
   useEffect(() => {
-    if (!waveContainerRef.current || !audioRef.current || !currentPlayable) {
-      return;
+    const audio = audioRef.current;
+    const container = waveContainerRef.current;
+    if (!audio || !container || !currentId || !currentPlayable) return;
+
+    const newSrc = api.audioUrl(currentId);
+    if (audio.src !== newSrc) {
+      audio.src = newSrc;
+      audio.load();
     }
+    audio.play().catch(() => {
+      // Browser autoplay policy may block us before the first user gesture;
+      // the Play button will recover.
+    });
+
     const ws = WaveSurfer.create({
-      container: waveContainerRef.current,
+      container,
       waveColor: "#94a3b8",
       progressColor: "#0ea5e9",
       cursorColor: "#0ea5e9",
@@ -129,7 +142,7 @@ export function Player() {
       barWidth: 1,
       barGap: 1,
       barHeight: 0.6,
-      media: audioRef.current,
+      media: audio,
     });
     wsRef.current = ws;
     return () => {
@@ -189,8 +202,6 @@ export function Player() {
     );
   }
 
-  const audioSrc = isPlayable(current) ? api.audioUrl(current.id) : undefined;
-
   return (
     <div className="flex flex-col gap-6">
       {skipNotice && (
@@ -220,8 +231,6 @@ export function Player() {
 
       <audio
         ref={audioRef}
-        src={audioSrc}
-        autoPlay
         onPlay={() => setIsPlaying(true)}
         onPause={() => setIsPlaying(false)}
         onLoadedMetadata={(e) => setDuration(e.currentTarget.duration)}
