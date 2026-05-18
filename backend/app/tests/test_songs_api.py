@@ -9,7 +9,15 @@ from sqlalchemy.orm import Session
 
 from app.api.deps import get_db
 from app.main import app
-from app.models import Analysis, Song, SongStatus, Stems, StemsStatus
+from app.models import (
+    Analysis,
+    Song,
+    SongStatus,
+    Stems,
+    StemsStatus,
+    Transcription,
+    TranscriptionStatus,
+)
 from app.services.storage import LocalFilesystemStorage
 
 
@@ -370,3 +378,133 @@ def test_get_stem_audio_409_when_path_null(db_session: Session):
     client = _client(db_session)
     r = client.get(f"/api/songs/{song.id}/stems/vocals")
     assert r.status_code == 409
+
+
+# --- transcribe --------------------------------------------------------------
+
+
+def _transcription_row(
+    db: Session, song: Song, **overrides
+) -> Transcription:
+    base = dict(
+        song_id=song.id,
+        model_name="large-v3",
+        status=TranscriptionStatus.success,
+        language="en",
+        segments=[
+            {
+                "start": 0.0,
+                "end": 1.0,
+                "text": " hi",
+                "words": [{"start": 0.0, "end": 1.0, "word": " hi"}],
+            }
+        ],
+        vocal_rms_threshold=0.005,
+        vocal_rms_observed=0.15,
+        duration_seconds=1.0,
+    )
+    base.update(overrides)
+    row = Transcription(**base)
+    db.add(row)
+    db.flush()
+    return row
+
+
+def test_trigger_transcribe_enqueues_when_analyzed_with_stems(db_session: Session):
+    song = _analyzed_song(db_session, vid="tr-ok")
+    _stems_row(db_session, song)
+    client = _client(db_session)
+    with patch("app.api.songs.celery_app.send_task") as send:
+        r = client.post(f"/api/songs/{song.id}/transcribe")
+    assert r.status_code == 202
+    send.assert_called_once_with(
+        "app.workers.transcribe.transcribe_song", args=[str(song.id)]
+    )
+
+
+def test_trigger_transcribe_404_unknown_song(db_session: Session):
+    client = _client(db_session)
+    r = client.post(
+        "/api/songs/00000000-0000-0000-0000-000000000000/transcribe"
+    )
+    assert r.status_code == 404
+
+
+def test_trigger_transcribe_409_when_not_analyzed(db_session: Session):
+    song = _downloaded_song(db_session, vid="tr-too-early")
+    client = _client(db_session)
+    with patch("app.api.songs.celery_app.send_task") as send:
+        r = client.post(f"/api/songs/{song.id}/transcribe")
+    assert r.status_code == 409
+    send.assert_not_called()
+
+
+def test_trigger_transcribe_409_when_no_stems(db_session: Session):
+    song = _analyzed_song(db_session, vid="tr-no-stems")
+    client = _client(db_session)
+    with patch("app.api.songs.celery_app.send_task") as send:
+        r = client.post(f"/api/songs/{song.id}/transcribe")
+    assert r.status_code == 409
+    send.assert_not_called()
+
+
+def test_trigger_transcribe_409_when_vocals_path_null(db_session: Session):
+    song = _analyzed_song(db_session, vid="tr-partial-stems")
+    _stems_row(db_session, song, vocals_path=None)
+    client = _client(db_session)
+    with patch("app.api.songs.celery_app.send_task") as send:
+        r = client.post(f"/api/songs/{song.id}/transcribe")
+    assert r.status_code == 409
+    send.assert_not_called()
+
+
+def test_get_transcription_returns_row(db_session: Session):
+    song = _analyzed_song(db_session, vid="has-transcription")
+    _transcription_row(db_session, song)
+    client = _client(db_session)
+    r = client.get(f"/api/songs/{song.id}/transcription")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "success"
+    assert body["model_name"] == "large-v3"
+    assert body["language"] == "en"
+    assert body["segments"][0]["text"] == " hi"
+    assert body["segments"][0]["words"][0]["word"] == " hi"
+    assert body["vocal_rms_threshold"] == 0.005
+    assert body["vocal_rms_observed"] == 0.15
+
+
+def test_get_transcription_returns_skipped_row(db_session: Session):
+    song = _analyzed_song(db_session, vid="skipped-tr")
+    _transcription_row(
+        db_session,
+        song,
+        status=TranscriptionStatus.skipped_instrumental,
+        language=None,
+        segments=[],
+        vocal_rms_observed=0.001,
+        duration_seconds=None,
+    )
+    client = _client(db_session)
+    r = client.get(f"/api/songs/{song.id}/transcription")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "skipped_instrumental"
+    assert body["language"] is None
+    assert body["segments"] == []
+    assert body["duration_seconds"] is None
+
+
+def test_get_transcription_404_song_not_found(db_session: Session):
+    client = _client(db_session)
+    r = client.get(
+        "/api/songs/00000000-0000-0000-0000-000000000000/transcription"
+    )
+    assert r.status_code == 404
+
+
+def test_get_transcription_404_when_not_transcribed(db_session: Session):
+    song = _analyzed_song(db_session, vid="no-transcription-yet")
+    client = _client(db_session)
+    r = client.get(f"/api/songs/{song.id}/transcription")
+    assert r.status_code == 404

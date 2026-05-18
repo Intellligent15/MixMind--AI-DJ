@@ -9,32 +9,45 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_db
-from app.models import Queue, QueueItem, Song, SongStatus, Stems
+from app.models import (
+    Queue,
+    QueueItem,
+    Song,
+    SongStatus,
+    Stems,
+    Transcription,
+)
 from app.schemas import QueueItemAdd, QueueRead, QueueReorder
 from app.workers import celery_app
 from app.workers.analyze import analyze_song
 from app.workers.download import download_song
 
 # Dispatched by task name so the API container doesn't have to import
-# app.workers.separate (which pulls torch + demucs — native-worker only).
+# app.workers.separate / app.workers.transcribe (which pull torch + demucs
+# + mlx-whisper — native-worker only).
 SEPARATE_TASK = "app.workers.separate.separate_stems"
+TRANSCRIBE_TASK = "app.workers.transcribe.transcribe_song"
 
 
-class _SeparateTaskShim:
+class _TaskShim:
     """Adapter exposing the .s/.si/.delay surface tests + chain composition
-    expect, without importing the underlying torch-bound module."""
+    expect, without importing the underlying ML-bound modules."""
+
+    def __init__(self, task_name: str) -> None:
+        self._task_name = task_name
 
     def s(self, *args):
-        return celery_app.signature(SEPARATE_TASK, args=args)
+        return celery_app.signature(self._task_name, args=args)
 
     def si(self, *args):
-        return celery_app.signature(SEPARATE_TASK, args=args, immutable=True)
+        return celery_app.signature(self._task_name, args=args, immutable=True)
 
     def delay(self, *args):
-        return celery_app.send_task(SEPARATE_TASK, args=list(args))
+        return celery_app.send_task(self._task_name, args=list(args))
 
 
-separate_stems = _SeparateTaskShim()
+separate_stems = _TaskShim(SEPARATE_TASK)
+transcribe_song = _TaskShim(TRANSCRIBE_TASK)
 
 router = APIRouter(prefix="/api/queues", tags=["queues"])
 
@@ -202,41 +215,48 @@ def reorder_queue_items(
 def _enqueue_pipeline_for_song(song: Song, db: Session) -> None:
     """Kick off whatever pipeline stages a song still needs.
 
-    Phase 5 extends Phase 4 with stem separation. The chain length depends
-    on what the song already has:
-      pending/failed-no-audio  -> download -> analyze -> separate
-      downloaded/failed-w-audio -> analyze -> separate
-      analyzed (no stems row)   -> separate
-      analyzed (has stems row)  -> nothing
+    Phase 6 extends Phase 5 with Whisper transcription. The full chain is:
+        download -> analyze -> separate -> transcribe
+    We trim from the front depending on what the song already has:
+        pending/failed-no-audio   -> full 4-step chain
+        downloaded/failed-w-audio -> analyze -> separate -> transcribe
+        analyzed/ready, no stems  -> separate -> transcribe
+        analyzed/ready, has stems, no transcription -> transcribe
+        ready, has stems + transcription -> nothing (fully processed)
 
-    Later phases will extend this with transcription, lyrics, mix planning.
+    .si() ignores upstream returns so each task only sees its own song_id.
     """
     sid = str(song.id)
-    # Has the song already cleared the separation stage? One Stems row
-    # per song; presence means we've already separated (or are mid-flight).
     has_stems = (
         db.scalar(select(Stems.id).where(Stems.song_id == song.id)) is not None
     )
+    has_transcription = (
+        db.scalar(select(Transcription.id).where(Transcription.song_id == song.id))
+        is not None
+    )
 
     if song.status in (SongStatus.pending, SongStatus.failed) and not song.audio_path:
-        # download -> analyze -> separate. .si() ignores upstream returns
-        # so each task only sees its own song_id arg.
-        if has_stems:
-            chain(download_song.s(sid), analyze_song.si(sid)).delay()
-        else:
-            chain(
-                download_song.s(sid),
-                analyze_song.si(sid),
-                separate_stems.si(sid),
-            ).delay()
+        # Full chain. We don't try to skip the tail when has_stems/
+        # has_transcription is already true here because those situations
+        # don't occur for a song that's never been downloaded.
+        chain(
+            download_song.s(sid),
+            analyze_song.si(sid),
+            separate_stems.si(sid),
+            transcribe_song.si(sid),
+        ).delay()
     elif song.status in (SongStatus.downloaded, SongStatus.failed):
-        if has_stems:
-            analyze_song.delay(sid)
-        else:
-            chain(analyze_song.s(sid), separate_stems.si(sid)).delay()
-    elif song.status in (SongStatus.analyzed, SongStatus.ready) and not has_stems:
-        separate_stems.delay(sid)
-    # analyzed/ready with stems already: nothing to do.
+        chain(
+            analyze_song.s(sid),
+            separate_stems.si(sid),
+            transcribe_song.si(sid),
+        ).delay()
+    elif song.status in (SongStatus.analyzed, SongStatus.ready):
+        if not has_stems:
+            chain(separate_stems.s(sid), transcribe_song.si(sid)).delay()
+        elif not has_transcription:
+            transcribe_song.delay(sid)
+        # else: fully processed — nothing to do.
 
 
 @router.post(

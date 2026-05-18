@@ -8,17 +8,24 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_db
-from app.models import Analysis, Song, SongStatus, Stems
-from app.schemas import AnalysisRead, SongCreate, SongRead, StemsRead
+from app.models import Analysis, Song, SongStatus, Stems, Transcription
+from app.schemas import (
+    AnalysisRead,
+    SongCreate,
+    SongRead,
+    StemsRead,
+    TranscriptionRead,
+)
 from app.services.storage import get_storage
 from app.workers import celery_app
 from app.workers.analyze import analyze_song
 from app.workers.download import download_song
 
 # Dispatched via celery_app.send_task so the API container doesn't have to
-# import app.workers.separate — that module pulls in torch + demucs, which
-# only the native worker needs.
+# import app.workers.separate / app.workers.transcribe — those modules pull
+# in torch + demucs + mlx-whisper, which only the native worker needs.
 SEPARATE_TASK = "app.workers.separate.separate_stems"
+TRANSCRIBE_TASK = "app.workers.transcribe.transcribe_song"
 # Mirrors STEM_NAMES in app.services.stems (kept inline so the API doesn't
 # import the stems service module either — same reason as above).
 STEM_NAMES: tuple[str, ...] = ("vocals", "drums", "bass", "other")
@@ -173,3 +180,52 @@ def get_song_stem_audio(
     if not path.exists():
         raise HTTPException(status_code=410, detail="stem file missing on disk")
     return FileResponse(path, media_type="audio/wav", filename=path.name)
+
+
+# Same gate as the transcribe_song worker's CLAIMABLE_STATUSES — keep in
+# sync. The API rejects early so the frontend gets a useful error instead
+# of a silently-dropped task.
+TRANSCRIBE_GATE = (SongStatus.analyzed, SongStatus.ready, SongStatus.failed)
+
+
+@router.post(
+    "/{song_id}/transcribe",
+    response_model=SongRead,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def trigger_transcribe_song(
+    song_id: uuid.UUID, db: Session = Depends(get_db)
+) -> Song:
+    song = db.get(Song, song_id)
+    if song is None:
+        raise HTTPException(status_code=404, detail="song not found")
+    if song.status not in TRANSCRIBE_GATE:
+        raise HTTPException(
+            status_code=409,
+            detail=f"song not ready for transcription (status={song.status.value})",
+        )
+    # Stems must exist — the worker will fail loudly otherwise, but
+    # rejecting up-front gives the frontend a usable error.
+    stems = db.scalar(select(Stems).where(Stems.song_id == song_id))
+    if stems is None or stems.vocals_path is None:
+        raise HTTPException(
+            status_code=409,
+            detail="song has no separated vocal stem yet",
+        )
+    celery_app.send_task(TRANSCRIBE_TASK, args=[str(song.id)])
+    return song
+
+
+@router.get("/{song_id}/transcription", response_model=TranscriptionRead)
+def get_song_transcription(
+    song_id: uuid.UUID, db: Session = Depends(get_db)
+) -> Transcription:
+    song = db.get(Song, song_id)
+    if song is None:
+        raise HTTPException(status_code=404, detail="song not found")
+    transcription = db.scalar(
+        select(Transcription).where(Transcription.song_id == song_id)
+    )
+    if transcription is None:
+        raise HTTPException(status_code=404, detail="transcription not available")
+    return transcription

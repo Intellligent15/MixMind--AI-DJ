@@ -2,13 +2,21 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
-import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_db
 from app.main import app
-from app.models import Queue, QueueItem, Song, SongStatus, Stems, StemsStatus
+from app.models import (
+    Queue,
+    QueueItem,
+    Song,
+    SongStatus,
+    Stems,
+    StemsStatus,
+    Transcription,
+    TranscriptionStatus,
+)
 
 
 def _client(db_session: Session) -> TestClient:
@@ -294,20 +302,41 @@ def _add_stems_row(db: Session, song: Song) -> Stems:
     return row
 
 
+def _add_transcription_row(db: Session, song: Song) -> Transcription:
+    row = Transcription(
+        song_id=song.id,
+        model_name="large-v3",
+        status=TranscriptionStatus.success,
+        language="en",
+        segments=[],
+        vocal_rms_threshold=0.005,
+        vocal_rms_observed=0.1,
+        duration_seconds=1.0,
+    )
+    db.add(row)
+    db.flush()
+    return row
+
+
 def test_lock_fans_out_pipeline_by_song_status(db_session: Session):
     queue = Queue()
     db_session.add(queue)
     pending = _make_song(db_session, "p1")
     downloaded = _make_song(db_session, "d1", SongStatus.downloaded)
-    analyzed = _make_song(db_session, "a1", SongStatus.analyzed)
-    # Already-fully-processed song (analyzed AND has stems) — nothing to do.
-    done = _make_song(db_session, "z1", SongStatus.analyzed)
+    # analyzed + no stems -> separate + transcribe
+    analyzed_no_stems = _make_song(db_session, "a1", SongStatus.analyzed)
+    # analyzed + stems, no transcription -> transcribe only
+    analyzed_with_stems = _make_song(db_session, "a2", SongStatus.analyzed)
+    _add_stems_row(db_session, analyzed_with_stems)
+    # ready + stems + transcription -> nothing to do
+    done = _make_song(db_session, "z1", SongStatus.ready)
     _add_stems_row(db_session, done)
+    _add_transcription_row(db_session, done)
     db_session.flush()
-    for i, s in enumerate([pending, downloaded, analyzed, done]):
-        db_session.add(
-            QueueItem(queue_id=queue.id, song_id=s.id, position=i)
-        )
+    for i, s in enumerate(
+        [pending, downloaded, analyzed_no_stems, analyzed_with_stems, done]
+    ):
+        db_session.add(QueueItem(queue_id=queue.id, song_id=s.id, position=i))
     db_session.flush()
 
     client = _client(db_session)
@@ -317,14 +346,19 @@ def test_lock_fans_out_pipeline_by_song_status(db_session: Session):
         "app.api.queues.download_song"
     ) as download_mock, patch(
         "app.api.queues.separate_stems"
-    ) as separate_mock:
+    ) as separate_mock, patch(
+        "app.api.queues.transcribe_song"
+    ) as transcribe_mock:
         chain_mock.return_value.delay.return_value = None
         analyze_mock.delay.return_value = None
         separate_mock.delay.return_value = None
+        transcribe_mock.delay.return_value = None
         download_mock.s.return_value = "d-sig"
         analyze_mock.s.return_value = "a-sig"
         analyze_mock.si.return_value = "a-isig"
+        separate_mock.s.return_value = "s-sig"
         separate_mock.si.return_value = "s-isig"
+        transcribe_mock.si.return_value = "t-isig"
 
         r = client.post(f"/api/queues/{queue.id}/lock")
 
@@ -332,23 +366,30 @@ def test_lock_fans_out_pipeline_by_song_status(db_session: Session):
     assert r.json()["locked"] is True
     assert r.json()["locked_at"] is not None
 
-    # pending -> chain(download, analyze.si, separate.si).delay()
-    # downloaded -> chain(analyze, separate.si).delay()
-    # analyzed (no stems) -> separate.delay()
-    # done (analyzed + stems) -> no dispatch
-    chain_mock.assert_any_call("d-sig", "a-isig", "s-isig")
-    chain_mock.assert_any_call("a-sig", "s-isig")
-    assert chain_mock.call_count == 2
-    # Each chain composition is followed by .delay()
-    assert chain_mock.return_value.delay.call_count == 2
+    # pending -> chain(download, analyze.si, separate.si, transcribe.si).delay()
+    # downloaded -> chain(analyze, separate.si, transcribe.si).delay()
+    # analyzed (no stems) -> chain(separate, transcribe.si).delay()
+    # analyzed (stems, no transcription) -> transcribe.delay()
+    # done (ready + stems + transcription) -> no dispatch
+    chain_mock.assert_any_call("d-sig", "a-isig", "s-isig", "t-isig")
+    chain_mock.assert_any_call("a-sig", "s-isig", "t-isig")
+    chain_mock.assert_any_call("s-sig", "t-isig")
+    assert chain_mock.call_count == 3
+    assert chain_mock.return_value.delay.call_count == 3
 
     download_mock.s.assert_called_once_with(str(pending.id))
-    # analyze.si used for pending's chain, analyze.s used for downloaded's
     analyze_mock.si.assert_called_once_with(str(pending.id))
     analyze_mock.s.assert_called_once_with(str(downloaded.id))
-    # separate.si used in both chains, .delay used for analyzed-no-stems
+    # separate.si used in pending + downloaded chains; separate.s used in
+    # analyzed-no-stems chain. separate.delay is not used directly anymore
+    # (transcribe is always chained behind it).
     assert separate_mock.si.call_count == 2
-    separate_mock.delay.assert_called_once_with(str(analyzed.id))
+    separate_mock.s.assert_called_once_with(str(analyzed_no_stems.id))
+    separate_mock.delay.assert_not_called()
+    # transcribe.si used in all three chains; transcribe.delay used directly
+    # for the stems-but-no-transcription branch.
+    assert transcribe_mock.si.call_count == 3
+    transcribe_mock.delay.assert_called_once_with(str(analyzed_with_stems.id))
     # done is fully processed — nothing more
     analyze_mock.delay.assert_not_called()
 
