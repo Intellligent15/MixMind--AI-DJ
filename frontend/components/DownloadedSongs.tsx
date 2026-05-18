@@ -8,6 +8,12 @@ function isTerminal(status: Song["status"]): boolean {
   return status === "analyzed" || status === "ready" || status === "failed";
 }
 
+const SEPARATABLE: ReadonlyArray<Song["status"]> = [
+  "analyzed",
+  "ready",
+  "failed",
+];
+
 export function DownloadedSongs() {
   const qc = useQueryClient();
   const songs = useQuery({
@@ -22,6 +28,10 @@ export function DownloadedSongs() {
 
   const analyze = useMutation({
     mutationFn: (id: string) => api.triggerAnalyze(id),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["songs"] }),
+  });
+  const separate = useMutation({
+    mutationFn: (id: string) => api.triggerSeparate(id),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["songs"] }),
   });
 
@@ -101,6 +111,16 @@ export function DownloadedSongs() {
                 >
                   Debug
                 </Link>
+              )}
+              {SEPARATABLE.includes(s.status) && (
+                <button
+                  type="button"
+                  onClick={() => separate.mutate(s.id)}
+                  disabled={separate.isPending}
+                  className="text-sm border rounded px-3 py-1 hover:bg-black/5 dark:hover:bg-white/10 disabled:opacity-50"
+                >
+                  Separate stems
+                </button>
               )}
             </div>
           </li>
