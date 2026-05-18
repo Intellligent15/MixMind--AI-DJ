@@ -89,10 +89,33 @@ export function ProcessingView() {
 
   const items = queue.data?.items ?? [];
 
-  // Poll each song individually so we get fast updates without re-fetching
-  // the whole queue. Stops polling a song once it reaches a terminal status.
-  const songQueries = useQueries({
+  // Per-song stems lookup. 404 just means "not separated yet" → null.
+  // This page only renders for a locked queue, and lock-time fan-out
+  // chains separate after analyze, so every song is expected to get a
+  // Stems row — keep polling until one lands.
+  const stemsQueries = useQueries({
     queries: items.map((item) => ({
+      queryKey: ["stems", item.song.id],
+      queryFn: async (): Promise<Stems | null> => {
+        try {
+          return await api.getStems(item.song.id);
+        } catch (err) {
+          if (isStatusError(err, 404)) return null;
+          throw err;
+        }
+      },
+      retry: false,
+      refetchInterval: (q: { state: { data?: Stems | null } }) =>
+        q.state.data ? false : 1500,
+    })),
+  });
+
+  // Poll each song individually so we get fast updates without re-fetching
+  // the whole queue. The worker bounces Song.status back to `analyzed` in
+  // a separate transaction from inserting the Stems row, so we can't stop
+  // polling at "analyzed" — we have to wait until the stems actually exist.
+  const songQueries = useQueries({
+    queries: items.map((item, idx) => ({
       queryKey: ["song", item.song.id],
       queryFn: () => api.getSong(item.song.id),
       initialData: item.song,
@@ -100,7 +123,8 @@ export function ProcessingView() {
         const s = q.state.data;
         if (!s) return 1000;
         if (s.status === "failed") return false;
-        if (PLAYABLE_STATUSES.includes(s.status)) return false;
+        const hasStems = !!stemsQueries[idx]?.data;
+        if (hasStems) return false;
         return 1000;
       },
     })),
@@ -110,28 +134,6 @@ export function ProcessingView() {
     () => songQueries.map((q, i) => q.data ?? items[i].song),
     [songQueries, items]
   );
-
-  // Per-song stems lookup. 404 just means "not separated yet" — surface
-  // that as a non-error null so the UI can treat it as "no stems row".
-  const stemsQueries = useQueries({
-    queries: songs.map((song) => ({
-      queryKey: ["stems", song.id],
-      queryFn: async (): Promise<Stems | null> => {
-        try {
-          return await api.getStems(song.id);
-        } catch (err) {
-          if (isStatusError(err, 404)) return null;
-          throw err;
-        }
-      },
-      retry: false,
-      // Refetch while we know separation is in flight; otherwise leave alone.
-      refetchInterval: (q: { state: { data?: Stems | null } }) => {
-        if (q.state.data) return false;
-        return song.status === "separating" ? 1500 : false;
-      },
-    })),
-  });
 
   // Track when we first observed each song in `separating` so we can
   // surface the "worker may be down" hint after SEPARATING_WARN_MS.

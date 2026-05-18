@@ -2,8 +2,8 @@
 
 import Link from "next/link";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { use } from "react";
-import { api, isStatusError } from "@/lib/api";
+import { use, useEffect, useState } from "react";
+import { api, isStatusError, type Song, type Stems } from "@/lib/api";
 import { StemsDebug } from "@/components/StemsDebug";
 import { WaveformDebug } from "@/components/WaveformDebug";
 
@@ -15,13 +15,21 @@ export default function SongDebugPage({
   const { id } = use(params);
 
   const qc = useQueryClient();
+  // True from click-Separate until the Stems row lands. Survives the
+  // analyzed -> separating -> analyzed flicker so polling never stops
+  // before stems actually exist.
+  const [awaitingStems, setAwaitingStems] = useState(false);
+
   const songQ = useQuery({
     queryKey: ["song", id],
     queryFn: () => api.getSong(id),
-    // Poll while separation is mid-flight so the stems panel appears as
-    // soon as the worker finishes.
-    refetchInterval: (q) =>
-      q.state.data?.status === "separating" ? 1500 : false,
+    refetchInterval: (q) => {
+      const s = q.state.data;
+      if (!s) return 1500;
+      if (s.status === "separating") return 1500;
+      if (awaitingStems) return 1500;
+      return false;
+    },
   });
   const analysisQ = useQuery({
     queryKey: ["analysis", id],
@@ -30,24 +38,55 @@ export default function SongDebugPage({
   });
   const stemsQ = useQuery({
     queryKey: ["stems", id],
-    queryFn: () => api.getStems(id),
+    queryFn: async (): Promise<Stems | null> => {
+      try {
+        return await api.getStems(id);
+      } catch (err) {
+        if (isStatusError(err, 404)) return null;
+        throw err;
+      }
+    },
     retry: false,
-    // Once a song flips out of separating, refetch stems once to pick the
-    // new row up. Cheap because the query is otherwise idle.
     refetchInterval: (q) => {
       if (q.state.data) return false;
-      return songQ.data?.status === "separating" ? 1500 : false;
+      if (awaitingStems) return 1500;
+      if (songQ.data?.status === "separating") return 1500;
+      return false;
     },
   });
+
+  // If the page mounts and we land mid-separation (e.g. user navigated
+  // away and came back), kick the awaiting flag on automatically.
+  useEffect(() => {
+    if (songQ.data?.status === "separating") setAwaitingStems(true);
+  }, [songQ.data?.status]);
+
+  // Stop awaiting as soon as the Stems row shows up.
+  useEffect(() => {
+    if (stemsQ.data) setAwaitingStems(false);
+  }, [stemsQ.data]);
+
   const separate = useMutation({
     mutationFn: () => api.triggerSeparate(id),
+    onMutate: () => {
+      // Optimistic flip + start awaiting so the polling loops engage even
+      // before the worker has picked the task up.
+      setAwaitingStems(true);
+      qc.setQueryData<Song | undefined>(["song", id], (prev) =>
+        prev ? { ...prev, status: "separating" } : prev
+      );
+    },
     onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["song", id] });
+      qc.invalidateQueries({ queryKey: ["stems", id] });
+    },
+    onError: () => {
+      setAwaitingStems(false);
       qc.invalidateQueries({ queryKey: ["song", id] });
     },
   });
   const stemsAvailable = !!stemsQ.data;
-  const stemsMissing404 =
-    !stemsQ.data && isStatusError(stemsQ.error, 404);
+  const stemsMissing404 = !stemsQ.data && stemsQ.isFetched && !stemsQ.error;
 
   return (
     <main className="min-h-screen max-w-5xl mx-auto p-8 flex flex-col gap-6 font-mono">
@@ -120,8 +159,8 @@ export default function SongDebugPage({
           {!stemsAvailable && (
             <section className="flex items-center justify-between border rounded p-3">
               <p className="text-sm opacity-80">
-                {songQ.data.status === "separating"
-                  ? "Separating stems… (this typically takes ~30s per minute of audio on MPS)"
+                {awaitingStems || songQ.data.status === "separating"
+                  ? "Separating stems… (cold model load ~30s the first time, ~10–15s per song after)"
                   : stemsMissing404
                     ? "No stems yet. Run Demucs to separate vocals, drums, bass, and other."
                     : `Stems unavailable: ${(stemsQ.error as Error)?.message ?? "unknown error"}`}
@@ -130,11 +169,15 @@ export default function SongDebugPage({
                 type="button"
                 onClick={() => separate.mutate()}
                 disabled={
-                  separate.isPending || songQ.data.status === "separating"
+                  separate.isPending ||
+                  awaitingStems ||
+                  songQ.data.status === "separating"
                 }
                 className="text-sm border rounded px-3 py-1 hover:bg-black/5 dark:hover:bg-white/10 disabled:opacity-50"
               >
-                {separate.isPending || songQ.data.status === "separating"
+                {separate.isPending ||
+                awaitingStems ||
+                songQ.data.status === "separating"
                   ? "Separating…"
                   : "Separate stems"}
               </button>
