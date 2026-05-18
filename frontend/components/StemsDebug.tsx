@@ -1,10 +1,9 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import WaveSurfer from "wavesurfer.js";
 import { api, STEM_NAMES, type StemName, type Stems } from "@/lib/api";
 
-// Color per stem keeps the four waveforms visually distinguishable.
 const STEM_COLORS: Record<StemName, { wave: string; progress: string }> = {
   vocals: { wave: "#fda4af", progress: "#e11d48" },
   drums: { wave: "#fcd34d", progress: "#d97706" },
@@ -12,37 +11,69 @@ const STEM_COLORS: Record<StemName, { wave: string; progress: string }> = {
   other: { wave: "#93c5fd", progress: "#2563eb" },
 };
 
-type SoloState = StemName | null;
+type StemRecord<T> = Record<StemName, T>;
+const emptyStemRecord = <T,>(v: T): StemRecord<T> => ({
+  vocals: v,
+  drums: v,
+  bass: v,
+  other: v,
+});
 
 export function StemsDebug({ songId, stems }: { songId: string; stems: Stems }) {
-  // One container ref per stem, one WaveSurfer instance per stem.
-  const containerRefs = useRef<Record<StemName, HTMLDivElement | null>>({
-    vocals: null,
-    drums: null,
-    bass: null,
-    other: null,
-  });
-  const wsRefs = useRef<Record<StemName, WaveSurfer | null>>({
-    vocals: null,
-    drums: null,
-    bass: null,
-    other: null,
-  });
-  const [isPlaying, setIsPlaying] = useState(false);
-  const [solo, setSolo] = useState<SoloState>(null);
-  const [muted, setMuted] = useState<Record<StemName, boolean>>({
-    vocals: false,
-    drums: false,
-    bass: false,
-    other: false,
-  });
+  // DOM + visualization refs
+  const containerRefs = useRef<StemRecord<HTMLDivElement | null>>(
+    emptyStemRecord<HTMLDivElement | null>(null)
+  );
+  const wsRefs = useRef<StemRecord<WaveSurfer | null>>(
+    emptyStemRecord<WaveSurfer | null>(null)
+  );
 
-  // Build the four WaveSurfers once when the stems row id is known. Don't
-  // include solo/muted in deps — those are reflected via the volume effect
-  // below so we don't recreate (and re-stream) the WaveSurfers on every
-  // toggle.
+  // Web Audio graph: one ctx + four gain nodes (persistent) + four source
+  // nodes (recreated per play, since AudioBufferSourceNodes are one-shot).
+  // All four stems share ctx.currentTime, so a single .start(t) on all of
+  // them is sample-accurate — fixes the per-element clock drift we got
+  // from four separate HTMLAudioElements.
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const buffersRef = useRef<StemRecord<AudioBuffer | null>>(
+    emptyStemRecord<AudioBuffer | null>(null)
+  );
+  const gainsRef = useRef<StemRecord<GainNode | null>>(
+    emptyStemRecord<GainNode | null>(null)
+  );
+  const sourcesRef = useRef<StemRecord<AudioBufferSourceNode | null>>(
+    emptyStemRecord<AudioBufferSourceNode | null>(null)
+  );
+  // ctx.currentTime when the most recent .start() was scheduled, and the
+  // song-relative offset at that moment. currentPos = offset + (now - start).
+  const startCtxTimeRef = useRef(0);
+  const offsetAtStartRef = useRef(0);
+  const rafRef = useRef<number | null>(null);
+
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [isLoading, setIsLoading] = useState(true);
+  const [solo, setSolo] = useState<StemName | null>(null);
+  const [muted, setMuted] = useState<StemRecord<boolean>>(
+    emptyStemRecord<boolean>(false)
+  );
+
+  // ---- one-time setup per (songId, stems.id): graph + buffers + WS viz ----
   useEffect(() => {
-    const created: Partial<Record<StemName, WaveSurfer>> = {};
+    let cancelled = false;
+    setIsLoading(true);
+    offsetAtStartRef.current = 0;
+
+    const ctx = new AudioContext();
+    audioCtxRef.current = ctx;
+    for (const name of STEM_NAMES) {
+      const gain = ctx.createGain();
+      gain.gain.value = 1;
+      gain.connect(ctx.destination);
+      gainsRef.current[name] = gain;
+    }
+
+    // WaveSurfers exist for the waveform + cursor only. We mute them and
+    // never call .play() — sound comes exclusively from the Web Audio graph.
+    const createdWs: WaveSurfer[] = [];
     for (const name of STEM_NAMES) {
       const el = containerRefs.current[name];
       if (!el) continue;
@@ -57,62 +88,181 @@ export function StemsDebug({ songId, stems }: { songId: string; stems: Stems }) 
         barHeight: 0.7,
         url: api.stemAudioUrl(songId, name),
       });
-      created[name] = ws;
+      ws.setVolume(0);
       wsRefs.current[name] = ws;
+      createdWs.push(ws);
     }
 
-    // Master state tracks whichever stem fires play/pause/finish first
-    // (they're fired together by the master button anyway).
-    const offs: Array<() => void> = [];
-    for (const ws of Object.values(created)) {
-      if (!ws) continue;
-      offs.push(ws.on("play", () => setIsPlaying(true)));
-      offs.push(ws.on("pause", () => setIsPlaying(false)));
-      offs.push(ws.on("finish", () => setIsPlaying(false)));
-    }
+    // Decode all four stems in parallel. We pay the bytes twice (once for
+    // WS viz, once here) — acceptable for a debug page; can dedupe later
+    // by computing peaks ourselves and passing them to WS.
+    Promise.all(
+      STEM_NAMES.map(async (name) => {
+        const resp = await fetch(api.stemAudioUrl(songId, name));
+        if (!resp.ok) throw new Error(`stem ${name}: HTTP ${resp.status}`);
+        const arr = await resp.arrayBuffer();
+        const buf = await ctx.decodeAudioData(arr);
+        return [name, buf] as const;
+      })
+    )
+      .then((pairs) => {
+        if (cancelled) return;
+        for (const [name, buf] of pairs) buffersRef.current[name] = buf;
+        setIsLoading(false);
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        console.error("stem decode failed", err);
+        setIsLoading(false);
+      });
 
-    // Capture the ref object once so the cleanup reads the same dict the
-    // effect populated, even if React tears down before the next run.
-    const refsAtSetup = wsRefs.current;
     return () => {
-      offs.forEach((off) => off());
+      cancelled = true;
+      if (rafRef.current !== null) cancelAnimationFrame(rafRef.current);
+      rafRef.current = null;
       for (const name of STEM_NAMES) {
-        created[name]?.destroy();
-        refsAtSetup[name] = null;
+        const src = sourcesRef.current[name];
+        if (src) {
+          src.onended = null;
+          try {
+            src.stop();
+          } catch {
+            // already stopped — safe to ignore
+          }
+          src.disconnect();
+        }
+        sourcesRef.current[name] = null;
+        gainsRef.current[name]?.disconnect();
+        gainsRef.current[name] = null;
+        buffersRef.current[name] = null;
+        wsRefs.current[name] = null;
       }
+      createdWs.forEach((ws) => ws.destroy());
+      ctx.close().catch(() => {});
+      audioCtxRef.current = null;
     };
   }, [songId, stems.id]);
 
-  // Apply solo + per-stem mute as volume: solo'd stem at 1, others at 0.
-  // Solo wins over manual mute.
+  // ---- solo/mute → gain ----
   useEffect(() => {
     for (const name of STEM_NAMES) {
-      const ws = wsRefs.current[name];
-      if (!ws) continue;
-      const audible =
-        solo === null ? !muted[name] : solo === name;
-      ws.setVolume(audible ? 1 : 0);
+      const gain = gainsRef.current[name];
+      if (!gain) continue;
+      const audible = solo === null ? !muted[name] : solo === name;
+      gain.gain.value = audible ? 1 : 0;
     }
   }, [solo, muted]);
 
-  const playAll = async () => {
-    // Pause first to reset state, seek to 0, then play together. WaveSurfer's
-    // play() returns a promise we don't need to await per-stem.
+  // ---- playback ----
+  const tick = useCallback(() => {
+    const ctx = audioCtxRef.current;
+    if (!ctx) return;
+    const pos =
+      offsetAtStartRef.current + (ctx.currentTime - startCtxTimeRef.current);
     for (const name of STEM_NAMES) {
-      wsRefs.current[name]?.pause();
-      wsRefs.current[name]?.setTime(0);
+      wsRefs.current[name]?.setTime(Math.max(0, pos));
     }
+    rafRef.current = requestAnimationFrame(tick);
+  }, []);
+
+  const startSources = useCallback(async (fromOffset: number) => {
+    const ctx = audioCtxRef.current;
+    if (!ctx) return;
+    if (ctx.state === "suspended") await ctx.resume();
+
+    // Tear down any leftover sources before scheduling new ones.
     for (const name of STEM_NAMES) {
-      void wsRefs.current[name]?.play();
+      const old = sourcesRef.current[name];
+      if (old) {
+        old.onended = null;
+        try {
+          old.stop();
+        } catch {
+          // already stopped — safe to ignore
+        }
+        old.disconnect();
+      }
+      sourcesRef.current[name] = null;
     }
-  };
+
+    const startAt = ctx.currentTime + 0.08; // small lookahead
+    const newSources: AudioBufferSourceNode[] = [];
+    for (const name of STEM_NAMES) {
+      const buf = buffersRef.current[name];
+      const gain = gainsRef.current[name];
+      if (!buf || !gain) continue;
+      const src = ctx.createBufferSource();
+      src.buffer = buf;
+      src.connect(gain);
+      sourcesRef.current[name] = src;
+      newSources.push(src);
+    }
+
+    // Single ended handler — only acts on natural end-of-song (we null the
+    // handler before manual stop()).
+    const onAnyEnded = () => {
+      const c = audioCtxRef.current;
+      if (!c) return;
+      const pos = offsetAtStartRef.current + (c.currentTime - startCtxTimeRef.current);
+      const dur = buffersRef.current.vocals?.duration ?? 0;
+      if (pos + 0.05 >= dur) {
+        offsetAtStartRef.current = 0;
+        setIsPlaying(false);
+        if (rafRef.current !== null) cancelAnimationFrame(rafRef.current);
+        rafRef.current = null;
+        for (const name of STEM_NAMES) wsRefs.current[name]?.setTime(0);
+      }
+    };
+    newSources.forEach((s) => {
+      s.onended = onAnyEnded;
+    });
+
+    for (const s of newSources) s.start(startAt, fromOffset);
+    startCtxTimeRef.current = startAt;
+    offsetAtStartRef.current = fromOffset;
+  }, []);
+
+  const play = useCallback(async () => {
+    if (isLoading) return;
+    await startSources(offsetAtStartRef.current);
+    setIsPlaying(true);
+    if (rafRef.current === null) rafRef.current = requestAnimationFrame(tick);
+  }, [isLoading, startSources, tick]);
+
+  const pause = useCallback(() => {
+    const ctx = audioCtxRef.current;
+    if (!ctx) return;
+    const pos =
+      offsetAtStartRef.current + (ctx.currentTime - startCtxTimeRef.current);
+    for (const name of STEM_NAMES) {
+      const src = sourcesRef.current[name];
+      if (src) {
+        src.onended = null;
+        try {
+          src.stop();
+        } catch {
+          // already stopped — safe to ignore
+        }
+        src.disconnect();
+      }
+      sourcesRef.current[name] = null;
+    }
+    offsetAtStartRef.current = Math.max(0, pos);
+    if (rafRef.current !== null) cancelAnimationFrame(rafRef.current);
+    rafRef.current = null;
+    setIsPlaying(false);
+  }, []);
 
   const togglePlay = () => {
-    if (isPlaying) {
-      for (const name of STEM_NAMES) wsRefs.current[name]?.pause();
-    } else {
-      for (const name of STEM_NAMES) void wsRefs.current[name]?.play();
-    }
+    if (isPlaying) pause();
+    else void play();
+  };
+
+  const restart = async () => {
+    if (isPlaying) pause();
+    offsetAtStartRef.current = 0;
+    for (const name of STEM_NAMES) wsRefs.current[name]?.setTime(0);
+    await play();
   };
 
   return (
@@ -130,14 +280,16 @@ export function StemsDebug({ songId, stems }: { songId: string; stems: Stems }) 
         <button
           type="button"
           onClick={togglePlay}
-          className="border rounded px-3 py-1 hover:bg-black/5 dark:hover:bg-white/10"
+          disabled={isLoading}
+          className="border rounded px-3 py-1 hover:bg-black/5 dark:hover:bg-white/10 disabled:opacity-50"
         >
-          {isPlaying ? "Pause all" : "Play all"}
+          {isLoading ? "Loading…" : isPlaying ? "Pause all" : "Play all"}
         </button>
         <button
           type="button"
-          onClick={playAll}
-          className="border rounded px-3 py-1 hover:bg-black/5 dark:hover:bg-white/10"
+          onClick={restart}
+          disabled={isLoading}
+          className="border rounded px-3 py-1 hover:bg-black/5 dark:hover:bg-white/10 disabled:opacity-50"
         >
           Restart
         </button>
@@ -156,14 +308,9 @@ export function StemsDebug({ songId, stems }: { songId: string; stems: Stems }) 
           const isSolo = solo === name;
           const isMuted = muted[name];
           return (
-            <li
-              key={name}
-              className="border rounded p-2 flex flex-col gap-1"
-            >
+            <li key={name} className="border rounded p-2 flex flex-col gap-1">
               <div className="flex items-center justify-between text-xs">
-                <span className="font-mono uppercase tracking-wide">
-                  {name}
-                </span>
+                <span className="font-mono uppercase tracking-wide">{name}</span>
                 <div className="flex gap-1">
                   <button
                     type="button"
