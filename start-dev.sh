@@ -40,6 +40,15 @@ cd backend
 # — invisible to the container that serves the audio.
 export LOCAL_STORAGE_PATH="${LOCAL_STORAGE_PATH:-$REPO_ROOT/cache}"
 
+# Demucs downloads the htdemucs_ft weights on first run via urllib. macOS
+# Python doesn't trust the system root CAs by default, so point urllib +
+# requests at certifi's bundle (which is already on the dep tree).
+CERTIFI_PEM=$(uv run python -c "import certifi; print(certifi.where())" 2>/dev/null || true)
+if [[ -n "$CERTIFI_PEM" ]]; then
+  export SSL_CERT_FILE="${SSL_CERT_FILE:-$CERTIFI_PEM}"
+  export REQUESTS_CA_BUNDLE="${REQUESTS_CA_BUNDLE:-$CERTIFI_PEM}"
+fi
+
 echo "==> Applying database migrations..."
 uv run alembic upgrade head
 
@@ -49,4 +58,8 @@ echo "    Frontend: http://localhost:3000"
 echo "    Stop docker stack with: ./stop-dev.sh"
 echo
 
-exec uv run celery -A app.workers worker --loglevel=info
+# --pool=solo: single-process, serial task execution. Required for torch
+# + MPS, which crashes (SIGABRT) under the default prefork pool when a
+# Demucs task runs in a forked worker process on macOS. Single-user
+# pipeline doesn't lose anything to serial execution anyway.
+exec uv run celery -A app.workers worker --loglevel=info --pool=solo
