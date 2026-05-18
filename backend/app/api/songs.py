@@ -11,10 +11,17 @@ from app.api.deps import get_db
 from app.models import Analysis, Song, SongStatus, Stems
 from app.schemas import AnalysisRead, SongCreate, SongRead, StemsRead
 from app.services.storage import get_storage
-from app.services.stems import STEM_NAMES
+from app.workers import celery_app
 from app.workers.analyze import analyze_song
 from app.workers.download import download_song
-from app.workers.separate import separate_stems
+
+# Dispatched via celery_app.send_task so the API container doesn't have to
+# import app.workers.separate — that module pulls in torch + demucs, which
+# only the native worker needs.
+SEPARATE_TASK = "app.workers.separate.separate_stems"
+# Mirrors STEM_NAMES in app.services.stems (kept inline so the API doesn't
+# import the stems service module either — same reason as above).
+STEM_NAMES: tuple[str, ...] = ("vocals", "drums", "bass", "other")
 
 router = APIRouter(prefix="/api/songs", tags=["songs"])
 
@@ -122,7 +129,7 @@ def trigger_separate_song(song_id: uuid.UUID, db: Session = Depends(get_db)) -> 
             status_code=409,
             detail=f"song not ready for separation (status={song.status.value})",
         )
-    separate_stems.delay(str(song.id))
+    celery_app.send_task(SEPARATE_TASK, args=[str(song.id)])
     return song
 
 

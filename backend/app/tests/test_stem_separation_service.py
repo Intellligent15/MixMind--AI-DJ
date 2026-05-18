@@ -11,6 +11,7 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import numpy as np
 import torch
 
 from app.services.stems import STEM_NAMES, StemSeparationService
@@ -43,8 +44,8 @@ def test_separate_remaps_demucs_order_into_stem_names_dict():
     with (
         patch("app.services.stems.service.get_model", return_value=model),
         patch(
-            "app.services.stems.service.torchaudio.load",
-            return_value=(torch.zeros(2, 100), 44100),
+            "app.services.stems.service.sf.read",
+            return_value=(np.zeros((100, 2), dtype=np.float32), 44100),
         ),
         patch(
             "app.services.stems.service.convert_audio",
@@ -74,8 +75,8 @@ def test_separate_computes_vocal_rms():
     with (
         patch("app.services.stems.service.get_model", return_value=model),
         patch(
-            "app.services.stems.service.torchaudio.load",
-            return_value=(torch.zeros(2, 1000), 44100),
+            "app.services.stems.service.sf.read",
+            return_value=(np.zeros((1000, 2), dtype=np.float32), 44100),
         ),
         patch(
             "app.services.stems.service.convert_audio",
@@ -98,8 +99,8 @@ def test_separate_silent_vocals_has_zero_rms():
     with (
         patch("app.services.stems.service.get_model", return_value=model),
         patch(
-            "app.services.stems.service.torchaudio.load",
-            return_value=(torch.zeros(2, 500), 44100),
+            "app.services.stems.service.sf.read",
+            return_value=(np.zeros((500, 2), dtype=np.float32), 44100),
         ),
         patch(
             "app.services.stems.service.convert_audio",

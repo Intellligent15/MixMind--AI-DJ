@@ -6,7 +6,6 @@ from pathlib import Path
 
 import soundfile as sf
 import torch
-import torchaudio
 from demucs.apply import apply_model
 from demucs.audio import convert_audio
 from demucs.pretrained import get_model
@@ -68,9 +67,11 @@ class StemSeparationService:
     def separate(self, audio_path: Path) -> SeparationResult:
         model = self._load_model()
 
-        wav, sample_rate = torchaudio.load(str(audio_path))
-        # Demucs expects (channels, samples) at the model's sample rate and
-        # channel count. convert_audio handles resampling + mono->stereo.
+        # soundfile gives (samples, channels); demucs convert_audio wants
+        # (channels, samples). torchaudio.load would work but torchaudio
+        # 2.11+ routes through TorchCodec which isn't on the dep list.
+        audio, sample_rate = sf.read(str(audio_path), always_2d=True)
+        wav = torch.from_numpy(audio.T).float()
         wav = convert_audio(wav, sample_rate, model.samplerate, model.audio_channels)
 
         # apply_model wants a (batch, channels, samples) tensor and returns

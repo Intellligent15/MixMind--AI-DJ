@@ -280,10 +280,12 @@ def _stems_row(db: Session, song: Song, **overrides) -> Stems:
 def test_trigger_separate_enqueues_when_analyzed(db_session: Session):
     song = _analyzed_song(db_session, vid="sep-ok")
     client = _client(db_session)
-    with patch("app.api.songs.separate_stems.delay") as delay:
+    with patch("app.api.songs.celery_app.send_task") as send:
         r = client.post(f"/api/songs/{song.id}/separate")
     assert r.status_code == 202
-    delay.assert_called_once_with(str(song.id))
+    send.assert_called_once_with(
+        "app.workers.separate.separate_stems", args=[str(song.id)]
+    )
 
 
 def test_trigger_separate_404_unknown_song(db_session: Session):
@@ -295,10 +297,10 @@ def test_trigger_separate_404_unknown_song(db_session: Session):
 def test_trigger_separate_409_when_not_analyzed(db_session: Session):
     song = _downloaded_song(db_session, vid="sep-too-early")
     client = _client(db_session)
-    with patch("app.api.songs.separate_stems.delay") as delay:
+    with patch("app.api.songs.celery_app.send_task") as send:
         r = client.post(f"/api/songs/{song.id}/separate")
     assert r.status_code == 409
-    delay.assert_not_called()
+    send.assert_not_called()
 
 
 def test_get_stems_returns_row(db_session: Session):

@@ -11,9 +11,30 @@ from sqlalchemy.orm import Session
 from app.api.deps import get_db
 from app.models import Queue, QueueItem, Song, SongStatus, Stems
 from app.schemas import QueueItemAdd, QueueRead, QueueReorder
+from app.workers import celery_app
 from app.workers.analyze import analyze_song
 from app.workers.download import download_song
-from app.workers.separate import separate_stems
+
+# Dispatched by task name so the API container doesn't have to import
+# app.workers.separate (which pulls torch + demucs — native-worker only).
+SEPARATE_TASK = "app.workers.separate.separate_stems"
+
+
+class _SeparateTaskShim:
+    """Adapter exposing the .s/.si/.delay surface tests + chain composition
+    expect, without importing the underlying torch-bound module."""
+
+    def s(self, *args):
+        return celery_app.signature(SEPARATE_TASK, args=args)
+
+    def si(self, *args):
+        return celery_app.signature(SEPARATE_TASK, args=args, immutable=True)
+
+    def delay(self, *args):
+        return celery_app.send_task(SEPARATE_TASK, args=list(args))
+
+
+separate_stems = _SeparateTaskShim()
 
 router = APIRouter(prefix="/api/queues", tags=["queues"])
 
