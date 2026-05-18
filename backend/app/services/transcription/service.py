@@ -56,10 +56,23 @@ class TranscriptionService:
         logger.info(
             "transcribing %s with mlx-whisper %s", vocals_path, self.model_repo
         )
+        # condition_on_previous_text=False breaks Whisper's "Thank you" /
+        # "Thanks for watching" hallucination loop. Each 30s window decodes
+        # independently — we lose a little narrative coherence (which we
+        # don't need for DJ transitions, since segments anchor to time not
+        # story) and gain robustness on sparse / heavily-processed vocals
+        # where the model would otherwise condition on its own bad output.
+        #
+        # hallucination_silence_threshold=2.0 leans on word_timestamps to
+        # skip silent stretches longer than 2s when the model suspects it
+        # has started hallucinating — a free guard since we already turn
+        # word_timestamps on.
         raw = mlx_whisper.transcribe(
             str(vocals_path),
             path_or_hf_repo=self.model_repo,
             word_timestamps=True,
+            condition_on_previous_text=False,
+            hallucination_silence_threshold=2.0,
         )
 
         segments: list[dict] = []

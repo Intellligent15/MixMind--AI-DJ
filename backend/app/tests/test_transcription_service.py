@@ -116,3 +116,22 @@ def test_transcribe_passes_word_timestamps_flag():
     _, kwargs = mock_transcribe.call_args
     assert kwargs.get("word_timestamps") is True
     assert "mlx-community" in kwargs.get("path_or_hf_repo", "")
+
+
+def test_transcribe_passes_hallucination_guards():
+    """Both hallucination guards must flow through to mlx-whisper.
+
+    condition_on_previous_text=False breaks the "Thank you" feedback loop;
+    hallucination_silence_threshold=2.0 skips suspected hallucinated text
+    that lines up with >2s of silence. A regression of either would
+    re-introduce the Charli-xcx-style empty-vocals failure."""
+    svc = TranscriptionService()
+    with patch(
+        "app.services.transcription.service.mlx_whisper.transcribe",
+        return_value=_stub_raw(),
+    ) as mock_transcribe:
+        svc.transcribe(Path("/fake/vocals.wav"))
+
+    _, kwargs = mock_transcribe.call_args
+    assert kwargs.get("condition_on_previous_text") is False
+    assert kwargs.get("hallucination_silence_threshold") == 2.0
