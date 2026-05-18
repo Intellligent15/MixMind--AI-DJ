@@ -6,7 +6,7 @@ See [ai-dj-spec.md](ai-dj-spec.md) for the full project specification.
 
 ## Status
 
-**Phase 4 complete** — queue UI (dnd-kit) at `/`, library at `/library`, processing view gated on first 2 songs analyzed, fullscreen player shell with back-to-back hard-cut playback. See [docs/the notes](docs/the notes). Prior phases: [Phase 3](docs/the notes), [Phase 2](docs/the notes), [Phase 1](docs/the notes).
+**Phase 5 complete** — Demucs `htdemucs_ft` stem separation on the native worker via MPS, four-stacked-stem debug view with per-stem solo/mute, processing view shows the `separating` step + a "worker stuck" hint. See [docs/the notes](docs/the notes). Prior phases: [Phase 4](docs/the notes), [Phase 3](docs/the notes), [Phase 2](docs/the notes), [Phase 1](docs/the notes).
 
 Build phases are listed in the spec under **Build Phase Order**.
 
