@@ -11,6 +11,7 @@ celery_app = Celery(
         "app.workers.download",
         "app.workers.analyze",
         "app.workers.separate",
+        "app.workers.transcribe",
     ],
 )
 
