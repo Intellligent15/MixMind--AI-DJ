@@ -11,6 +11,7 @@ import {
   type Song,
   type SongStatus,
   type Stems,
+  type Transcription,
 } from "@/lib/api";
 
 // Songs at or past this point in the pipeline are considered "ready enough"
@@ -25,9 +26,11 @@ const PLAYABLE_STATUSES: ReadonlyArray<SongStatus> = [
 // Phase 7+ will replace this gate with "first transition rendered".
 const GATE_ANALYZED = 2;
 
-// Logical pipeline progression. "separated" isn't a SongStatus — it's
-// derived from the presence of a Stems row (song.status flips back to
-// `analyzed` when the worker finishes separating).
+// Logical pipeline progression. "separated" and "transcribed" aren't
+// SongStatus values — they're derived from the presence of a Stems or
+// Transcription row. The worker bounces Song.status back to `analyzed`
+// after separating, and to `ready` after transcribing, in separate
+// transactions from inserting the row.
 type PipelineStep =
   | "pending"
   | "downloading"
@@ -35,7 +38,9 @@ type PipelineStep =
   | "analyzing"
   | "analyzed"
   | "separating"
-  | "separated";
+  | "separated"
+  | "transcribing"
+  | "transcribed";
 
 const PIPELINE_STEPS: { key: PipelineStep; label: string }[] = [
   { key: "pending", label: "queued" },
@@ -45,16 +50,28 @@ const PIPELINE_STEPS: { key: PipelineStep; label: string }[] = [
   { key: "analyzed", label: "analyzed" },
   { key: "separating", label: "separating" },
   { key: "separated", label: "separated" },
+  { key: "transcribing", label: "transcribing" },
+  { key: "transcribed", label: "ready" },
 ];
 
-function stepIndex(status: SongStatus, hasStems: boolean): number {
+function stepIndex(
+  status: SongStatus,
+  hasStems: boolean,
+  hasTranscription: boolean
+): number {
   if (status === "failed") return -1;
-  if (hasStems) return PIPELINE_STEPS.length - 1; // "separated"
+  if (hasTranscription) return PIPELINE_STEPS.length - 1; // "transcribed"
+  if (status === "transcribing") {
+    return PIPELINE_STEPS.findIndex((s) => s.key === "transcribing");
+  }
+  if (hasStems) {
+    return PIPELINE_STEPS.findIndex((s) => s.key === "separated");
+  }
   if (status === "separating") {
     return PIPELINE_STEPS.findIndex((s) => s.key === "separating");
   }
   // analyzed/ready without stems sit at the "analyzed" step.
-  if (status === "analyzed" || status === "ready" || status === "transcribing") {
+  if (status === "analyzed" || status === "ready") {
     return PIPELINE_STEPS.findIndex((s) => s.key === "analyzed");
   }
   return PIPELINE_STEPS.findIndex((s) => s.key === status);
@@ -67,11 +84,11 @@ function statusBadgeClass(status: SongStatus): string {
   return "bg-yellow-500/20";
 }
 
-// Songs whose status sits at `separating` for longer than this get a
-// yellow "worker may be down" warning. The native Celery worker is the
-// only thing that can pick up the job; if it isn't running, the message
-// just sits in Redis indefinitely.
-const SEPARATING_WARN_MS = 120_000;
+// Songs whose status sits at `separating` or `transcribing` for longer
+// than this get a yellow "worker may be down" warning. The native Celery
+// worker is the only thing that can pick up either job; if it isn't
+// running, the message just sits in Redis indefinitely.
+const WORKER_STUCK_WARN_MS = 120_000;
 
 export function ProcessingView() {
   const router = useRouter();
@@ -110,10 +127,32 @@ export function ProcessingView() {
     })),
   });
 
+  // Per-song transcription lookup. 404 = "not transcribed yet" → null.
+  // Lock-time fan-out chains transcribe after separate, so we keep polling
+  // until a Transcription row lands (success OR skipped_instrumental both
+  // count as "done" for pipeline progress).
+  const transcriptionQueries = useQueries({
+    queries: items.map((item) => ({
+      queryKey: ["transcription", item.song.id],
+      queryFn: async (): Promise<Transcription | null> => {
+        try {
+          return await api.getTranscription(item.song.id);
+        } catch (err) {
+          if (isStatusError(err, 404)) return null;
+          throw err;
+        }
+      },
+      retry: false,
+      refetchInterval: (q: { state: { data?: Transcription | null } }) =>
+        q.state.data ? false : 1500,
+    })),
+  });
+
   // Poll each song individually so we get fast updates without re-fetching
-  // the whole queue. The worker bounces Song.status back to `analyzed` in
-  // a separate transaction from inserting the Stems row, so we can't stop
-  // polling at "analyzed" — we have to wait until the stems actually exist.
+  // the whole queue. The worker bounces Song.status back to `analyzed`
+  // after separating and to `ready` after transcribing in transactions
+  // separate from inserting the row, so we can't stop polling at any
+  // terminal Song.status — we have to wait until both rows exist.
   const songQueries = useQueries({
     queries: items.map((item, idx) => ({
       queryKey: ["song", item.song.id],
@@ -123,8 +162,8 @@ export function ProcessingView() {
         const s = q.state.data;
         if (!s) return 1000;
         if (s.status === "failed") return false;
-        const hasStems = !!stemsQueries[idx]?.data;
-        if (hasStems) return false;
+        const hasTranscription = !!transcriptionQueries[idx]?.data;
+        if (hasTranscription) return false;
         return 1000;
       },
     })),
@@ -135,33 +174,43 @@ export function ProcessingView() {
     [songQueries, items]
   );
 
-  // Track when we first observed each song in `separating` so we can
-  // surface the "worker may be down" hint after SEPARATING_WARN_MS.
-  const separatingSinceRef = useRef<Map<string, number>>(new Map());
+  // Track when we first observed each song in `separating` or
+  // `transcribing` so we can surface the "worker may be down" hint after
+  // WORKER_STUCK_WARN_MS. Keyed by "songId:status" so a stuck separation
+  // followed by a stuck transcription warn independently.
+  const workerStuckSinceRef = useRef<Map<string, number>>(new Map());
   const [, forceTick] = useState(0);
   useEffect(() => {
     const now = Date.now();
     let dirty = false;
-    const seen = separatingSinceRef.current;
+    const seen = workerStuckSinceRef.current;
+    const liveKeys = new Set<string>();
     for (const s of songs) {
-      if (s.status === "separating") {
-        if (!seen.has(s.id)) {
-          seen.set(s.id, now);
+      if (s.status === "separating" || s.status === "transcribing") {
+        const k = `${s.id}:${s.status}`;
+        liveKeys.add(k);
+        if (!seen.has(k)) {
+          seen.set(k, now);
           dirty = true;
         }
-      } else if (seen.has(s.id)) {
-        seen.delete(s.id);
+      }
+    }
+    for (const k of seen.keys()) {
+      if (!liveKeys.has(k)) {
+        seen.delete(k);
         dirty = true;
       }
     }
     if (dirty) forceTick((n) => n + 1);
   }, [songs]);
 
-  // Re-render once per 5s while any song is still separating, so the
-  // warning appears even if nothing else changes.
+  // Re-render once per 5s while any song is still in a worker-bound
+  // status, so the warning appears even if nothing else changes.
   useEffect(() => {
-    const anySeparating = songs.some((s) => s.status === "separating");
-    if (!anySeparating) return;
+    const anyStuck = songs.some(
+      (s) => s.status === "separating" || s.status === "transcribing"
+    );
+    if (!anyStuck) return;
     const t = setInterval(() => forceTick((n) => n + 1), 5000);
     return () => clearInterval(t);
   }, [songs]);
@@ -231,7 +280,8 @@ export function ProcessingView() {
       <ul className="flex flex-col gap-3">
         {songs.map((song, idx) => {
           const hasStems = !!stemsQueries[idx]?.data;
-          const step = stepIndex(song.status, hasStems);
+          const hasTranscription = !!transcriptionQueries[idx]?.data;
+          const step = stepIndex(song.status, hasStems, hasTranscription);
           const pct =
             step < 0
               ? 0
@@ -241,11 +291,13 @@ export function ProcessingView() {
           // Queue items are unique even when the same song is queued twice;
           // fall back to a composite if the item isn't there yet.
           const key = items[idx]?.id ?? `${song.id}:${idx}`;
-          const separatingSince = separatingSinceRef.current.get(song.id);
-          const separatingStuck =
-            song.status === "separating" &&
-            separatingSince !== undefined &&
-            Date.now() - separatingSince > SEPARATING_WARN_MS;
+          const stuckSince =
+            song.status === "separating" || song.status === "transcribing"
+              ? workerStuckSinceRef.current.get(`${song.id}:${song.status}`)
+              : undefined;
+          const stuck =
+            stuckSince !== undefined &&
+            Date.now() - stuckSince > WORKER_STUCK_WARN_MS;
           return (
             <li key={key} className="border rounded p-3 flex flex-col gap-2">
               <div className="flex items-center gap-3">
@@ -280,12 +332,13 @@ export function ProcessingView() {
                   style={{ width: `${song.status === "failed" ? 100 : pct}%` }}
                 />
               </div>
-              {separatingStuck && (
+              {stuck && (
                 <p className="text-xs text-amber-700 dark:text-amber-400">
-                  Separation has been pending for &gt;
-                  {Math.floor(SEPARATING_WARN_MS / 1000)}s. Demucs runs on the
-                  native worker (MPS) — check that <code>./start-dev.sh</code>{" "}
-                  is running.
+                  {song.status === "separating" ? "Separation" : "Transcription"}{" "}
+                  has been pending for &gt;
+                  {Math.floor(WORKER_STUCK_WARN_MS / 1000)}s. Demucs and
+                  Whisper run on the native worker (MPS) — check that{" "}
+                  <code>./start-dev.sh</code> is running.
                 </p>
               )}
             </li>

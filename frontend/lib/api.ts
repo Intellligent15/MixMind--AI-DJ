@@ -91,6 +91,39 @@ export type Stems = {
   updated_at: string;
 };
 
+export type TranscriptionStatus =
+  | "not_attempted"
+  | "success"
+  | "skipped_instrumental"
+  | "error";
+
+export type TranscriptionWord = {
+  start: number;
+  end: number;
+  word: string;
+};
+
+export type TranscriptionSegment = {
+  start: number;
+  end: number;
+  text: string;
+  words: TranscriptionWord[];
+};
+
+export type Transcription = {
+  id: string;
+  song_id: string;
+  model_name: string;
+  status: TranscriptionStatus;
+  language: string | null;
+  segments: TranscriptionSegment[];
+  vocal_rms_threshold: number | null;
+  vocal_rms_observed: number | null;
+  duration_seconds: number | null;
+  created_at: string;
+  updated_at: string;
+};
+
 export type QueueItem = {
   id: string;
   queue_id: string;
@@ -128,6 +161,11 @@ export const api = {
   getStems: (id: string) => request<Stems>(`/api/songs/${id}/stems`),
   stemAudioUrl: (id: string, name: StemName) =>
     `${API_BASE}/api/songs/${id}/stems/${name}`,
+
+  triggerTranscribe: (id: string) =>
+    request<Song>(`/api/songs/${id}/transcribe`, { method: "POST" }),
+  getTranscription: (id: string) =>
+    request<Transcription>(`/api/songs/${id}/transcription`),
 
   getCurrentQueue: () => request<Queue>(`/api/queues/current`),
   createQueue: () => request<Queue>(`/api/queues`, { method: "POST" }),

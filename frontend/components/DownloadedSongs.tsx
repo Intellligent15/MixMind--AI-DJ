@@ -8,7 +8,13 @@ import {
   useQuery,
   useQueryClient,
 } from "@tanstack/react-query";
-import { api, isStatusError, type Song, type Stems } from "@/lib/api";
+import {
+  api,
+  isStatusError,
+  type Song,
+  type Stems,
+  type Transcription,
+} from "@/lib/api";
 
 function isTerminal(status: Song["status"]): boolean {
   return status === "analyzed" || status === "ready" || status === "failed";
@@ -19,13 +25,28 @@ const SEPARATABLE: ReadonlyArray<Song["status"]> = [
   "ready",
   "failed",
 ];
+const TRANSCRIBABLE: ReadonlyArray<Song["status"]> = [
+  "analyzed",
+  "ready",
+  "failed",
+];
 
-// A song's "displayed" status is derived: once the Stems row exists, show
-// `separated` even though the worker bounces the Song row back to
-// `analyzed`. Mirrors ProcessingView's pipeline-step derivation.
-type DisplayStatus = Song["status"] | "separated";
+// A song's "displayed" status is derived: once a Stems / Transcription row
+// exists, show `separated` / `transcribed` even though the worker bounces
+// the Song row back to `analyzed` or `ready`. Mirrors ProcessingView.
+type DisplayStatus = Song["status"] | "separated" | "transcribed";
 
-function displayStatus(song: Song, hasStems: boolean): DisplayStatus {
+function displayStatus(
+  song: Song,
+  hasStems: boolean,
+  hasTranscription: boolean
+): DisplayStatus {
+  if (
+    hasTranscription &&
+    (song.status === "analyzed" || song.status === "ready")
+  ) {
+    return "transcribed";
+  }
   if (hasStems && (song.status === "analyzed" || song.status === "ready")) {
     return "separated";
   }
@@ -34,6 +55,7 @@ function displayStatus(song: Song, hasStems: boolean): DisplayStatus {
 
 function badgeClass(status: DisplayStatus): string {
   if (status === "failed") return "bg-red-500/20";
+  if (status === "transcribed") return "bg-emerald-500/40";
   if (status === "separated") return "bg-emerald-500/30";
   if (status === "analyzed" || status === "ready") return "bg-green-500/20";
   if (status === "downloaded") return "bg-blue-500/20";
@@ -42,10 +64,13 @@ function badgeClass(status: DisplayStatus): string {
 
 export function DownloadedSongs() {
   const qc = useQueryClient();
-  // Tracks song ids the user just clicked "Separate" on — keeps polling
-  // alive across the analyzed -> separating -> analyzed flicker until the
-  // Stems row actually shows up. Cleared automatically once stems land.
+  // Tracks song ids the user just clicked "Separate" / "Transcribe" on —
+  // keeps polling alive across the worker-status flicker until the Stems /
+  // Transcription row actually shows up. Cleared automatically.
   const [pendingStems, setPendingStems] = useState<Set<string>>(new Set());
+  const [pendingTranscription, setPendingTranscription] = useState<
+    Set<string>
+  >(new Set());
 
   const songs = useQuery({
     queryKey: ["songs"],
@@ -54,10 +79,10 @@ export function DownloadedSongs() {
       const data = q.state.data as Song[] | undefined;
       if (!data) return 1000;
       if (data.some((s) => !isTerminal(s.status))) return 1000;
-      // Keep polling while we're still waiting on stems for any song,
-      // since the worker bounces Song.status back to `analyzed` (terminal)
-      // before the Stems row appears in a separate transaction.
-      if (pendingStems.size > 0) return 1000;
+      // Keep polling while we're still waiting on a Stems or Transcription
+      // row for any song. The worker bounces Song.status back to terminal
+      // values before the row appears in a separate transaction.
+      if (pendingStems.size > 0 || pendingTranscription.size > 0) return 1000;
       return false;
     },
   });
@@ -93,7 +118,37 @@ export function DownloadedSongs() {
     return m;
   }, [songs.data, stemsQueries]);
 
-  // Auto-clear pendingStems entries once their stems land.
+  // Per-song transcription lookup. 404 = "not transcribed yet" → null.
+  const transcriptionQueries = useQueries({
+    queries: (songs.data ?? []).map((song) => ({
+      queryKey: ["transcription", song.id],
+      queryFn: async (): Promise<Transcription | null> => {
+        try {
+          return await api.getTranscription(song.id);
+        } catch (err) {
+          if (isStatusError(err, 404)) return null;
+          throw err;
+        }
+      },
+      retry: false,
+      refetchInterval: (q: { state: { data?: Transcription | null } }) => {
+        if (q.state.data) return false;
+        if (pendingTranscription.has(song.id)) return 1500;
+        if (song.status === "transcribing") return 1500;
+        return false;
+      },
+    })),
+  });
+
+  const transcriptionBySongId = useMemo(() => {
+    const m = new Map<string, Transcription | null>();
+    (songs.data ?? []).forEach((s, i) => {
+      m.set(s.id, transcriptionQueries[i]?.data ?? null);
+    });
+    return m;
+  }, [songs.data, transcriptionQueries]);
+
+  // Auto-clear pending* entries once the corresponding row lands.
   useEffect(() => {
     setPendingStems((prev) => {
       let changed = false;
@@ -107,6 +162,20 @@ export function DownloadedSongs() {
       return changed ? next : prev;
     });
   }, [stemsBySongId]);
+
+  useEffect(() => {
+    setPendingTranscription((prev) => {
+      let changed = false;
+      const next = new Set(prev);
+      for (const id of prev) {
+        if (transcriptionBySongId.get(id)) {
+          next.delete(id);
+          changed = true;
+        }
+      }
+      return changed ? next : prev;
+    });
+  }, [transcriptionBySongId]);
 
   const analyze = useMutation({
     mutationFn: (id: string) => api.triggerAnalyze(id),
@@ -140,6 +209,28 @@ export function DownloadedSongs() {
     },
   });
 
+  const transcribe = useMutation({
+    mutationFn: (id: string) => api.triggerTranscribe(id),
+    onMutate: (id: string) => {
+      setPendingTranscription((prev) => new Set(prev).add(id));
+      qc.setQueryData<Song[] | undefined>(["songs"], (list) =>
+        list?.map((s) => (s.id === id ? { ...s, status: "transcribing" } : s))
+      );
+    },
+    onSuccess: (_data, id) => {
+      qc.invalidateQueries({ queryKey: ["songs"] });
+      qc.invalidateQueries({ queryKey: ["transcription", id] });
+    },
+    onError: (_err, id) => {
+      setPendingTranscription((prev) => {
+        const next = new Set(prev);
+        next.delete(id);
+        return next;
+      });
+      qc.invalidateQueries({ queryKey: ["songs"] });
+    },
+  });
+
   return (
     <section className="flex flex-col gap-3">
       <h2 className="font-semibold">Library</h2>
@@ -150,9 +241,17 @@ export function DownloadedSongs() {
       <ul className="flex flex-col gap-3">
         {songs.data?.map((s) => {
           const hasStems = !!stemsBySongId.get(s.id);
-          const display = displayStatus(s, hasStems);
+          const hasTranscription = !!transcriptionBySongId.get(s.id);
+          const display = displayStatus(s, hasStems, hasTranscription);
           const isMidSeparation =
             s.status === "separating" || pendingStems.has(s.id);
+          const isMidTranscription =
+            s.status === "transcribing" || pendingTranscription.has(s.id);
+          // Transcription requires stems to exist first (the worker reads
+          // vocals_path off the Stems row); gating the button avoids a 409
+          // from the API.
+          const transcribable =
+            hasStems && TRANSCRIBABLE.includes(s.status);
           return (
             <li key={s.id} className="border rounded p-3 flex flex-col gap-2">
               <div className="flex items-center gap-3">
@@ -226,6 +325,20 @@ export function DownloadedSongs() {
                       : hasStems
                         ? "Re-separate stems"
                         : "Separate stems"}
+                  </button>
+                )}
+                {(transcribable || s.status === "transcribing") && (
+                  <button
+                    type="button"
+                    onClick={() => transcribe.mutate(s.id)}
+                    disabled={isMidTranscription || transcribe.isPending}
+                    className="text-sm border rounded px-3 py-1 hover:bg-black/5 dark:hover:bg-white/10 disabled:opacity-50"
+                  >
+                    {isMidTranscription
+                      ? "Transcribing…"
+                      : hasTranscription
+                        ? "Re-transcribe"
+                        : "Transcribe"}
                   </button>
                 )}
               </div>

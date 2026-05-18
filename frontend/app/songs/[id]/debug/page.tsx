@@ -3,8 +3,15 @@
 import Link from "next/link";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { use, useEffect, useState } from "react";
-import { api, isStatusError, type Song, type Stems } from "@/lib/api";
+import {
+  api,
+  isStatusError,
+  type Song,
+  type Stems,
+  type Transcription,
+} from "@/lib/api";
 import { StemsDebug } from "@/components/StemsDebug";
+import { TranscriptionDebug } from "@/components/TranscriptionDebug";
 import { WaveformDebug } from "@/components/WaveformDebug";
 
 export default function SongDebugPage({
@@ -15,10 +22,11 @@ export default function SongDebugPage({
   const { id } = use(params);
 
   const qc = useQueryClient();
-  // True from click-Separate until the Stems row lands. Survives the
-  // analyzed -> separating -> analyzed flicker so polling never stops
-  // before stems actually exist.
+  // True from click-Separate / click-Transcribe until the corresponding
+  // row lands. Survives the worker-status flicker so polling never stops
+  // before the row actually exists.
   const [awaitingStems, setAwaitingStems] = useState(false);
+  const [awaitingTranscription, setAwaitingTranscription] = useState(false);
 
   const songQ = useQuery({
     queryKey: ["song", id],
@@ -26,8 +34,9 @@ export default function SongDebugPage({
     refetchInterval: (q) => {
       const s = q.state.data;
       if (!s) return 1500;
-      if (s.status === "separating") return 1500;
-      if (awaitingStems) return 1500;
+      if (s.status === "separating" || s.status === "transcribing")
+        return 1500;
+      if (awaitingStems || awaitingTranscription) return 1500;
       return false;
     },
   });
@@ -54,17 +63,39 @@ export default function SongDebugPage({
       return false;
     },
   });
+  const transcriptionQ = useQuery({
+    queryKey: ["transcription", id],
+    queryFn: async (): Promise<Transcription | null> => {
+      try {
+        return await api.getTranscription(id);
+      } catch (err) {
+        if (isStatusError(err, 404)) return null;
+        throw err;
+      }
+    },
+    retry: false,
+    refetchInterval: (q) => {
+      if (q.state.data) return false;
+      if (awaitingTranscription) return 1500;
+      if (songQ.data?.status === "transcribing") return 1500;
+      return false;
+    },
+  });
 
-  // If the page mounts and we land mid-separation (e.g. user navigated
-  // away and came back), kick the awaiting flag on automatically.
+  // If the page mounts and we land mid-separation or mid-transcription,
+  // kick the awaiting flag on automatically.
   useEffect(() => {
     if (songQ.data?.status === "separating") setAwaitingStems(true);
+    if (songQ.data?.status === "transcribing") setAwaitingTranscription(true);
   }, [songQ.data?.status]);
 
-  // Stop awaiting as soon as the Stems row shows up.
+  // Stop awaiting as soon as the corresponding row shows up.
   useEffect(() => {
     if (stemsQ.data) setAwaitingStems(false);
   }, [stemsQ.data]);
+  useEffect(() => {
+    if (transcriptionQ.data) setAwaitingTranscription(false);
+  }, [transcriptionQ.data]);
 
   const separate = useMutation({
     mutationFn: () => api.triggerSeparate(id),
@@ -85,8 +116,28 @@ export default function SongDebugPage({
       qc.invalidateQueries({ queryKey: ["song", id] });
     },
   });
+  const transcribe = useMutation({
+    mutationFn: () => api.triggerTranscribe(id),
+    onMutate: () => {
+      setAwaitingTranscription(true);
+      qc.setQueryData<Song | undefined>(["song", id], (prev) =>
+        prev ? { ...prev, status: "transcribing" } : prev
+      );
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["song", id] });
+      qc.invalidateQueries({ queryKey: ["transcription", id] });
+    },
+    onError: () => {
+      setAwaitingTranscription(false);
+      qc.invalidateQueries({ queryKey: ["song", id] });
+    },
+  });
   const stemsAvailable = !!stemsQ.data;
   const stemsMissing404 = !stemsQ.data && stemsQ.isFetched && !stemsQ.error;
+  const transcriptionAvailable = !!transcriptionQ.data;
+  const transcriptionMissing404 =
+    !transcriptionQ.data && transcriptionQ.isFetched && !transcriptionQ.error;
 
   return (
     <main className="min-h-screen max-w-5xl mx-auto p-8 flex flex-col gap-6 font-mono">
@@ -180,6 +231,37 @@ export default function SongDebugPage({
                 songQ.data.status === "separating"
                   ? "Separating…"
                   : "Separate stems"}
+              </button>
+            </section>
+          )}
+
+          {transcriptionAvailable && (
+            <TranscriptionDebug transcription={transcriptionQ.data!} />
+          )}
+          {!transcriptionAvailable && stemsAvailable && (
+            <section className="flex items-center justify-between border rounded p-3">
+              <p className="text-sm opacity-80">
+                {awaitingTranscription || songQ.data.status === "transcribing"
+                  ? "Transcribing vocals… (first run downloads ~3 GB of MLX weights; subsequent runs are ~real-time)"
+                  : transcriptionMissing404
+                    ? "No transcription yet. Run Whisper over the vocal stem."
+                    : `Transcription unavailable: ${(transcriptionQ.error as Error)?.message ?? "unknown error"}`}
+              </p>
+              <button
+                type="button"
+                onClick={() => transcribe.mutate()}
+                disabled={
+                  transcribe.isPending ||
+                  awaitingTranscription ||
+                  songQ.data.status === "transcribing"
+                }
+                className="text-sm border rounded px-3 py-1 hover:bg-black/5 dark:hover:bg-white/10 disabled:opacity-50"
+              >
+                {transcribe.isPending ||
+                awaitingTranscription ||
+                songQ.data.status === "transcribing"
+                  ? "Transcribing…"
+                  : "Transcribe"}
               </button>
             </section>
           )}
