@@ -62,7 +62,7 @@ def _fake_result() -> SeparationResult:
 def _patch_service_returning(result: SeparationResult):
     service = MagicMock()
     service.separate.return_value = result
-    service.model_name = "htdemucs_ft"
+    service.model_name = "htdemucs"
     return service
 
 
@@ -95,7 +95,7 @@ def test_separate_stems_happy_path(analyzed_song: str, tmp_path: Path):
 
         row = db.query(Stems).filter(Stems.song_id == sid).one()
         assert row.status == StemsStatus.separated
-        assert row.model_name == "htdemucs_ft"
+        assert row.model_name == "htdemucs"
         assert row.vocals_path == f"stems/{song.youtube_video_id}/vocals.wav"
         assert row.drums_path == f"stems/{song.youtube_video_id}/drums.wav"
         assert row.bass_path == f"stems/{song.youtube_video_id}/bass.wav"
@@ -106,7 +106,7 @@ def test_separate_stems_happy_path(analyzed_song: str, tmp_path: Path):
 def test_separate_stems_marks_failed_on_error(analyzed_song: str):
     service = MagicMock()
     service.separate.side_effect = RuntimeError("demucs boom")
-    service.model_name = "htdemucs_ft"
+    service.model_name = "htdemucs"
 
     with (
         patch("app.workers.separate.get_storage", return_value=MagicMock()),
@@ -138,7 +138,7 @@ def test_separate_stems_skips_wrong_status(analyzed_song: str):
         db.commit()
 
     service = MagicMock()
-    service.model_name = "htdemucs_ft"
+    service.model_name = "htdemucs"
     with (
         patch("app.workers.separate.get_storage", return_value=MagicMock()),
         patch(
@@ -162,7 +162,7 @@ def test_separate_stems_skips_if_already_separating(analyzed_song: str):
         db.commit()
 
     service = MagicMock()
-    service.model_name = "htdemucs_ft"
+    service.model_name = "htdemucs"
     with (
         patch("app.workers.separate.get_storage", return_value=MagicMock()),
         patch(
@@ -201,7 +201,7 @@ def test_separate_stems_replaces_existing_stems_row(
         db.add(
             Stems(
                 song_id=sid,
-                model_name="htdemucs_ft",
+                model_name="htdemucs",
                 status=StemsStatus.separated,
                 vocals_path="stems/old/vocals.wav",
                 drums_path="stems/old/drums.wav",

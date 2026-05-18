@@ -26,7 +26,7 @@ def _stem_key(video_id: str, stem: str) -> str:
 
 @celery_app.task(name="app.workers.separate.separate_stems")
 def separate_stems(song_id: str) -> str | None:
-    """Run Demucs htdemucs_ft over the song's audio and persist four stems.
+    """Run Demucs htdemucs over the song's audio and persist four stems.
 
     Idempotent under concurrent dispatch via the same atomic-claim pattern
     as download_song / analyze_song: the analyzed/ready/failed -> separating

@@ -30,7 +30,7 @@ class Stems(Base):
     )
 
     model_name: Mapped[str] = mapped_column(
-        String, nullable=False, default="htdemucs_ft"
+        String, nullable=False, default="htdemucs"
     )
     status: Mapped[StemsStatus] = mapped_column(
         Enum(StemsStatus, name="stems_status"),

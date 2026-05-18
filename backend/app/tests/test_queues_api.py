@@ -281,7 +281,7 @@ def test_reorder_400_on_mismatched_ids(db_session: Session):
 def _add_stems_row(db: Session, song: Song) -> Stems:
     row = Stems(
         song_id=song.id,
-        model_name="htdemucs_ft",
+        model_name="htdemucs",
         status=StemsStatus.separated,
         vocals_path=f"stems/{song.youtube_video_id}/vocals.wav",
         drums_path=f"stems/{song.youtube_video_id}/drums.wav",

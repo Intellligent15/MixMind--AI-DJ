@@ -13,8 +13,11 @@ from demucs.pretrained import get_model
 logger = logging.getLogger(__name__)
 
 
-# htdemucs_ft is the locked V1 choice (spec → Locked Decisions Summary).
-# 4 stems, fine-tuned variant — produces these source labels in this order.
+# htdemucs (single-model, not the _ft 4-bag ensemble) — same 4-stem
+# output, ~4× faster on MPS since it runs one forward pass instead of
+# averaging four checkpoints. Quality loss is inaudible for DJ mixing.
+# Spec → Locked Decisions originally said `htdemucs_ft`; the deviation
+# is tracked in docs/the notes.
 STEM_NAMES = ("drums", "bass", "other", "vocals")
 
 
@@ -42,13 +45,13 @@ def _select_device() -> torch.device:
 
 
 class StemSeparationService:
-    """Wraps Demucs htdemucs_ft for 4-stem source separation.
+    """Wraps Demucs htdemucs for 4-stem source separation.
 
     Pure function: no DB, no storage I/O. Loads the model lazily so cold
-    Celery workers don't pay the ~300 MB weight download on import.
+    Celery workers don't pay the ~80 MB weight download on import.
     """
 
-    def __init__(self, model_name: str = "htdemucs_ft") -> None:
+    def __init__(self, model_name: str = "htdemucs") -> None:
         self.model_name = model_name
         self._model = None
         self._device = _select_device()
@@ -77,12 +80,16 @@ class StemSeparationService:
         # apply_model wants a (batch, channels, samples) tensor and returns
         # (batch, sources, channels, samples). split=True chunks long inputs
         # to keep peak memory bounded; overlap=0.25 is the demucs default.
+        # shifts=2 averages two passes with random time shifts — costs ~2×
+        # but recovers most of the bleed artifacts we lose by not using the
+        # _ft bagged variant (vocals dimming when other stems get loud).
         with torch.no_grad():
             sources = apply_model(
                 model,
                 wav[None].to(self._device),
                 split=True,
                 overlap=0.25,
+                shifts=2,
                 progress=False,
             )[0]
 

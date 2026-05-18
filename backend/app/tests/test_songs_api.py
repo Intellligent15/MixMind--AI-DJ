@@ -262,7 +262,7 @@ def _stems_row(db: Session, song: Song, **overrides) -> Stems:
     vid = song.youtube_video_id
     base = dict(
         song_id=song.id,
-        model_name="htdemucs_ft",
+        model_name="htdemucs",
         status=StemsStatus.separated,
         vocals_path=f"stems/{vid}/vocals.wav",
         drums_path=f"stems/{vid}/drums.wav",
@@ -310,7 +310,7 @@ def test_get_stems_returns_row(db_session: Session):
     r = client.get(f"/api/songs/{song.id}/stems")
     assert r.status_code == 200
     body = r.json()
-    assert body["model_name"] == "htdemucs_ft"
+    assert body["model_name"] == "htdemucs"
     assert body["status"] == "separated"
     assert body["vocals_path"].endswith("/vocals.wav")
     assert body["vocal_rms"] == 0.2
