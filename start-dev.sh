@@ -58,8 +58,13 @@ echo "    Frontend: http://localhost:3000"
 echo "    Stop docker stack with: ./stop-dev.sh"
 echo
 
+# --group worker: pulls torch + demucs + torchaudio (the optional dep
+# group defined in pyproject.toml). The dockerized backend skips this
+# group entirely so its image stays small; only the native worker needs
+# the ML stack.
+#
 # --pool=solo: single-process, serial task execution. Required for torch
 # + MPS, which crashes (SIGABRT) under the default prefork pool when a
 # Demucs task runs in a forked worker process on macOS. Single-user
 # pipeline doesn't lose anything to serial execution anyway.
-exec uv run celery -A app.workers worker --loglevel=info --pool=solo
+exec uv run --group worker celery -A app.workers worker --loglevel=info --pool=solo

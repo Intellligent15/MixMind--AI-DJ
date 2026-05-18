@@ -19,9 +19,6 @@ dependencies = [
     "numpy>=2.4.5",
     "scipy>=1.17.1",
     "soundfile>=0.13.1",
-    "demucs>=4.0.1",
-    "torch>=2.12.0",
-    "torchaudio>=2.11.0",
 ]
 
 [build-system]
@@ -38,6 +35,20 @@ dev = [
     "httpx>=0.27,<0.28",
     "ruff>=0.7,<0.8",
 ]
+# Native-worker-only deps. The FastAPI container never imports these
+# (api/songs.py + api/queues.py dispatch separate_stems by task name),
+# so the dockerized backend skips the ~2 GB torch + demucs install via
+# `uv sync --no-dev --no-default-groups`.
+worker = [
+    "demucs>=4.0.1",
+    "torch>=2.12.0",
+    "torchaudio>=2.11.0",
+]
+
+[tool.uv]
+# `dev` is installed by default for local development; `worker` must be
+# requested explicitly (`uv sync --group worker` or `uv run --group worker`).
+default-groups = ["dev"]
 
 [tool.ruff]
 line-length = 100
