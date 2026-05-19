@@ -56,6 +56,7 @@ def _fake_result() -> SeparationResult:
             "other": torch.zeros(2, 100),
         },
         vocal_rms=0.12,
+        vocal_envelope={"frame_hz": 10, "rms": [0.0, 0.0], "peak": [0.0, 0.0]},
     )
 
 
@@ -101,6 +102,18 @@ def test_separate_stems_happy_path(analyzed_song: str, tmp_path: Path):
         assert row.bass_path == f"stems/{song.youtube_video_id}/bass.wav"
         assert row.other_path == f"stems/{song.youtube_video_id}/other.wav"
         assert row.vocal_rms == pytest.approx(0.12)
+        # Envelope sidecar key + on-disk JSON match the fake result payload.
+        env_key = f"stems/{song.youtube_video_id}/vocal_envelope.json"
+        assert row.vocal_envelope_path == env_key
+        env_file = tmp_path / env_key
+        assert env_file.exists()
+        import json as _json
+
+        assert _json.loads(env_file.read_text()) == {
+            "frame_hz": 10,
+            "rms": [0.0, 0.0],
+            "peak": [0.0, 0.0],
+        }
 
 
 def test_separate_stems_marks_failed_on_error(analyzed_song: str):
