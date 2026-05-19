@@ -21,19 +21,30 @@ logger = logging.getLogger(__name__)
 STEM_NAMES = ("drums", "bass", "other", "vocals")
 
 
+# Frame rate for the vocal envelope sidecar. 10 Hz = 100ms per frame, which
+# is finer than any DJ-relevant decision needs (transition windows are
+# beat-sized, ~0.4–1.0s at typical tempos) but cheap to store: a 4-minute
+# song yields ~2400 floats per channel ≈ 20 KB of JSON. Bumping this
+# would buy nothing the LLM mix-planner can use.
+VOCAL_ENVELOPE_FRAME_HZ = 10
+
+
 @dataclass
 class SeparationResult:
     """In-memory output of Demucs separation.
 
     `stems` maps each canonical stem name to a (channels, samples) tensor
     at the original audio's sample rate. `vocal_rms` is the linear RMS of
-    the vocal stem (averaged across channels) and is what Phase 6 will
-    read to decide whether to skip Whisper.
+    the vocal stem (averaged across channels) and is what Phase 6 reads
+    to decide whether to skip Whisper. `vocal_envelope` is the frame-wise
+    RMS+peak sidecar payload, computed here while the vocal tensor is
+    still in memory so the Vocal Safety service never re-loads the WAV.
     """
 
     sample_rate: int
     stems: dict[str, torch.Tensor]
     vocal_rms: float
+    vocal_envelope: dict
 
 
 def _select_device() -> torch.device:
@@ -42,6 +53,46 @@ def _select_device() -> torch.device:
     if torch.cuda.is_available():
         return torch.device("cuda")
     return torch.device("cpu")
+
+
+def _compute_vocal_envelope(
+    vocals: torch.Tensor, sample_rate: int, frame_hz: int
+) -> dict:
+    """Frame-wise RMS + peak envelope of the vocal stem.
+
+    Input is the (channels, samples) vocal tensor demucs hands back. We
+    average to mono first — the LLM never cares about stereo width when
+    deciding "is the vocal hot here" — then fold into non-overlapping
+    `sample_rate // frame_hz`-sample frames and reduce each frame to
+    (rms, peak). Trailing samples shorter than one frame are dropped:
+    they can't carry meaningful energy at this resolution and keeping
+    them would just leave a single noisy tail frame.
+
+    Output shape matches the sidecar schema:
+        {"frame_hz": int, "rms": [float, ...], "peak": [float, ...]}
+    rms and peak have the same length. Floats are unrounded so a future
+    reader can apply its own quantisation policy.
+    """
+    if vocals.ndim != 2:
+        raise ValueError(
+            f"expected (channels, samples) tensor, got shape {tuple(vocals.shape)}"
+        )
+
+    mono = vocals.mean(dim=0)
+    frame_size = max(1, sample_rate // frame_hz)
+    n_frames = mono.shape[0] // frame_size
+    if n_frames == 0:
+        return {"frame_hz": frame_hz, "rms": [], "peak": []}
+
+    trimmed = mono[: n_frames * frame_size]
+    frames = trimmed.view(n_frames, frame_size)
+    rms = torch.sqrt(torch.mean(frames ** 2, dim=1))
+    peak = frames.abs().amax(dim=1)
+    return {
+        "frame_hz": frame_hz,
+        "rms": rms.tolist(),
+        "peak": peak.tolist(),
+    }
 
 
 class StemSeparationService:
@@ -100,11 +151,15 @@ class StemSeparationService:
         stems = {name: sources[model.sources.index(name)] for name in STEM_NAMES}
 
         vocal_rms = float(torch.sqrt(torch.mean(stems["vocals"] ** 2)).item())
+        vocal_envelope = _compute_vocal_envelope(
+            stems["vocals"], model.samplerate, VOCAL_ENVELOPE_FRAME_HZ
+        )
 
         return SeparationResult(
             sample_rate=model.samplerate,
             stems=stems,
             vocal_rms=vocal_rms,
+            vocal_envelope=vocal_envelope,
         )
 
     @staticmethod

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import uuid
 
@@ -22,6 +23,10 @@ CLAIMABLE_STATUSES = (SongStatus.analyzed, SongStatus.ready, SongStatus.failed)
 
 def _stem_key(video_id: str, stem: str) -> str:
     return f"stems/{video_id}/{stem}.wav"
+
+
+def _envelope_key(video_id: str) -> str:
+    return f"stems/{video_id}/vocal_envelope.json"
 
 
 @celery_app.task(name="app.workers.separate.separate_stems")
@@ -100,6 +105,14 @@ def separate_stems(song_id: str) -> str | None:
         service.write_stem(result.stems[stem_name], result.sample_rate, dest)
         keys[stem_name] = key
 
+    # Sidecar JSON next to the four WAVs. Going through storage.path keeps
+    # the S3-swap discipline (spec → Storage Abstraction): the worker never
+    # touches cache/ directly.
+    envelope_key = _envelope_key(video_id)
+    envelope_dest = storage.path(envelope_key)
+    envelope_dest.parent.mkdir(parents=True, exist_ok=True)
+    envelope_dest.write_text(json.dumps(result.vocal_envelope))
+
     with SessionLocal() as db:
         existing = db.query(Stems).filter(Stems.song_id == song_uuid).one_or_none()
         if existing is not None:
@@ -114,6 +127,7 @@ def separate_stems(song_id: str) -> str | None:
             bass_path=keys["bass"],
             other_path=keys["other"],
             vocal_rms=result.vocal_rms,
+            vocal_envelope_path=envelope_key,
         )
         db.add(stems_row)
         song = db.get(Song, song_uuid)
