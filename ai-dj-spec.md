@@ -132,7 +132,7 @@ When the project is eventually moved to a Linux home server or cloud VM, the wor
 - **librosa** + **Spotify Web API** — hybrid analysis (BPM, key, beat grid, energy curve from librosa; section detection from Spotify when available, librosa fallback otherwise)
 - **Demucs (htdemucs_ft)** — 4-stem separation (vocals, drums, bass, other), MPS-accelerated with CPU fallback
 - **mlx-whisper** with `large-v3` model — timestamped vocal transcription, runs on isolated vocal stem
-- **Genius API** — lyrics text (used as ground-truth reference; Whisper provides timestamps)
+- **Genius API** — lyrics text (used as ground-truth reference; Whisper provides timestamps via the Lyrics Alignment Model below)
 - **pyrubberband** — time-stretching and pitch-shifting (requires `rubberband-cli` installed natively)
 - **soundfile** + **numpy** — audio I/O and manipulation
 - **pydub** — convenience layer
@@ -198,6 +198,81 @@ The minimum-length constraint prevents picking sub-second gaps between words as 
 - Per-word + per-segment confidence preservation: **landed in Phase 6** (May 2026).
 - Vocal envelope computation during separation: **planned**, lands before Phase 7 so every newly-separated song captures it.
 - `vocal_safe_regions` service + API + debug overlay: **planned**, lands before Phase 9 when the LLM starts consuming it.
+
+---
+
+## Lyrics Alignment Model
+
+Whisper and Genius give us **complementary signals**:
+
+- **Genius API** — authoritative lyric text. No timing.
+- **mlx-whisper** — per-word timestamps. Possibly wrong words (hallucinations, dropouts, different punctuation, alternative cuts).
+
+The goal is to assign Whisper's timestamps to Genius's exact lyric text, producing a `(word, start, end, confidence)` sequence the mix-planner can trust both *what* and *when*.
+
+### Why this matters
+
+The mix-planner LLM (Phase 9) plans transitions with prompts like "cut on the word `love`" or "fade out before `Hotter than hell`." For that to work:
+
+- The textual reference (`love`, `Hotter than hell`) must match what's actually in the lyric — Whisper transcripts alone are unreliable here (we've seen "Thank you" hallucinations and word-drop regressions like "in front of" → "one of").
+- The timing must match what's actually in the audio — Genius alone has no timing.
+
+Aligning Genius (truth) onto Whisper (timing) closes the gap.
+
+### Approaches
+
+Three layered approaches; the first is the baseline.
+
+#### 1. Sequence alignment (DTW / Needleman-Wunsch over words)
+
+Pure-Python global alignment between two word sequences (Genius words, Whisper words):
+
+- **Match** (same word at the same place): copy Whisper's timestamp onto the Genius word. Confidence = high.
+- **Substitution** (similar but wrong, e.g. "flame" ↔ "name"): copy Whisper's timestamp anyway — Whisper got the timing right, just the word wrong. Score substitutions by edit distance and/or Soundex/Metaphone codes to be phonetically robust. Confidence = medium.
+- **Insertion in Genius** (Whisper missed a word): interpolate timestamp linearly from the neighbors. Confidence = low.
+- **Insertion in Whisper** (hallucinated word not in Genius): drop it.
+
+Output: every Genius word gets `(word, start, end, confidence, source)` where `source ∈ {whisper_match, whisper_substitution, interpolated}`.
+
+#### 2. Whisper `initial_prompt` priming (free quality boost, complements #1)
+
+mlx-whisper accepts an `initial_prompt` (up to ~200 tokens) that biases output toward expected text. Passing the Genius lyrics (or just the first verse / chorus, given the token limit) as the prompt measurably reduces hallucination on familiar lyrics and increases the match rate in step #1. Doesn't *enforce* the prompted text — it's a hint, not a constraint — so we still need step #1 for the actual alignment.
+
+Cost: one line in `services/transcription/service.py` once Genius is integrated. We feed the prompt at transcribe time (not after), so Lyrics fetch must run *before* (or in parallel with re-transcribe of) the songs we want to align.
+
+#### 3. Forced alignment via phoneme-level CTC (escape hatch)
+
+WhisperX, Montreal Forced Aligner, or wav2vec2-based CTC aligners take `(audio, text)` and produce word timestamps directly for the exact provided text — they never trust Whisper's word choices. Highest quality.
+
+Cost: new dependency tree (~3 GB of weights, likely wav2vec2-based), possibly no clean MLX port. Reserve for the case where DTW alignment turns out to drop too many words on real-world songs.
+
+### Recommendation
+
+Ship **(1) + (2) together** as the V1 alignment. Skip (3) unless DTW quality is unacceptable in practice. The LLM mix-planner needs "approximately when does each line happen," not karaoke-grade frame accuracy — DTW + prompt priming is good enough for this bar.
+
+### Edge cases
+
+- **Section headers**: Genius often interleaves `[Chorus]`, `[Verse 2]`, `[Outro]`, `[Pre-Chorus]` etc. Strip these before alignment.
+- **Repeated choruses**: Genius lists a chorus once with "(×4)" or similar; the song sings it four times. Either expand before alignment, or use a windowed alignment that can match the same Genius line at multiple time positions.
+- **Live cuts / remixes**: the artist may sing different words than Genius lists. After alignment, segments with a long run of low-confidence matches should be flagged so the mix-planner can fall back to vocal-safety-only logic.
+- **No Genius match**: fall back to raw Whisper output, mark `Lyrics.alignment_status = "whisper_only"` so downstream consumers know the data is less trustworthy.
+- **Trust order**: for *what* is sung, `Genius > Whisper > stem-audio`. For *when* something is sung, `stem-audio > Whisper > Genius`. The alignment reconciles both.
+
+### Where this lives in the code
+
+- **Persisted at transcription time**: per-word `probability`, per-segment `avg_logprob` (landed in Phase 6).
+- **Persisted at Genius fetch time**: the raw `Lyrics.text` and `Lyrics.genius_id` (Phase 8.5 — see Build Phase Order below).
+- **Persisted at alignment time**: `Lyrics.aligned_words` JSONB (see data model), plus an `alignment_status` enum and a scalar `alignment_quality` aggregate so consumers can quickly decide whether to trust the alignment or fall back.
+- **Computed by**: `services/lyrics_alignment/` — pure function `align(transcription: Transcription, genius_text: str) -> AlignmentResult`. Same shape as the vocal-safety service: deterministic, no I/O, kwarg-tunable thresholds.
+- **Whisper feedback loop**: once a song has Lyrics, a re-transcribe pass with `initial_prompt=genius_text[:200_tokens]` is dispatched. The resulting Transcription is what step (1) aligns against.
+- **API**: `GET /api/songs/{id}/lyrics` returns `{text, aligned_words, alignment_status, alignment_quality}`.
+- **LLM hook (Phase 9)**: the per-song JSON the LLM sees includes the aligned word list when `alignment_status = "success"`. When `alignment_status = "whisper_only"` or quality is below a threshold, the LLM gets only the raw Whisper transcript plus vocal-safe regions — and is instructed to plan more conservative transitions (crossfades over hard cuts).
+
+### Status (when this lands)
+
+- Genius fetch + raw Lyrics row: **planned in Phase 8.5** (see Build Phase Order).
+- DTW alignment + prompt-priming re-transcribe: **planned in Phase 8.5**, alongside Genius.
+- Forced-alignment escape hatch: **deferred**, only built if real-world alignment quality is unacceptable.
 
 ---
 
@@ -302,8 +377,22 @@ Transcription (1:1 with Song, nullable)
 Lyrics (1:1 with Song, nullable)
   song_id: UUID
   genius_id: int | None
-  text: str | None
+  text: str | None                       # raw Genius lyric text
   fetch_status: enum (not_attempted, success, not_found, error)
+  # Lyrics Alignment Model — see dedicated section. Empty/null when
+  # alignment hasn't run or Genius fetch failed.
+  aligned_words: list[AlignedWord] | None  # JSONB; see shape below
+  alignment_status: enum (not_attempted, success, whisper_only, low_quality, error)
+  alignment_quality: float | None        # 0..1 aggregate; below ~0.5,
+                                         # downstream code falls back to
+                                         # vocal-safety-only logic.
+
+  # AlignedWord shape (JSONB):
+  #   word: str           # the Genius word (authoritative text)
+  #   start, end: float   # timestamps from Whisper (or interpolated)
+  #   confidence: float   # 0..1; combines match-type + Whisper word prob
+  #   source: str         # "whisper_match" | "whisper_substitution" |
+  #                       # "interpolated" | "whisper_only"
 
 Queue
   id: UUID
@@ -515,7 +604,8 @@ Recommended sequence — each phase ends with something testable:
 6. **Whisper transcription** — mlx-whisper integration, vocal stem energy check for skip logic, per-decode confidence signals persisted (per-word `probability`, per-segment `avg_logprob` / `no_speech_prob` / `compression_ratio` / `temperature`) for the Vocal Safety Model.
 7. **Beat-matched crossfading** — first real mixing, BPM matching, beat alignment, simple crossfade. **Prerequisite:** Phase 5's vocal envelope must be in place for every song that hits the mixer (so Phase 9's vocal-safe-regions logic has its inputs available).
 8. **Render-to-FLAC pipeline** — mix plan execution producing FLAC files
-9. **LLM mix planning** — Gemini provider, tool-calling, first AI-planned transitions. **Prerequisite:** the Vocal Safety service (`services/vocal_safety/`, `GET /api/songs/{id}/vocal_safe_regions`) lands before this phase — the LLM consumes the safe-regions list when choosing transition windows.
+   - **8.5 (sub-phase) — Genius lyrics + alignment.** Fetch Genius lyric text into the `Lyrics` row; run the DTW-based Lyrics Alignment Model (see dedicated section) against the existing Whisper output to produce `aligned_words` + `alignment_status` + `alignment_quality`. Also adds an `initial_prompt`-primed re-transcribe pass over songs that have Genius text, so the alignment step has more matched anchors. Lands before Phase 9 so the LLM can consume aligned lyrics; can land in parallel with Phase 8.
+9. **LLM mix planning** — Gemini provider, tool-calling, first AI-planned transitions. **Prerequisites:** the Vocal Safety service (`services/vocal_safety/`, `GET /api/songs/{id}/vocal_safe_regions`) AND the Lyrics Alignment service (`services/lyrics_alignment/`, aligned lyrics persisted on the `Lyrics` row) both land before this phase — the LLM consumes both when choosing transition windows and word-anchored cuts.
 10. **Full pipeline integration** — the three-state frontend (building / processing / playing), playback orchestration, hard-cut fallback
 11. **Polish** — error handling, LRU cache eviction, status display refinements, end-to-end Playwright tests
 
