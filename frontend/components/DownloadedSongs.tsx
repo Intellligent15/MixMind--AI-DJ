@@ -40,8 +40,17 @@ type DisplayStatus = Song["status"] | "separated" | "transcribed";
 function displayStatus(
   song: Song,
   hasStems: boolean,
-  hasTranscription: boolean
+  hasTranscription: boolean,
+  isPendingTranscription: boolean,
+  isPendingSeparation: boolean,
 ): DisplayStatus {
+  // User just clicked Re-transcribe / Re-separate. Show the in-flight
+  // state immediately and keep showing it until the pending flag clears
+  // (when the new row lands). This wins over the cached status because
+  // a server refetch race can briefly return the pre-worker status
+  // (`analyzed`/`ready`) and we don't want the badge to flicker.
+  if (isPendingTranscription) return "transcribing";
+  if (isPendingSeparation) return "separating";
   if (
     hasTranscription &&
     (song.status === "analyzed" || song.status === "ready")
@@ -81,19 +90,24 @@ export function DownloadedSongs() {
     // pre-separate, post-separate pre-transcribe), so we can't treat
     // `analyzed` as terminal — instead, we treat the song as in-flight
     // until it lands at `ready` with both a Stems row and a Transcription
-    // row. The stemsBySongId / transcriptionBySongId maps are computed
-    // below and re-captured by this closure on every render.
+    // row. We read the per-song stems / transcription rows directly from
+    // the query cache (via qc.getQueryData) rather than the
+    // stemsBySongId / transcriptionBySongId memos defined further down,
+    // because react-query evaluates refetchInterval during the same
+    // render pass that this useQuery is declared in — referencing the
+    // memo names directly would hit the temporal dead zone before they
+    // are initialized.
     refetchInterval: (q) => {
       const data = q.state.data as Song[] | undefined;
       if (!data) return 1000;
-      const anyInFlight = data.some(
-        (s) =>
-          !isFullyProcessed(
-            s,
-            !!stemsBySongId.get(s.id),
-            !!transcriptionBySongId.get(s.id),
-          ),
-      );
+      const anyInFlight = data.some((s) => {
+        const cachedStems = qc.getQueryData<Stems | null>(["stems", s.id]);
+        const cachedTranscription = qc.getQueryData<Transcription | null>([
+          "transcription",
+          s.id,
+        ]);
+        return !isFullyProcessed(s, !!cachedStems, !!cachedTranscription);
+      });
       if (anyInFlight) return 1000;
       if (pendingStems.size > 0 || pendingTranscription.size > 0) return 1000;
       return false;
@@ -222,12 +236,22 @@ export function DownloadedSongs() {
       qc.setQueryData<Song[] | undefined>(["songs"], (list) =>
         list?.map((s) => (s.id === id ? { ...s, status: "separating" } : s))
       );
+      // Re-separate: clear the cached Stems row so the "pending clears
+      // when the row appears" effect doesn't fire on the OLD row. The
+      // worker deletes + recreates anyway; we just make the UI honest
+      // about it.
+      qc.setQueryData(["stems", id], null);
     },
     onSuccess: (_data, id) => {
-      // Re-sync with server. The optimistic `separating` stays in cache
-      // until the next refetch returns the real status.
-      qc.invalidateQueries({ queryKey: ["songs"] });
-      qc.invalidateQueries({ queryKey: ["stems", id] });
+      // Don't invalidate here. invalidateQueries triggers an immediate
+      // refetch which would overwrite our optimistic `separating` with
+      // whatever the worker hasn't yet promoted the row to (often still
+      // `analyzed`/`ready`), causing a visible flicker. The 1 s songs
+      // poll picks up the worker's real status change on its own.
+      // qc.invalidateQueries({ queryKey: ["songs"] });
+      // qc.invalidateQueries({ queryKey: ["stems", id] });
+      void _data;
+      void id;
     },
     onError: (_err, id) => {
       // Roll back: remove from pending and re-fetch.
@@ -247,10 +271,18 @@ export function DownloadedSongs() {
       qc.setQueryData<Song[] | undefined>(["songs"], (list) =>
         list?.map((s) => (s.id === id ? { ...s, status: "transcribing" } : s))
       );
+      // Re-transcribe path: clear the OLD cached Transcription row so
+      // the "pending clears when row lands" effect doesn't immediately
+      // see the stale row and drop the pending flag while the new one
+      // is being computed. Worker will replace it on success.
+      qc.setQueryData(["transcription", id], null);
     },
     onSuccess: (_data, id) => {
-      qc.invalidateQueries({ queryKey: ["songs"] });
-      qc.invalidateQueries({ queryKey: ["transcription", id] });
+      // Same reason as separate.onSuccess — don't invalidate here, let
+      // the 1 s polling pick up the worker's real status without
+      // overwriting our optimistic `transcribing`.
+      void _data;
+      void id;
     },
     onError: (_err, id) => {
       setPendingTranscription((prev) => {
@@ -273,11 +305,17 @@ export function DownloadedSongs() {
         {songs.data?.map((s) => {
           const hasStems = !!stemsBySongId.get(s.id);
           const hasTranscription = !!transcriptionBySongId.get(s.id);
-          const display = displayStatus(s, hasStems, hasTranscription);
           const isMidSeparation =
             s.status === "separating" || pendingStems.has(s.id);
           const isMidTranscription =
             s.status === "transcribing" || pendingTranscription.has(s.id);
+          const display = displayStatus(
+            s,
+            hasStems,
+            hasTranscription,
+            pendingTranscription.has(s.id),
+            pendingStems.has(s.id),
+          );
           // Transcription requires stems to exist first (the worker reads
           // vocals_path off the Stems row); gating the button avoids a 409
           // from the API.

@@ -41,14 +41,23 @@ export default function SongDebugPage({
     // Previously we only polled during separating/transcribing, which
     // missed the queue-lock chain's transitions THROUGH `analyzed` —
     // a user landing on this page mid-chain would see a stale status.
-    // hasStems/hasTranscription are captured from stemsQ/transcriptionQ
-    // declared below; the closure resolves them at refetch time.
+    //
+    // We read stems/transcription presence via qc.getQueryData rather
+    // than referencing the stemsQ/transcriptionQ variables declared
+    // below: react-query evaluates this callback during the same render
+    // pass that this useQuery is being declared in, so the const
+    // bindings haven't been initialized yet (temporal dead zone).
     refetchInterval: (q) => {
       const s = q.state.data;
       if (!s) return 1500;
       if (awaitingStems || awaitingTranscription) return 1500;
       if (isActivelyProcessing(s.status)) return 1500;
-      if (!isFullyProcessed(s, !!stemsQ.data, !!transcriptionQ.data)) {
+      const cachedStems = qc.getQueryData<Stems | null>(["stems", id]);
+      const cachedTranscription = qc.getQueryData<Transcription | null>([
+        "transcription",
+        id,
+      ]);
+      if (!isFullyProcessed(s, !!cachedStems, !!cachedTranscription)) {
         return 3000;
       }
       return false;
@@ -121,15 +130,19 @@ export default function SongDebugPage({
     mutationFn: () => api.triggerSeparate(id),
     onMutate: () => {
       // Optimistic flip + start awaiting so the polling loops engage even
-      // before the worker has picked the task up.
+      // before the worker has picked the task up. Also clear the cached
+      // Stems row so the "stop awaiting when row appears" effect doesn't
+      // immediately drop the flag on the OLD row during a re-separate.
       setAwaitingStems(true);
       qc.setQueryData<Song | undefined>(["song", id], (prev) =>
         prev ? { ...prev, status: "separating" } : prev
       );
+      qc.setQueryData(["stems", id], null);
     },
     onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["song", id] });
-      qc.invalidateQueries({ queryKey: ["stems", id] });
+      // No invalidate — that triggers an immediate refetch that would
+      // overwrite the optimistic `separating` with the pre-worker status.
+      // The 1.5 s polling will pick up real changes on its own.
     },
     onError: () => {
       setAwaitingStems(false);
@@ -143,10 +156,12 @@ export default function SongDebugPage({
       qc.setQueryData<Song | undefined>(["song", id], (prev) =>
         prev ? { ...prev, status: "transcribing" } : prev
       );
+      // Re-transcribe: same trick as separate — clear the cached row so
+      // the awaiting flag stays sticky until the new row lands.
+      qc.setQueryData(["transcription", id], null);
     },
     onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["song", id] });
-      qc.invalidateQueries({ queryKey: ["transcription", id] });
+      // No invalidate — see separate.onSuccess for why.
     },
     onError: () => {
       setAwaitingTranscription(false);
