@@ -187,7 +187,7 @@ The minimum-length constraint prevents picking sub-second gaps between words as 
 
 ### Where this lives in the code
 
-- **Persisted at separation time:** the vocal envelope (RMS + peak at frame-rate ~10 Hz) is computed in `separate_stems` and stored alongside the four stem WAVs. Format TBD between (a) JSONB column on the `Stems` row or (b) sidecar `cache/stems/<id>/vocal_envelope.json`. Lean toward sidecar — the rest of `cache/stems/` is the stems' canonical home, ~20 KB per song doesn't need SQL access patterns, and DB rows stay cheap.
+- **Persisted at separation time:** the vocal envelope (RMS + peak at 10 Hz) is computed in `separate_stems` and stored as a sidecar `cache/stems/<video_id>/vocal_envelope.json`. `Stems.vocal_envelope_path` points at it. Sidecar (not a JSONB column) because the rest of `cache/stems/` is the stems' canonical home, ~20 KB per song doesn't need SQL access patterns, and DB rows stay cheap. **Landed alongside Phase 5 (post-Phase 6).** Rows pre-`db729e2f9c53` are null — re-separate to populate.
 - **Persisted at transcription time:** the per-word `probability` and per-segment confidence fields are kept on the `Transcription` row's `segments` JSONB.
 - **Computed on demand:** `services/vocal_safety/` exposes a pure function `vocal_safe_regions(transcription, envelope, **thresholds) -> list[(start, end)]`. Thresholds are kwargs so callers can tune for the use case (e.g. the LLM mix-planner might want stricter regions than the manual mixer service).
 - **API surface:** `GET /api/songs/{id}/vocal_safe_regions` (default thresholds, overridable via query params). Useful for the debug page's "show safe-cut zones on the waveform" overlay.
@@ -353,9 +353,10 @@ Stems (1:1 with Song)
   bass_path: str
   other_path: str
   vocal_rms: float | None        # scalar RMS over the full vocal stem (gates Whisper skip)
-  vocal_envelope_path: str | None  # PLANNED: sidecar JSON path for frame-wise RMS+peak
-                                   # at ~10Hz over the vocal stem. Lands before Phase 7.
+  vocal_envelope_path: str | None  # Sidecar JSON path for frame-wise RMS+peak at 10 Hz
+                                   # over the vocal stem. Written by separate_stems.
                                    # Schema: {"frame_hz": 10, "rms": [...], "peak": [...]}.
+                                   # Null on rows pre-`db729e2f9c53` — re-separate to fill.
                                    # Input to the Vocal Safety Model.
 
 Transcription (1:1 with Song, nullable)
@@ -600,7 +601,7 @@ Recommended sequence — each phase ends with something testable:
 2. **Search + download** — yt-dlp search endpoint, download endpoint, basic search UI, HTML5 playback of raw downloads
 3. **Analysis pipeline** — librosa + Spotify hybrid, debug view with waveform + beat markers + BPM/key display
 4. **Queue UI** — search results panel, queue panel with dnd-kit, Done button, basic back-to-back playback (no mixing yet)
-5. **Stem separation** — Demucs integration on the native worker via MPS, debug view to solo each stem. **Followup before Phase 7:** also persist a frame-wise vocal envelope (RMS + peak at ~10 Hz) for the Vocal Safety Model — see the data-model `vocal_envelope_path` field. Compute it during separation while the tensor is in memory (re-loading the WAV later would be wasteful). Persist as a sidecar `cache/stems/<id>/vocal_envelope.json`.
+5. **Stem separation** — Demucs integration on the native worker via MPS, debug view to solo each stem. **Vocal envelope sidecar** (RMS + peak at 10 Hz, `cache/stems/<video_id>/vocal_envelope.json` + `Stems.vocal_envelope_path`) is now also written during separation as a Phase 5/6 followup — input #2 to the Vocal Safety Model.
 6. **Whisper transcription** — mlx-whisper integration, vocal stem energy check for skip logic, per-decode confidence signals persisted (per-word `probability`, per-segment `avg_logprob` / `no_speech_prob` / `compression_ratio` / `temperature`) for the Vocal Safety Model.
 7. **Beat-matched crossfading** — first real mixing, BPM matching, beat alignment, simple crossfade. **Prerequisite:** Phase 5's vocal envelope must be in place for every song that hits the mixer (so Phase 9's vocal-safe-regions logic has its inputs available).
 8. **Render-to-FLAC pipeline** — mix plan execution producing FLAC files
