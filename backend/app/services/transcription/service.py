@@ -82,11 +82,13 @@ WHISPER_OPTIONS: dict = {
     # mlx-whisper hasn't implemented beam search yet (decoding.py raises
     # NotImplementedError if beam_size is set), so we stick with greedy
     # decoding at temperature 0.0 and let `best_of` kick in only when the
-    # temperature-fallback ladder advances past 0.0.
-    # "beam_size": 5,  # blocked on https://github.com/ml-explore/mlx-examples
+    # temperature-fallback ladder advances past 0.0. `patience` is also
+    # off — mlx-whisper's _verify_options rejects "patience without
+    # beam_size" as a contradiction. Re-enable both together when
+    # mlx-whisper ships beam search.
+    # "beam_size": 5,
+    # "patience": 1.0,
     "best_of": 3,
-    # Beam search patience factor — default.
-    "patience": 1.0,
     # [-1] is mlx-whisper's standard "suppress all special / non-speech
     # tokens" sentinel. Don't change without reading mlx-whisper docs.
     "suppress_tokens": [-1],
