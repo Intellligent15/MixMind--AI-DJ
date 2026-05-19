@@ -213,5 +213,8 @@ def test_transcribe_passes_full_override_set():
     # Decoder options
     assert kwargs.get("language") == "en"
     assert kwargs.get("task") == "transcribe"
-    assert kwargs.get("beam_size") == 5
+    # beam_size is intentionally NOT passed — mlx-whisper hasn't
+    # implemented beam search yet and raises NotImplementedError if it's
+    # set. Greedy decode at temperature 0.0 + best_of at higher temps.
+    assert "beam_size" not in kwargs
     assert kwargs.get("best_of") == 3

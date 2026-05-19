@@ -79,9 +79,11 @@ WHISPER_OPTIONS: dict = {
     # / remove if you start queueing multilingual songs.
     "language": "en",
     "task": "transcribe",
-    # Beam search at temperature 0.0. Higher quality, slightly slower.
-    "beam_size": 5,
-    # When temperature > 0 kicks in, sample 3 candidates and pick best.
+    # mlx-whisper hasn't implemented beam search yet (decoding.py raises
+    # NotImplementedError if beam_size is set), so we stick with greedy
+    # decoding at temperature 0.0 and let `best_of` kick in only when the
+    # temperature-fallback ladder advances past 0.0.
+    # "beam_size": 5,  # blocked on https://github.com/ml-explore/mlx-examples
     "best_of": 3,
     # Beam search patience factor — default.
     "patience": 1.0,
