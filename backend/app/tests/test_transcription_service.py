@@ -118,14 +118,14 @@ def test_transcribe_passes_word_timestamps_flag():
     assert "mlx-community" in kwargs.get("path_or_hf_repo", "")
 
 
-def test_transcribe_passes_hallucination_silence_threshold():
-    """hallucination_silence_threshold=2.0 must flow through to
-    mlx-whisper. A regression would re-introduce the Charli-xcx-style
-    "Thank you" loop on sparse vocals.
+def test_transcribe_passes_hallucination_guards():
+    """Both hallucination guards must flow through to mlx-whisper.
 
-    condition_on_previous_text is left at mlx-whisper's default (True) —
-    we tried False to break the feedback loop but it measurably hurt
-    normal-track transcripts."""
+    condition_on_previous_text=False decodes each 30 s window
+    independently, blocking the "Thank you" feedback loop;
+    hallucination_silence_threshold=2.0 drops text aligned with >2 s
+    of silence. A regression of either re-opens the sparse-vocal
+    failure mode."""
     svc = TranscriptionService()
     with patch(
         "app.services.transcription.service.mlx_whisper.transcribe",
@@ -134,5 +134,5 @@ def test_transcribe_passes_hallucination_silence_threshold():
         svc.transcribe(Path("/fake/vocals.wav"))
 
     _, kwargs = mock_transcribe.call_args
+    assert kwargs.get("condition_on_previous_text") is False
     assert kwargs.get("hallucination_silence_threshold") == 2.0
-    assert "condition_on_previous_text" not in kwargs

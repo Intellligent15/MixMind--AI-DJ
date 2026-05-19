@@ -62,16 +62,18 @@ class TranscriptionService:
         # suspects it has started hallucinating — a free guard since we
         # already turn word_timestamps on.
         #
-        # condition_on_previous_text stays at mlx-whisper's default
-        # (True): we initially flipped it off to break the "Thank you"
-        # feedback loop on sparse vocals, but the loss of cross-window
-        # context measurably degraded normal-track transcripts. The
-        # silence-threshold guard alone catches the worst hallucinations
-        # without paying that price.
+        # condition_on_previous_text=False decodes each 30 s window
+        # independently, breaking Whisper's window-to-window feedback
+        # loop. We tried it both ways under large-v3-turbo and bounced
+        # back; under large-v3 the decoder depth carries enough context
+        # within a window that we don't need the previous-text crutch,
+        # so we get the loop protection without paying as much narrative
+        # cost. Currently under evaluation against real-world tracks.
         raw = mlx_whisper.transcribe(
             str(vocals_path),
             path_or_hf_repo=self.model_repo,
             word_timestamps=True,
+            condition_on_previous_text=False,
             hallucination_silence_threshold=2.0,
         )
 
