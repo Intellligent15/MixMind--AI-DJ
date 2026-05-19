@@ -104,7 +104,14 @@ def test_transcribe_empty_result_zero_duration():
     assert result.language is None
 
 
-def test_transcribe_passes_word_timestamps_flag():
+def test_transcribe_passes_full_override_set():
+    """Every override from WHISPER_OPTIONS must flow through to mlx-whisper.
+
+    These are the tuned values for music + Demucs-leaked vocals — a
+    silent regression would either re-introduce the "Thank you"
+    hallucination loop, eat real lyric repetition, or hallucinate
+    "(music)" / "[applause]" tags. The test pins every knob so a
+    one-line edit to WHISPER_OPTIONS gets flagged."""
     svc = TranscriptionService()
     with patch(
         "app.services.transcription.service.mlx_whisper.transcribe",
@@ -114,25 +121,23 @@ def test_transcribe_passes_word_timestamps_flag():
 
     mock_transcribe.assert_called_once()
     _, kwargs = mock_transcribe.call_args
-    assert kwargs.get("word_timestamps") is True
     assert "mlx-community" in kwargs.get("path_or_hf_repo", "")
 
-
-def test_transcribe_passes_hallucination_guards():
-    """Both hallucination guards must flow through to mlx-whisper.
-
-    condition_on_previous_text=False decodes each 30 s window
-    independently, blocking the "Thank you" feedback loop;
-    hallucination_silence_threshold=2.0 drops text aligned with >2 s
-    of silence. A regression of either re-opens the sparse-vocal
-    failure mode."""
-    svc = TranscriptionService()
-    with patch(
-        "app.services.transcription.service.mlx_whisper.transcribe",
-        return_value=_stub_raw(),
-    ) as mock_transcribe:
-        svc.transcribe(Path("/fake/vocals.wav"))
-
-    _, kwargs = mock_transcribe.call_args
+    # Hallucination / quality guards
+    assert kwargs.get("compression_ratio_threshold") == 3.0
+    assert kwargs.get("logprob_threshold") == -1.2
+    assert kwargs.get("no_speech_threshold") == 0.45
+    assert kwargs.get("hallucination_silence_threshold") == 1.5
     assert kwargs.get("condition_on_previous_text") is False
-    assert kwargs.get("hallucination_silence_threshold") == 2.0
+    assert kwargs.get("temperature") == (0.0, 0.2)
+
+    # Content / formatting
+    assert "vocals" in (kwargs.get("initial_prompt") or "").lower()
+    assert kwargs.get("word_timestamps") is True
+    assert kwargs.get("clip_timestamps") == "0"
+
+    # Decoder options
+    assert kwargs.get("language") == "en"
+    assert kwargs.get("task") == "transcribe"
+    assert kwargs.get("beam_size") == 5
+    assert kwargs.get("best_of") == 3
