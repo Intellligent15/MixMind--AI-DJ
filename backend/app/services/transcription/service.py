@@ -8,17 +8,21 @@ import mlx_whisper
 
 logger = logging.getLogger(__name__)
 
-# MLX-converted weights for whisper large-v3 — the spec's locked V1 model.
-# We briefly ran large-v3-turbo (fewer decoder layers, ~5-6× faster on
-# MPS) but it was measurably more prone to the "Thank you" hallucination
-# loop on sparse-vocal tracks (Charli xcx "Everything is romantic" was
-# the canonical failure). large-v3's extra decoder depth carries enough
-# context to ride out the same silent stretches. mlx-whisper downloads +
-# caches the weights from HuggingFace on first call; subsequent calls are
-# fast. Transcription.model_name is stored per-row so historical rows
-# from earlier model choices stay accurate.
-DEFAULT_MODEL_REPO = "mlx-community/whisper-large-v3-mlx"
-DEFAULT_MODEL_NAME = "large-v3"
+# MLX-converted weights for whisper large-v3-turbo. Same Whisper
+# architecture as large-v3 but with fewer decoder layers — ~5-6× faster
+# on MPS at a measurable WER cost. Currently on a second eval pass with
+# the fuller WHISPER_OPTIONS set (hallucination_silence_threshold,
+# tightened logprob/no_speech, initial_prompt, etc.) to see whether
+# those guards make turbo's quality acceptable for DJ use. If sparse-
+# vocal tracks still fail (e.g. Charli xcx "Everything is romantic"
+# re-developing the "Thank you" loop), revert to large-v3 by swapping
+# both constants back to:
+#     "mlx-community/whisper-large-v3-mlx" / "large-v3"
+# mlx-whisper downloads + caches the weights from HuggingFace on first
+# call; subsequent calls are fast. Transcription.model_name is stored
+# per-row so historical rows from earlier model choices stay accurate.
+DEFAULT_MODEL_REPO = "mlx-community/whisper-large-v3-turbo"
+DEFAULT_MODEL_NAME = "large-v3-turbo"
 
 
 # Full mlx-whisper override set. Kept as a module-level dict so tuning is
