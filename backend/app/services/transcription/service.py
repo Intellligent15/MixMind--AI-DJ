@@ -8,16 +8,17 @@ import mlx_whisper
 
 logger = logging.getLogger(__name__)
 
-# MLX-converted weights for whisper large-v3-turbo. Spec → Locked Decisions
-# names `large-v3`; turbo is the same architecture with fewer decoder
-# layers, ~5-6× faster on MPS at ~1-2% WER cost on most content. The
-# tradeoff is right for a single-user DJ app where queue->playback latency
-# matters more than the last fraction of WER. mlx-whisper downloads +
+# MLX-converted weights for whisper large-v3 — the spec's locked V1 model.
+# We briefly ran large-v3-turbo (fewer decoder layers, ~5-6× faster on
+# MPS) but it was measurably more prone to the "Thank you" hallucination
+# loop on sparse-vocal tracks (Charli xcx "Everything is romantic" was
+# the canonical failure). large-v3's extra decoder depth carries enough
+# context to ride out the same silent stretches. mlx-whisper downloads +
 # caches the weights from HuggingFace on first call; subsequent calls are
-# fast. Transcription.model_name is stored per-row so historical rows from
-# a large-v3 run stay accurate after a swap.
-DEFAULT_MODEL_REPO = "mlx-community/whisper-large-v3-turbo"
-DEFAULT_MODEL_NAME = "large-v3-turbo"
+# fast. Transcription.model_name is stored per-row so historical rows
+# from earlier model choices stay accurate.
+DEFAULT_MODEL_REPO = "mlx-community/whisper-large-v3-mlx"
+DEFAULT_MODEL_NAME = "large-v3"
 
 
 @dataclass

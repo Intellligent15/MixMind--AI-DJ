@@ -6,7 +6,7 @@ See [ai-dj-spec.md](ai-dj-spec.md) for the full project specification.
 
 ## Status
 
-**Phase 6 complete** — mlx-whisper `large-v3-turbo` transcription on the vocal stem via the native worker, with word-level timestamps and a `vocal_rms < 0.005` skip gate for instrumentals. Songs now advance `analyzed → transcribing → ready` and the processing view picks up `transcribing` + `transcribed` pipeline steps (derived from the presence of a Transcription row). See [docs/the notes](docs/the notes). Prior phases: [Phase 5](docs/the notes), [Phase 4](docs/the notes), [Phase 3](docs/the notes), [Phase 2](docs/the notes), [Phase 1](docs/the notes).
+**Phase 6 complete** — mlx-whisper `large-v3` transcription on the vocal stem via the native worker, with word-level timestamps, a `hallucination_silence_threshold=2.0` guard, and a `vocal_rms < 0.005` skip gate for instrumentals. Songs now advance `analyzed → transcribing → ready` and the processing view picks up `transcribing` + `transcribed` pipeline steps (derived from the presence of a Transcription row). See [docs/the notes](docs/the notes). Prior phases: [Phase 5](docs/the notes), [Phase 4](docs/the notes), [Phase 3](docs/the notes), [Phase 2](docs/the notes), [Phase 1](docs/the notes).
 
 Build phases are listed in the spec under **Build Phase Order**.
 
