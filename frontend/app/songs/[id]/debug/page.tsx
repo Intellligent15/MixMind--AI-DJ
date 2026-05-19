@@ -10,6 +10,12 @@ import {
   type Stems,
   type Transcription,
 } from "@/lib/api";
+import {
+  isActivelyProcessing,
+  isFullyProcessed,
+  maySoonHaveStems,
+  maySoonHaveTranscription,
+} from "@/lib/song-status";
 import { StemsDebug } from "@/components/StemsDebug";
 import { TranscriptionDebug } from "@/components/TranscriptionDebug";
 import { WaveformDebug } from "@/components/WaveformDebug";
@@ -31,12 +37,20 @@ export default function SongDebugPage({
   const songQ = useQuery({
     queryKey: ["song", id],
     queryFn: () => api.getSong(id),
+    // Poll until the song is fully processed (or terminally failed).
+    // Previously we only polled during separating/transcribing, which
+    // missed the queue-lock chain's transitions THROUGH `analyzed` —
+    // a user landing on this page mid-chain would see a stale status.
+    // hasStems/hasTranscription are captured from stemsQ/transcriptionQ
+    // declared below; the closure resolves them at refetch time.
     refetchInterval: (q) => {
       const s = q.state.data;
       if (!s) return 1500;
-      if (s.status === "separating" || s.status === "transcribing")
-        return 1500;
       if (awaitingStems || awaitingTranscription) return 1500;
+      if (isActivelyProcessing(s.status)) return 1500;
+      if (!isFullyProcessed(s, !!stemsQ.data, !!transcriptionQ.data)) {
+        return 3000;
+      }
       return false;
     },
   });
@@ -58,8 +72,12 @@ export default function SongDebugPage({
     retry: false,
     refetchInterval: (q) => {
       if (q.state.data) return false;
-      if (awaitingStems) return 1500;
-      if (songQ.data?.status === "separating") return 1500;
+      if (songQ.data?.status === "failed") return false;
+      if (awaitingStems || songQ.data?.status === "separating") return 1500;
+      // Slow poll while the song could plausibly grow stems via the
+      // queue-lock chain (analyzed/ready). 3s is enough to feel snappy
+      // without busy-looping on songs the user never separates.
+      if (songQ.data && maySoonHaveStems(songQ.data)) return 3000;
       return false;
     },
   });
@@ -76,8 +94,10 @@ export default function SongDebugPage({
     retry: false,
     refetchInterval: (q) => {
       if (q.state.data) return false;
-      if (awaitingTranscription) return 1500;
-      if (songQ.data?.status === "transcribing") return 1500;
+      if (songQ.data?.status === "failed") return false;
+      if (awaitingTranscription || songQ.data?.status === "transcribing")
+        return 1500;
+      if (songQ.data && maySoonHaveTranscription(songQ.data)) return 3000;
       return false;
     },
   });

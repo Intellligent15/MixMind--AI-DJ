@@ -15,10 +15,11 @@ import {
   type Stems,
   type Transcription,
 } from "@/lib/api";
-
-function isTerminal(status: Song["status"]): boolean {
-  return status === "analyzed" || status === "ready" || status === "failed";
-}
+import {
+  isFullyProcessed,
+  maySoonHaveStems,
+  maySoonHaveTranscription,
+} from "@/lib/song-status";
 
 const SEPARATABLE: ReadonlyArray<Song["status"]> = [
   "analyzed",
@@ -75,20 +76,36 @@ export function DownloadedSongs() {
   const songs = useQuery({
     queryKey: ["songs"],
     queryFn: api.listSongs,
+    // Poll while any song is mid-pipeline. The worker bounces Song.status
+    // through `analyzed` twice during the queue-lock chain (post-analyze
+    // pre-separate, post-separate pre-transcribe), so we can't treat
+    // `analyzed` as terminal — instead, we treat the song as in-flight
+    // until it lands at `ready` with both a Stems row and a Transcription
+    // row. The stemsBySongId / transcriptionBySongId maps are computed
+    // below and re-captured by this closure on every render.
     refetchInterval: (q) => {
       const data = q.state.data as Song[] | undefined;
       if (!data) return 1000;
-      if (data.some((s) => !isTerminal(s.status))) return 1000;
-      // Keep polling while we're still waiting on a Stems or Transcription
-      // row for any song. The worker bounces Song.status back to terminal
-      // values before the row appears in a separate transaction.
+      const anyInFlight = data.some(
+        (s) =>
+          !isFullyProcessed(
+            s,
+            !!stemsBySongId.get(s.id),
+            !!transcriptionBySongId.get(s.id),
+          ),
+      );
+      if (anyInFlight) return 1000;
       if (pendingStems.size > 0 || pendingTranscription.size > 0) return 1000;
       return false;
     },
   });
 
-  // Per-song stems lookup. 404 = "no stems yet" → null. Polls while we're
-  // expecting a stems row (just-clicked or song is mid-separation).
+  // Per-song stems lookup. 404 = "no stems yet" → null. Polls during
+  // separating and during analyzed/ready (where the worker writes the
+  // Stems row + rolls Song.status back in a single transaction, so the
+  // status flip is the user-visible signal that stems exist). Slower
+  // 3 s cadence for the analyzed/ready window so a lonely song that
+  // never gets separated doesn't busy-loop forever.
   const stemsQueries = useQueries({
     queries: (songs.data ?? []).map((song) => ({
       queryKey: ["stems", song.id],
@@ -103,8 +120,11 @@ export function DownloadedSongs() {
       retry: false,
       refetchInterval: (q: { state: { data?: Stems | null } }) => {
         if (q.state.data) return false;
-        if (pendingStems.has(song.id)) return 1500;
-        if (song.status === "separating") return 1500;
+        if (song.status === "failed") return false;
+        if (pendingStems.has(song.id) || song.status === "separating") {
+          return 1500;
+        }
+        if (maySoonHaveStems(song)) return 3000;
         return false;
       },
     })),
@@ -119,6 +139,11 @@ export function DownloadedSongs() {
   }, [songs.data, stemsQueries]);
 
   // Per-song transcription lookup. 404 = "not transcribed yet" → null.
+  // Mirrors the stems polling: fast during transcribing / user-clicked,
+  // slower 3 s during analyzed/ready (where the chain may eventually
+  // dispatch transcribe). The worker writes the Transcription row +
+  // sets Song.status to "ready" in one transaction, so the row + status
+  // become visible together.
   const transcriptionQueries = useQueries({
     queries: (songs.data ?? []).map((song) => ({
       queryKey: ["transcription", song.id],
@@ -133,8 +158,14 @@ export function DownloadedSongs() {
       retry: false,
       refetchInterval: (q: { state: { data?: Transcription | null } }) => {
         if (q.state.data) return false;
-        if (pendingTranscription.has(song.id)) return 1500;
-        if (song.status === "transcribing") return 1500;
+        if (song.status === "failed") return false;
+        if (
+          pendingTranscription.has(song.id) ||
+          song.status === "transcribing"
+        ) {
+          return 1500;
+        }
+        if (maySoonHaveTranscription(song)) return 3000;
         return false;
       },
     })),
