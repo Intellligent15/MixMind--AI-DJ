@@ -57,17 +57,91 @@ def test_transcribe_normalizes_segments_and_words():
 
     assert result.language == "en"
     assert len(result.segments) == 2
-    assert result.segments[0] == {
-        "start": 0.0,
-        "end": 1.5,
-        "text": " hello world",
-        "words": [
-            {"start": 0.0, "end": 0.5, "word": " hello"},
-            {"start": 0.6, "end": 1.5, "word": " world"},
-        ],
-    }
+    # Core timing + text shape on the first segment.
+    seg = result.segments[0]
+    assert seg["start"] == 0.0
+    assert seg["end"] == 1.5
+    assert seg["text"] == " hello world"
+    assert seg["words"] == [
+        # Confidence fields are None when the stub omits them (see the
+        # dedicated test below for the present-case).
+        {"start": 0.0, "end": 0.5, "word": " hello", "probability": None},
+        {"start": 0.6, "end": 1.5, "word": " world", "probability": None},
+    ]
     # Duration is the last segment's end timestamp.
     assert result.duration_seconds == 3.0
+
+
+def test_transcribe_preserves_confidence_fields():
+    """mlx-whisper populates per-word probability and per-segment
+    avg_logprob / no_speech_prob / compression_ratio / temperature on
+    every real decode. We persist them on the segments JSONB so the
+    planned vocal-safety logic (Phase 7+) doesn't have to re-transcribe.
+    """
+    raw = _stub_raw(
+        segments=[
+            {
+                "start": 0.0,
+                "end": 1.5,
+                "text": " hello",
+                "avg_logprob": -0.32,
+                "no_speech_prob": 0.04,
+                "compression_ratio": 1.8,
+                "temperature": 0.0,
+                "words": [
+                    {
+                        "start": 0.0,
+                        "end": 1.5,
+                        "word": " hello",
+                        "probability": 0.94,
+                    },
+                ],
+            },
+        ],
+    )
+    svc = TranscriptionService()
+    with patch(
+        "app.services.transcription.service.mlx_whisper.transcribe",
+        return_value=raw,
+    ):
+        result = svc.transcribe(Path("/fake/vocals.wav"))
+
+    seg = result.segments[0]
+    assert seg["avg_logprob"] == -0.32
+    assert seg["no_speech_prob"] == 0.04
+    assert seg["compression_ratio"] == 1.8
+    assert seg["temperature"] == 0.0
+    assert seg["words"][0]["probability"] == 0.94
+
+
+def test_transcribe_confidence_fields_default_to_none_when_missing():
+    """A stubbed mlx-whisper return that omits the confidence keys must
+    still produce well-formed segments — the JSONB column is consumed by
+    code that expects the keys to be present with None as the absent
+    marker."""
+    raw = _stub_raw(
+        segments=[
+            {
+                "start": 0.0,
+                "end": 1.0,
+                "text": " hi",
+                "words": [{"start": 0.0, "end": 1.0, "word": " hi"}],
+            }
+        ]
+    )
+    svc = TranscriptionService()
+    with patch(
+        "app.services.transcription.service.mlx_whisper.transcribe",
+        return_value=raw,
+    ):
+        result = svc.transcribe(Path("/fake/vocals.wav"))
+
+    seg = result.segments[0]
+    assert seg["avg_logprob"] is None
+    assert seg["no_speech_prob"] is None
+    assert seg["compression_ratio"] is None
+    assert seg["temperature"] is None
+    assert seg["words"][0]["probability"] is None
 
 
 def test_transcribe_handles_missing_words_key():

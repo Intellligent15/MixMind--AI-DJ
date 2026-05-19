@@ -95,14 +95,36 @@ WHISPER_OPTIONS: dict = {
 }
 
 
+def _maybe_float(d: dict, key: str) -> float | None:
+    """Read a numeric field from an mlx-whisper segment/word dict.
+
+    Returns None when the field is absent (stubbed test fixtures) or the
+    raw value is None. Keeps the normalizer terse and the JSONB payload
+    consistently typed for downstream consumers.
+    """
+    v = d.get(key)
+    return None if v is None else float(v)
+
+
 @dataclass
 class TranscriptionResult:
     """In-memory output of mlx-whisper.
 
     `segments` is the canonical wire shape persisted into the JSONB column:
-      {start, end, text, words: [{start, end, word}]}
-    Word entries preserve mlx-whisper's leading-space convention on `word`,
-    so re-joining segments by concatenation produces fluent text.
+      {
+        start, end, text,
+        avg_logprob, no_speech_prob, compression_ratio, temperature,
+        words: [{start, end, word, probability}],
+      }
+    Confidence fields are nullable — mlx-whisper populates them on every
+    real decode but a stubbed test result might omit them. Word entries
+    preserve mlx-whisper's leading-space convention on `word`, so
+    re-joining segments by concatenation produces fluent text.
+
+    The per-word `probability` and per-segment `avg_logprob` are the
+    inputs to Phase 7+'s vocal-safety logic (see ai-dj-spec.md → Vocal
+    Safety Model). Persisting them now avoids re-transcribing every song
+    when we land that work.
     """
 
     language: str | None
@@ -149,6 +171,9 @@ class TranscriptionService:
                         "end": float(w["end"]),
                         # mlx-whisper preserves the leading space; keep it.
                         "word": str(w["word"]),
+                        # Per-word confidence — Phase 7+ vocal-safety
+                        # input. None on stubbed test data.
+                        "probability": _maybe_float(w, "probability"),
                     }
                 )
             segments.append(
@@ -157,6 +182,16 @@ class TranscriptionService:
                     "end": float(seg["end"]),
                     "text": str(seg["text"]),
                     "words": words,
+                    # Per-segment confidence signals from mlx-whisper. All
+                    # are populated on real decodes; we keep them nullable
+                    # so stubbed tests + future model swaps that drop a
+                    # field don't break the normalizer.
+                    "avg_logprob": _maybe_float(seg, "avg_logprob"),
+                    "no_speech_prob": _maybe_float(seg, "no_speech_prob"),
+                    "compression_ratio": _maybe_float(
+                        seg, "compression_ratio"
+                    ),
+                    "temperature": _maybe_float(seg, "temperature"),
                 }
             )
 

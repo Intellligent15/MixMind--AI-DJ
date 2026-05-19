@@ -140,7 +140,64 @@ When the project is eventually moved to a Linux home server or cloud VM, the wor
 
 ### Whisper behavior
 
-Whisper runs in parallel with stem separation during the analysis phase. It runs on the isolated vocal stem (after Demucs completes) for better accuracy. If the vocal stem has less than 5% non-silent content (deterministic energy threshold check), Whisper is skipped — this catches instrumentals, ambient tracks, and EDM where the "vocal" stem is mostly sample chops. Timestamped output is cached as JSON, indexed by song.
+Whisper runs in parallel with stem separation during the analysis phase. It runs on the isolated vocal stem (after Demucs completes) for better accuracy. If the vocal stem has less than 5% non-silent content (deterministic energy threshold check — implemented as `vocal_rms < 0.005` against the RMS computed during separation), Whisper is skipped — this catches instrumentals, ambient tracks, and EDM where the "vocal" stem is mostly sample chops.
+
+Per-decode signals — per-word `probability` and per-segment `avg_logprob` / `no_speech_prob` / `compression_ratio` / `temperature` — are preserved on the `Transcription` row alongside the text. They are inputs to the Vocal Safety Model below.
+
+---
+
+## Vocal Safety Model
+
+Whisper output is treated as a hint, not as truth. For decisions about where a transition can land (hard cuts, stem swaps, drop swaps), we cross-reference Whisper's word boundaries with the **vocal stem's energy envelope** — a frame-wise RMS + peak signal computed during Demucs separation at ~10 Hz.
+
+### Why two signals
+
+- Whisper alone has **false negatives** (misses quiet vocals) — a hard cut placed in a "Whisper found nothing" gap might still chop a syllable that the model dropped.
+- Whisper alone has **false positives** (hallucinates text on silence, e.g. the canonical "Thank you" loop) — we'd skip a perfectly safe transition zone because "Whisper said there's a word."
+- The vocal stem envelope is the **physical** ground truth of vocal presence. Whisper is the **semantic** layer.
+
+Triangulating both signals dramatically reduces the failure modes a listener would notice.
+
+### Per-word usability test
+
+A Whisper word is considered "real" (worth respecting in transition planning) when:
+
+```
+usable_vocal_word =
+    word.probability             >= WORD_PROB_MIN          (default 0.35)
+    AND segment.avg_logprob      >= SEGMENT_LOGPROB_MIN    (default -1.2)
+    AND envelope.rms_near_word   >= STEM_RMS_PRESENCE      (default 0.02)
+    AND envelope.peak_near_word  >= STEM_PEAK_PRESENCE     (default 0.08)
+```
+
+"Near word" = a small window around `(word.start, word.end)` (e.g. ±50 ms) over the envelope.
+
+### Vocal-safe regions
+
+A time interval `(t_start, t_end)` is **vocal-safe** (a transition can safely place a hard cut, swap, or drop within it) when:
+
+```
+no usable_vocal_word overlaps the interval
+AND envelope.rms is below STEM_RMS_QUIET          (default 0.01) for all frames
+AND envelope.peak is below STEM_PEAK_QUIET        (default 0.04) for all frames
+AND (t_end - t_start) >= MIN_SAFE_REGION_SECONDS  (default 1.5)
+```
+
+The minimum-length constraint prevents picking sub-second gaps between words as "safe" — a transition needs room to breathe.
+
+### Where this lives in the code
+
+- **Persisted at separation time:** the vocal envelope (RMS + peak at frame-rate ~10 Hz) is computed in `separate_stems` and stored alongside the four stem WAVs. Format TBD between (a) JSONB column on the `Stems` row or (b) sidecar `cache/stems/<id>/vocal_envelope.json`. Lean toward sidecar — the rest of `cache/stems/` is the stems' canonical home, ~20 KB per song doesn't need SQL access patterns, and DB rows stay cheap.
+- **Persisted at transcription time:** the per-word `probability` and per-segment confidence fields are kept on the `Transcription` row's `segments` JSONB.
+- **Computed on demand:** `services/vocal_safety/` exposes a pure function `vocal_safe_regions(transcription, envelope, **thresholds) -> list[(start, end)]`. Thresholds are kwargs so callers can tune for the use case (e.g. the LLM mix-planner might want stricter regions than the manual mixer service).
+- **API surface:** `GET /api/songs/{id}/vocal_safe_regions` (default thresholds, overridable via query params). Useful for the debug page's "show safe-cut zones on the waveform" overlay.
+- **LLM hook (Phase 9):** the per-song JSON the LLM sees includes the safe-regions list at the planner's chosen thresholds. The LLM is told "hard cuts, stem swaps, and drop swaps should land inside these intervals; outside them, prefer crossfades."
+
+### Status (when this lands)
+
+- Per-word + per-segment confidence preservation: **landed in Phase 6** (May 2026).
+- Vocal envelope computation during separation: **planned**, lands before Phase 7 so every newly-separated song captures it.
+- `vocal_safe_regions` service + API + debug overlay: **planned**, lands before Phase 9 when the LLM starts consuming it.
 
 ---
 
@@ -214,15 +271,33 @@ Analysis (1:1 with Song)
 
 Stems (1:1 with Song)
   song_id: UUID
+  model_name: str                # e.g. "htdemucs"
+  status: enum (pending, separating, separated, failed)
   vocals_path: str
   drums_path: str
   bass_path: str
   other_path: str
+  vocal_rms: float | None        # scalar RMS over the full vocal stem (gates Whisper skip)
+  vocal_envelope_path: str | None  # PLANNED: sidecar JSON path for frame-wise RMS+peak
+                                   # at ~10Hz over the vocal stem. Lands before Phase 7.
+                                   # Schema: {"frame_hz": 10, "rms": [...], "peak": [...]}.
+                                   # Input to the Vocal Safety Model.
 
 Transcription (1:1 with Song, nullable)
   song_id: UUID
-  segments: list[Segment]        # JSONB — {start, end, text, words: [{start, end, word}]}
+  model_name: str                # e.g. "large-v3"
   status: enum (not_attempted, success, skipped_instrumental, error)
+  language: str | None           # auto-detected (or forced) ISO code
+  segments: list[Segment]        # JSONB — see Segment shape below
+  vocal_rms_threshold: float | None  # threshold in effect at decision time
+  vocal_rms_observed: float | None   # the Stems.vocal_rms at decision time
+  duration_seconds: float | None
+
+  # Segment shape (JSONB):
+  #   start, end, text
+  #   avg_logprob, no_speech_prob, compression_ratio, temperature    # confidence
+  #   words: [{start, end, word, probability}]                       # confidence per word
+  # Confidence fields are inputs to the Vocal Safety Model.
 
 Lyrics (1:1 with Song, nullable)
   song_id: UUID
@@ -436,11 +511,11 @@ Recommended sequence — each phase ends with something testable:
 2. **Search + download** — yt-dlp search endpoint, download endpoint, basic search UI, HTML5 playback of raw downloads
 3. **Analysis pipeline** — librosa + Spotify hybrid, debug view with waveform + beat markers + BPM/key display
 4. **Queue UI** — search results panel, queue panel with dnd-kit, Done button, basic back-to-back playback (no mixing yet)
-5. **Stem separation** — Demucs integration on the native worker via MPS, debug view to solo each stem
-6. **Whisper transcription** — mlx-whisper integration, vocal stem energy check for skip logic
-7. **Beat-matched crossfading** — first real mixing, BPM matching, beat alignment, simple crossfade
+5. **Stem separation** — Demucs integration on the native worker via MPS, debug view to solo each stem. **Followup before Phase 7:** also persist a frame-wise vocal envelope (RMS + peak at ~10 Hz) for the Vocal Safety Model — see the data-model `vocal_envelope_path` field. Compute it during separation while the tensor is in memory (re-loading the WAV later would be wasteful). Persist as a sidecar `cache/stems/<id>/vocal_envelope.json`.
+6. **Whisper transcription** — mlx-whisper integration, vocal stem energy check for skip logic, per-decode confidence signals persisted (per-word `probability`, per-segment `avg_logprob` / `no_speech_prob` / `compression_ratio` / `temperature`) for the Vocal Safety Model.
+7. **Beat-matched crossfading** — first real mixing, BPM matching, beat alignment, simple crossfade. **Prerequisite:** Phase 5's vocal envelope must be in place for every song that hits the mixer (so Phase 9's vocal-safe-regions logic has its inputs available).
 8. **Render-to-FLAC pipeline** — mix plan execution producing FLAC files
-9. **LLM mix planning** — Gemini provider, tool-calling, first AI-planned transitions
+9. **LLM mix planning** — Gemini provider, tool-calling, first AI-planned transitions. **Prerequisite:** the Vocal Safety service (`services/vocal_safety/`, `GET /api/songs/{id}/vocal_safe_regions`) lands before this phase — the LLM consumes the safe-regions list when choosing transition windows.
 10. **Full pipeline integration** — the three-state frontend (building / processing / playing), playback orchestration, hard-cut fallback
 11. **Polish** — error handling, LRU cache eviction, status display refinements, end-to-end Playwright tests
 

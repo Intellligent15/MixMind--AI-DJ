@@ -12,6 +12,10 @@ class WordRead(BaseModel):
     start: float
     end: float
     word: str
+    # mlx-whisper per-word probability. Input to the planned vocal-safety
+    # logic (ai-dj-spec.md → Vocal Safety Model). Nullable for historical
+    # rows transcribed before we started preserving it.
+    probability: float | None = None
 
 
 class SegmentRead(BaseModel):
@@ -19,6 +23,13 @@ class SegmentRead(BaseModel):
     end: float
     text: str
     words: list[WordRead] = []
+    # Per-segment confidence signals from mlx-whisper. Same nullable
+    # rationale as WordRead.probability — historical rows from earlier
+    # Phase 6 work won't have these fields populated.
+    avg_logprob: float | None = None
+    no_speech_prob: float | None = None
+    compression_ratio: float | None = None
+    temperature: float | None = None
 
 
 class TranscriptionRead(BaseModel):
