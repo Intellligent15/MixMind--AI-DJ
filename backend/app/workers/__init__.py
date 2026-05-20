@@ -12,6 +12,7 @@ celery_app = Celery(
         "app.workers.analyze",
         "app.workers.separate",
         "app.workers.transcribe",
+        "app.workers.render_transition",
     ],
 )
 
