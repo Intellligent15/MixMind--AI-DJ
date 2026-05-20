@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -18,6 +19,8 @@ from app.models import (
 from app.schemas import MixPlanRead
 from app.services.storage import get_storage
 from app.workers import celery_app
+
+logger = logging.getLogger(__name__)
 
 RENDER_TASK = "app.workers.render_transition.render_transition"
 RENDER_GATE = (
@@ -139,7 +142,18 @@ def render_mix_plan(mix_plan_id: uuid.UUID, db: Session = Depends(get_db)):
             status_code=409,
             detail=f"pair songs not ready (a={a.status.value}, b={b.status.value})",
         )
-    celery_app.send_task(RENDER_TASK, args=[str(mix_plan_id)])
+    # Temporary instrumentation: ear-testing surfaced a 5-10 s delay
+    # between clicking Render in the UI and the worker logging "Task
+    # received." Time the send_task call so we can tell whether the
+    # broker publish is the culprit. Remove once diagnosed.
+    import time
+    t_before = time.perf_counter()
+    result = celery_app.send_task(RENDER_TASK, args=[str(mix_plan_id)])
+    t_after = time.perf_counter()
+    logger.warning(
+        "render dispatch timing: send_task took %.3fs (task_id=%s, mix_plan=%s)",
+        t_after - t_before, result.id, mix_plan_id,
+    )
     return {"status": "accepted"}
 
 
