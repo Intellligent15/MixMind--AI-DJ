@@ -6,7 +6,7 @@ See [ai-dj-spec.md](ai-dj-spec.md) for the full project specification.
 
 ## Status
 
-**Phase 6 complete** — mlx-whisper `large-v3` transcription on the vocal stem via the native worker, with word-level timestamps, a `hallucination_silence_threshold=2.0` guard, and a `vocal_rms < 0.005` skip gate for instrumentals. Songs now advance `analyzed → transcribing → ready` and the processing view picks up `transcribing` + `transcribed` pipeline steps (derived from the presence of a Transcription row). See [docs/the notes](docs/the notes). Prior phases: [Phase 5](docs/the notes), [Phase 4](docs/the notes), [Phase 3](docs/the notes), [Phase 2](docs/the notes), [Phase 1](docs/the notes).
+**Phase 7 complete** — beat-matched crossfading. Adjacent `ready` songs in a locked queue get a `MixPlan` row at lock time; the user kicks off a per-pair render that time-stretches B to A's BPM, pitch-shifts B to A's key, snaps both endpoints to downbeats, and linearly crossfades B in over A across an integer-bar window via `pyrubberband` + `soundfile`. The plan is hand-built by a deterministic generator (the seam Phase 9's LLM call will replace). Output WAV is persisted via the `StorageBackend` protocol and surfaced on the per-song debug page with an inline audio player. See [docs/the notes](docs/the notes). Prior phases: [Phase 6](docs/the notes), [Phase 5](docs/the notes), [Phase 4](docs/the notes), [Phase 3](docs/the notes), [Phase 2](docs/the notes), [Phase 1](docs/the notes).
 
 Build phases are listed in the spec under **Build Phase Order**.
 
