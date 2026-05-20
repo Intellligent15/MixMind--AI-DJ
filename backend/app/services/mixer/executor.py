@@ -204,7 +204,14 @@ def render(
     # Pre-seam: pure A.
     out[:a_seam_sample] = a_mix[:a_seam_sample]
 
-    # Crossfade region.
+    # Crossfade region. endpoint=False is load-bearing: t runs
+    # [0, 1/N, 2/N, ..., (N-1)/N], so the last crossfade sample is still
+    # slightly A-weighted and the next sample (post-seam, pure B from
+    # b_mix[b_seam_sample + crossfade_samples:]) is the natural continuation.
+    # Switching to endpoint=True would put a pure-B sample at the end of
+    # the crossfade region AND a pure-B sample as the first post-seam
+    # sample — a one-frame discontinuity right where the listener is
+    # paying attention.
     t = np.linspace(0.0, 1.0, crossfade_samples, endpoint=False, dtype=np.float32)
     t_stereo = t[:, None]  # broadcast to (samples, 1) for stereo math
     a_region = a_mix[a_seam_sample : a_seam_sample + crossfade_samples]
