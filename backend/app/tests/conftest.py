@@ -25,6 +25,7 @@ from app.models import Song  # noqa: F401 — ensure Song table is registered
 # ... CASCADE handles the FKs. queue_items and queues are listed for clarity
 # even though the CASCADE from songs would catch them via queue_items.song_id.
 _TRUNCATE_TABLES = (
+    "mix_plans",
     "queue_items",
     "queues",
     "transcriptions",

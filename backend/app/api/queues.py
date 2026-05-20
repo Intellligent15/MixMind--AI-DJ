@@ -284,4 +284,11 @@ def lock_queue(queue_id: uuid.UUID, db: Session = Depends(get_db)) -> Queue:
     for song in songs_to_pipeline:
         _enqueue_pipeline_for_song(song, db)
 
+    # Phase 7: seed MixPlan rows for each adjacent pair. plan_json is
+    # generated lazily at render time so the LLM call in Phase 9 doesn't
+    # fire for plans the user never asks to render. Local import to dodge
+    # the api/queues ↔ api/mix_plans circular at module load.
+    from app.api.mix_plans import _seed_mix_plans
+    _seed_mix_plans(queue, db)
+
     return queue

@@ -393,6 +393,25 @@ def test_lock_fans_out_pipeline_by_song_status(db_session: Session):
     # done is fully processed — nothing more
     analyze_mock.delay.assert_not_called()
 
+    # Phase 7: lock also seeds N-1 MixPlan rows for adjacent pairs in the
+    # queue. plan_json is null at seed time (lazy generation at render).
+    from sqlalchemy import select
+
+    from app.models import MixPlan
+
+    songs_in_order = [pending, downloaded, analyzed_no_stems, analyzed_with_stems, done]
+    rows = list(
+        db_session.scalars(
+            select(MixPlan).where(MixPlan.queue_id == queue.id)
+        )
+    )
+    assert len(rows) == len(songs_in_order) - 1
+    pos_by_song = {s.id: i for i, s in enumerate(songs_in_order)}
+    for row in rows:
+        assert pos_by_song[row.to_song_id] - pos_by_song[row.from_song_id] == 1
+        assert row.plan_json is None
+        assert row.rendered_audio_path is None
+
 
 def test_lock_409_if_empty(db_session: Session):
     queue = Queue()
