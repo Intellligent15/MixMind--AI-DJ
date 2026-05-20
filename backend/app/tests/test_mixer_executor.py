@@ -301,3 +301,77 @@ def test_render_soft_clips_loud_sum():
     decoded, _ = sf.read(io.BytesIO(result.wav_bytes), always_2d=True)
     assert decoded.max() <= 0.999 + 1e-5
     assert decoded.min() >= -0.999 - 1e-5
+
+
+def test_render_clamps_crossfade_when_stems_shorter_than_plan(caplog):
+    """Plan asks for a 1-bar crossfade (2s) starting at seam=2.0s, but
+    the stem WAVs are only 2.5s long — there's room for 0.5s of crossfade,
+    not 2s. Executor should clamp to what's available, log a WARN, and
+    produce a valid WAV rather than raising MixerPreconditionError.
+    Models the real-world drift between Song.duration_seconds (yt-dlp
+    metadata) and the actual stem WAV length after Demucs + pyrubberband."""
+    short_n = int(SR * 2.5)  # 2.5s — leaves 0.5s after the 2s seam
+
+    def short_read(path, always_2d=True, dtype="float32"):
+        return 0.2 * np.ones((short_n, 2), dtype=np.float32), SR
+
+    a = _inputs(prefix="A")
+    b = _inputs(prefix="B")
+    plan = [
+        {"tool": "set_transition_window",
+         "from_song_time_start": 2.0,   # snaps to downbeat 2.0
+         "to_song_time_start": 0.0,
+         "duration_bars": 1},            # asks for 2s of crossfade
+        *[
+            {"tool": "crossfade_stem", "stem": s,
+             "from_song": "A", "to_song": "B",
+             "start_bar": 0, "duration_bars": 1, "curve": "linear"}
+            for s in ("vocals", "drums", "bass", "other")
+        ],
+    ]
+
+    with patch("soundfile.read", side_effect=short_read), \
+         caplog.at_level("WARNING"):
+        result = render(plan, a, b, _FakeStorage())
+
+    # Should have logged the clamp.
+    assert any("clamping crossfade" in rec.message for rec in caplog.records)
+    # And produced a non-empty WAV.
+    decoded, _ = sf.read(io.BytesIO(result.wav_bytes), always_2d=True)
+    assert decoded.shape[0] > 0
+
+
+def test_render_rejects_when_no_overlap_available():
+    """A's downbeats extend past the actual stem length (analysis claims
+    a 10s downbeat in a 5s stem — a real bug case, not just sample
+    drift). The seam snaps to that beyond-end downbeat and max_crossfade_a
+    becomes negative. Executor still raises rather than silently
+    producing nonsense."""
+    bad_analysis = AnalysisBundle(
+        bpm=120.0,
+        key="C",
+        camelot_key="8B",
+        time_signature=4,
+        beat_grid=[i * 0.5 for i in range(40)],
+        downbeats=[10.0, 12.0],   # past the 5s audio
+        sections=[{"start": 0.0, "end": DUR, "label": "body"}],
+        duration=DUR,
+    )
+    a = SongRenderInputs(stem_paths=_stems_dict("A"), analysis=bad_analysis)
+    b = _inputs(prefix="B")
+    plan = [
+        {"tool": "set_transition_window",
+         "from_song_time_start": 8.0,   # snaps to 10.0 downbeat (past EOF)
+         "to_song_time_start": 0.0,
+         "duration_bars": 1},
+        *[
+            {"tool": "crossfade_stem", "stem": s,
+             "from_song": "A", "to_song": "B",
+             "start_bar": 0, "duration_bars": 1, "curve": "linear"}
+            for s in ("vocals", "drums", "bass", "other")
+        ],
+    ]
+
+    with patch("soundfile.read", side_effect=_fake_sf_read()):
+        with pytest.raises(MixerPreconditionError, match="no overlap"):
+            render(plan, a, b, _FakeStorage())

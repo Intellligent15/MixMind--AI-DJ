@@ -183,19 +183,34 @@ def render(
     )
     crossfade_samples = int(round(crossfade_seconds * REQUIRED_SAMPLE_RATE))
 
-    # Bounds checks (the plan generator should have clamped, but assert).
-    if a_seam_sample + crossfade_samples > a_mix.shape[0]:
+    # Bounds: the plan generator clamps based on Song.duration_seconds
+    # (from yt-dlp metadata), but the *actual* stem WAV length can drift
+    # by a few hundred ms — Demucs pads/trims, pyrubberband's stretch
+    # adds/removes a handful of samples, yt-dlp rounds. Clamp gracefully
+    # to whatever room actually exists rather than refusing the render.
+    # Only raise when there's literally no overlap to work with — that
+    # case represents a real bug (plan picked a seam past end-of-audio).
+    max_crossfade_a = a_mix.shape[0] - a_seam_sample
+    max_crossfade_b = b_mix.shape[0] - b_seam_sample
+    if max_crossfade_a <= 0 or max_crossfade_b <= 0:
         raise MixerPreconditionError(
-            f"crossfade extends past A's end "
-            f"(a_seam={a_seam_sample}, crossfade={crossfade_samples}, "
-            f"len_a={a_mix.shape[0]})"
+            f"no overlap available for crossfade "
+            f"(a_seam={a_seam_sample}/len_a={a_mix.shape[0]}, "
+            f"b_seam={b_seam_sample}/len_b={b_mix.shape[0]})"
         )
-    if b_seam_sample + crossfade_samples > b_mix.shape[0]:
-        raise MixerPreconditionError(
-            f"crossfade extends past B's end "
-            f"(b_seam={b_seam_sample}, crossfade={crossfade_samples}, "
-            f"len_b={b_mix.shape[0]})"
+    available = min(max_crossfade_a, max_crossfade_b)
+    if crossfade_samples > available:
+        logger.warning(
+            "render: clamping crossfade from %d to %d samples "
+            "(%.3fs -> %.3fs) — stem WAV length drifted from "
+            "Song.duration_seconds by ~%d samples",
+            crossfade_samples,
+            available,
+            crossfade_samples / REQUIRED_SAMPLE_RATE,
+            available / REQUIRED_SAMPLE_RATE,
+            crossfade_samples - available,
         )
+        crossfade_samples = available
 
     # 6. Build output buffer.
     out_len = a_seam_sample + (b_mix.shape[0] - b_seam_sample)
