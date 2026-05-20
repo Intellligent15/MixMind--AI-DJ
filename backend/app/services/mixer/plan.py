@@ -10,9 +10,18 @@ Strategy (full design: the design notes):
    intros / count-ins).
 3. duration_bars = min(16, available outro / bar, available stretched
    intro / bar), floored at 4 with a warning when shorter.
-4. Pitch shift B → A using musical-key semitone math (NOT Camelot,
-   though Camelot edges are handled). Apply full shift when |δ| > 2
-   (locked decision); log a WARN with from/to keys.
+
+Phase 7 explicitly does NOT pitch-shift. pyrubberband artifacts at
+shifts > 2 semitones can sound worse than the harmonic dissonance
+they're trying to fix, and small shifts are subtle enough that most
+listeners won't notice the mismatch. Phase 9's LLM has the
+`pitch_shift` and `temporary_pitch_shift` tools available and can
+decide per-pair whether to use them; the hand-built generator stays
+neutral and leaves keys as-is.
+
+`compute_pitch_shift` stays in the module as a public utility so
+Phase 9 (and anything else that wants to reason about smallest-shift
+targets) doesn't have to duplicate the key-parsing logic.
 """
 
 from __future__ import annotations
@@ -117,17 +126,10 @@ def build_pair_plan(a: AnalysisBundle, b: AnalysisBundle) -> MixPlanJSON:
         }
     ]
 
-    # Pitch shift B → A's key.
-    delta = compute_pitch_shift(a.key, b.key)
-    if delta != 0:
-        if abs(delta) > LARGE_SHIFT_THRESHOLD:
-            logger.warning(
-                "build_pair_plan: large pitch shift requested "
-                "(from_key=%s to_key=%s, delta=%d semitones); "
-                "applying anyway",
-                b.key, a.key, delta,
-            )
-        plan.append({"tool": "pitch_shift", "song": "B", "semitones": delta})
+    # No pitch_shift in Phase 7. The LARGE_SHIFT_THRESHOLD constant
+    # below is retained for Phase 9's LLM-side reasoning; the threshold
+    # is "what counts as a large shift" in the broader system, not just
+    # a parameter to this generator.
 
     for stem in ("vocals", "drums", "bass", "other"):
         plan.append({

@@ -88,31 +88,26 @@ def test_build_pair_plan_tempo_difference():
     assert window["duration_bars"] == 16  # both songs have plenty
 
 
-def test_build_pair_plan_key_difference_with_minor_shift():
-    a = _bundle(key="C")    # C major, root=0
-    b = _bundle(key="D")    # D major, root=2 → δ = -2 (B shifts down 2)
-    plan = build_pair_plan(a, b)
-    shift = next(c for c in plan if c["tool"] == "pitch_shift")
-    assert shift["semitones"] == -2
-    assert shift["song"] == "B"
-
-
-def test_build_pair_plan_large_shift_applied_with_warning(caplog):
-    a = _bundle(key="C")    # root=0
-    b = _bundle(key="F#")   # root=6 → δ = -6 or +6; ((0-6+6)%12)-6 = -6
-    with caplog.at_level("WARNING"):
+def test_build_pair_plan_never_emits_pitch_shift_even_when_keys_differ():
+    # Phase 7's hand-built generator does not pitch-shift. The LLM in
+    # Phase 9 may emit pitch_shift / temporary_pitch_shift, but the
+    # stand-in generator stays neutral on key matching.
+    for b_key in ("D", "F#", "Am", "G#m"):
+        a = _bundle(key="C")
+        b = _bundle(key=b_key)
         plan = build_pair_plan(a, b)
-    shift = next(c for c in plan if c["tool"] == "pitch_shift")
-    assert abs(shift["semitones"]) == 6  # full shift applied
-    assert any("large pitch shift" in rec.message for rec in caplog.records)
+        assert not any(c["tool"] == "pitch_shift" for c in plan), (
+            f"unexpected pitch_shift in plan for C → {b_key}: {plan}"
+        )
 
 
-def test_build_pair_plan_relative_major_minor_no_shift():
-    # C major's relative minor is A minor (same Camelot position 8B/8A).
-    a = _bundle(key="C")
-    b = _bundle(key="Am")
-    plan = build_pair_plan(a, b)
-    assert not any(c["tool"] == "pitch_shift" for c in plan)
+def test_compute_pitch_shift_remains_available_for_phase_9():
+    # The utility function is still exposed for Phase 9's planner even
+    # though build_pair_plan no longer calls it.
+    from app.services.mixer.plan import compute_pitch_shift
+    assert compute_pitch_shift("C", "D") == -2
+    assert compute_pitch_shift("C", "Am") == 0  # relative minor
+    assert abs(compute_pitch_shift("C", "F#")) == 6  # tritone
 
 
 def test_build_pair_plan_short_a_outro_clamps_to_end_window():

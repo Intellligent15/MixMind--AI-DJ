@@ -427,7 +427,9 @@ The LLM constructs a transition by calling these tools in sequence. The mixer se
 - `apply_echo(stem, song, start_bar, decay_bars, feedback)` — echo/delay tail-out
 - `swap_stem(stem, from_song, to_song, at_bar)` — hard swap on a beat
 - `loop_section(song, from_bar, to_bar, repeat_count)` — loop a bar for build-ups
-- `pitch_shift(song, semitones)` — pitch-shift for key matching, called once at transition start
+- `pitch_shift(song, semitones)` — static pitch shift applied to the entire song. `semitones` may be fractional. Called once at transition start. Phase 7's hand-built generator does NOT emit this — pyrubberband artifacts at large shifts can be worse than the dissonance they fix, so the LLM (Phase 9) makes the per-pair call about whether to shift at all
+- `temporary_pitch_shift(song, start_time, semitones, fade_in_bars, hold_bars, fade_out_bars)` — time-limited pitch shift that fades in, holds at the target, then fades back to the song's original key. Lets the planner introduce a brief key excursion (e.g. lift B up 3 semitones at the seam, hold for the chorus, then glide back to land on B's true key). Bar counts measured at the planner's target BPM
+- `set_tempo_ramp(song, start_time, end_time, start_bpm, end_bpm)` — gradual tempo change for one song over a time window. Lets the planner avoid an instantaneous tempo lock at the seam (e.g. ramp B from its original BPM to A's BPM over the last 8 bars of B's intro). Outside the ramp window the song plays at the closer endpoint BPM
 - `set_reasoning(text)` — LLM explains its choice, stored for debugging
 
 ### Transition Techniques Supported in V1
@@ -452,7 +454,15 @@ All of the following are implementable via the tool vocabulary above:
 
 ### Harmonic Matching
 
-Pitch-shift the incoming song to match the outgoing song's key when keys are incompatible. If the required shift exceeds ±2 semitones, log a warning but proceed with the transition anyway.
+Pitch-shifting for key matching is **a Phase 9 LLM decision**, not a hardcoded behavior. The Phase 7 hand-built plan generator leaves keys as-is regardless of mismatch: at shifts > 2 semitones, pyrubberband's timbral artifacts often sound worse than the dissonance they're meant to fix, and at smaller shifts most listeners don't notice the mismatch.
+
+Phase 9's LLM has three tools at its disposal for harmonic situations:
+
+- **`pitch_shift(song, semitones)`** — static shift of the entire song. Best for adjacent-Camelot keys where a small (≤2 semitone) shift gives the LLM a clean lock without audible artifacts.
+- **`temporary_pitch_shift(...)`** — shift for a region, then fade back to the original key. Useful for letting the chorus of B "ride" A's key briefly before B settles into its own.
+- **`set_tempo_ramp(...)`** — gradual BPM change. Useful when paired with a key choice: ramping into a new tempo can mask the moment a brief pitch-shift fades out.
+
+When a shift exceeds ±2 semitones, the executor logs a warning (`pitch_shift_warning=True` on the rendered transition) so the LLM's next-iteration loop can see that the planner asked for something likely to be artifact-heavy. The user can override per-transition via manual re-render with different LLM constraints (Phase 9+).
 
 ---
 
