@@ -48,6 +48,13 @@ export function MixPlanDebug({
         (prev) => (prev ? { ...prev, status: "rendering", error_text: null } : prev)
       );
     },
+    // setQueryData by itself doesn't schedule a refetch — and refetchInterval
+    // only re-evaluates its callback after each fetch. Without an explicit
+    // invalidation here, the optimistic "rendering" state never gets polled,
+    // so the UI sits on "rendering" until the user manually navigates away.
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["mix-plan", mixPlanId] });
+    },
     onError: () => {
       qc.invalidateQueries({ queryKey: ["mix-plan", mixPlanId] });
     },
