@@ -139,6 +139,21 @@ export type Queue = {
   items: QueueItem[];
 };
 
+export type MixPlanStatus = "pending" | "rendering" | "ready" | "failed";
+
+export type MixPlan = {
+  id: string;
+  queue_id: string;
+  from_song_id: string;
+  to_song_id: string;
+  plan_json: Record<string, unknown>[] | null;
+  rendered_audio_path: string | null;
+  status: MixPlanStatus;
+  error_text: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
 export const api = {
   search: (q: string, limit = 10) =>
     request<SearchResult[]>(
@@ -185,6 +200,20 @@ export const api = {
     }),
   lockQueue: (queueId: string) =>
     request<Queue>(`/api/queues/${queueId}/lock`, { method: "POST" }),
+
+  getMixPlan: async (id: string): Promise<MixPlan | null> => {
+    try {
+      return await request<MixPlan>(`/api/mix_plans/${id}`);
+    } catch (err) {
+      if (isStatusError(err, 404)) return null;
+      throw err;
+    }
+  },
+  listMixPlansForQueue: (queueId: string) =>
+    request<MixPlan[]>(`/api/queues/${queueId}/mix_plans`),
+  triggerRenderMixPlan: (id: string) =>
+    request<void>(`/api/mix_plans/${id}/render`, { method: "POST" }),
+  mixPlanAudioUrl: (id: string) => `${API_BASE}/api/mix_plans/${id}/audio`,
 };
 
 // Distinguishes a `request()` 4xx/5xx from a network error so callers can

@@ -6,6 +6,7 @@ import { use, useEffect, useState } from "react";
 import {
   api,
   isStatusError,
+  type Queue,
   type Song,
   type Stems,
   type Transcription,
@@ -16,6 +17,7 @@ import {
   maySoonHaveStems,
   maySoonHaveTranscription,
 } from "@/lib/song-status";
+import { MixPlanDebug } from "@/components/MixPlanDebug";
 import { StemsDebug } from "@/components/StemsDebug";
 import { TranscriptionDebug } from "@/components/TranscriptionDebug";
 import { WaveformDebug } from "@/components/WaveformDebug";
@@ -174,6 +176,46 @@ export default function SongDebugPage({
   const transcriptionMissing404 =
     !transcriptionQ.data && transcriptionQ.isFetched && !transcriptionQ.error;
 
+  // Phase 7: surface the transition into the next song when this song is
+  // sitting inside a LOCKED queue and the successor is `ready`. The mix-plan
+  // row is created by the backend at lock time, so we only need to find it.
+  const currentQueueQ = useQuery({
+    queryKey: ["queue", "current"],
+    queryFn: async (): Promise<Queue | null> => {
+      try {
+        return await api.getCurrentQueue();
+      } catch (err) {
+        if (isStatusError(err, 404)) return null;
+        throw err;
+      }
+    },
+    retry: false,
+  });
+  const queue = currentQueueQ.data ?? null;
+  const itemsSorted = queue
+    ? [...queue.items].sort((a, b) => a.position - b.position)
+    : [];
+  const selfIdx = itemsSorted.findIndex((it) => it.song.id === id);
+  const nextItem =
+    queue && queue.locked && selfIdx >= 0 && selfIdx < itemsSorted.length - 1
+      ? itemsSorted[selfIdx + 1]
+      : null;
+  const transitionEligible =
+    !!nextItem && nextItem.song.status === "ready";
+
+  const mixPlansQ = useQuery({
+    queryKey: ["mix-plans", queue?.id ?? null],
+    queryFn: () => api.listMixPlansForQueue(queue!.id),
+    enabled: !!queue && queue.locked,
+    retry: false,
+  });
+  const transitionPlan =
+    transitionEligible && nextItem
+      ? (mixPlansQ.data ?? []).find(
+          (p) => p.from_song_id === id && p.to_song_id === nextItem.song.id
+        ) ?? null
+      : null;
+
   return (
     <main className="min-h-screen max-w-5xl mx-auto p-8 flex flex-col gap-6 font-mono">
       <header className="flex items-baseline justify-between">
@@ -299,6 +341,13 @@ export default function SongDebugPage({
                   : "Transcribe"}
               </button>
             </section>
+          )}
+
+          {transitionPlan && nextItem && (
+            <MixPlanDebug
+              mixPlanId={transitionPlan.id}
+              nextTitle={nextItem.song.title}
+            />
           )}
 
           <section className="flex flex-col gap-2">
