@@ -91,6 +91,33 @@ def _all_stems_share_envelope(stem_calls: list[dict]) -> bool:
     )
 
 
+def _curve_envelopes(curve: str, t: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Return (a_gain, b_gain) envelopes for the given crossfade curve.
+
+    `t` is in [0, 1). `a_gain` ramps down (1 → 0); `b_gain` ramps up (0 → 1).
+
+    Curves:
+    - "equal_power": cos(π/2·t) for A, sin(π/2·t) for B. Gains-squared sum
+      to 1.0 at every t → perceived loudness flat. Industry standard for
+      crossfading uncorrelated tracks. **Default for Phase 7.**
+    - "linear": (1-t) for A, t for B. Gains sum to 1.0 but gains-squared
+      sum to 0.5 at midpoint → audible -3 dB dip. Correct for correlated
+      signals only.
+    - "exponential", "s_curve": reserved for Phase 9 — raise
+      NotImplementedError until the LLM has reason to emit them.
+    """
+    if curve == "equal_power":
+        a_gain = np.cos(t * (np.pi / 2.0)).astype(np.float32)
+        b_gain = np.sin(t * (np.pi / 2.0)).astype(np.float32)
+        return a_gain, b_gain
+    if curve == "linear":
+        return (1.0 - t).astype(np.float32), t.astype(np.float32)
+    raise NotImplementedError(
+        f"crossfade curve {curve!r} not supported in Phase 7 "
+        f"(supported: equal_power, linear)"
+    )
+
+
 def render(
     plan: MixPlanJSON,
     a: SongRenderInputs,
@@ -228,11 +255,12 @@ def render(
     # sample — a one-frame discontinuity right where the listener is
     # paying attention.
     t = np.linspace(0.0, 1.0, crossfade_samples, endpoint=False, dtype=np.float32)
-    t_stereo = t[:, None]  # broadcast to (samples, 1) for stereo math
+    curve = stem_calls[0]["curve"]
+    a_gain, b_gain = _curve_envelopes(curve, t)
     a_region = a_mix[a_seam_sample : a_seam_sample + crossfade_samples]
     b_region = b_mix[b_seam_sample : b_seam_sample + crossfade_samples]
     out[a_seam_sample : a_seam_sample + crossfade_samples] = (
-        (1.0 - t_stereo) * a_region + t_stereo * b_region
+        a_gain[:, None] * a_region + b_gain[:, None] * b_region
     )
 
     # Post-seam: pure B (already in post-stretch coords).

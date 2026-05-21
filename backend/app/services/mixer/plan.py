@@ -139,6 +139,9 @@ def build_pair_plan(a: AnalysisBundle, b: AnalysisBundle) -> MixPlanJSON:
             "to_song": "B",
             "start_bar": 0,
             "duration_bars": duration_bars,
-            "curve": "linear",
+            # equal_power is the standard for crossfading different
+            # tracks — keeps perceived loudness flat across the fade.
+            # Linear has an audible -3 dB dip at the midpoint.
+            "curve": "equal_power",
         })
     return plan

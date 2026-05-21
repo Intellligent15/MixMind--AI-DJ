@@ -15,7 +15,14 @@ from typing import Literal, TypedDict
 
 SongRef = Literal["A", "B"]
 StemName = Literal["vocals", "drums", "bass", "other"]
-CrossfadeCurve = Literal["linear", "exponential", "s_curve"]
+# Crossfade curve options. `equal_power` is the industry standard for
+# crossfading uncorrelated signals (different songs) — it holds perceived
+# loudness flat across the fade by using cos/sin gains, whose squares sum
+# to 1.0 at every t. `linear` is correct only for *correlated* signals
+# (same source with delay) where the two add coherently. `s_curve` and
+# `exponential` are reserved for Phase 9 — the executor refuses them
+# with NotImplementedError until the LLM has reason to emit them.
+CrossfadeCurve = Literal["equal_power", "linear", "exponential", "s_curve"]
 
 
 class SetTransitionWindow(TypedDict):

@@ -76,7 +76,9 @@ def test_build_pair_plan_identical_songs():
         assert call["to_song"] == "B"
         assert call["start_bar"] == 0
         assert call["duration_bars"] == 16
-        assert call["curve"] == "linear"
+        # equal_power is the industry-standard default for uncorrelated
+        # tracks; linear has a -3 dB midpoint dip.
+        assert call["curve"] == "equal_power"
 
 
 def test_build_pair_plan_tempo_difference():

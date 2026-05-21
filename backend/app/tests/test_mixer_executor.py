@@ -375,3 +375,77 @@ def test_render_rejects_when_no_overlap_available():
     with patch("soundfile.read", side_effect=_fake_sf_read()):
         with pytest.raises(MixerPreconditionError, match="no overlap"):
             render(plan, a, b, _FakeStorage())
+
+
+def test_render_equal_power_curve_keeps_loudness_flat_at_midpoint():
+    """Equal-power crossfade: at t=0.5 both gains = cos(π/4) = sin(π/4) ≈
+    0.707. Mid-crossfade output of two identical signals (both at amp 0.4)
+    should be 0.4 × (0.707 + 0.707) = 0.566, NOT 0.4 (which linear would
+    produce). This is what 'no midpoint dip' means in practice: when both
+    inputs are at +0.4, the output is louder by sqrt(2) than either input
+    alone, which is the correct sum-of-uncorrelated-powers behavior."""
+    a = _inputs(prefix="A")
+    b = _inputs(prefix="B")
+    sec_per_bar = 60.0 / 120.0 * 4  # = 2.0
+
+    def steady_read(path, always_2d=True, dtype="float32"):
+        # Identical positive constant for both songs → A and B at +0.4
+        # after the 4-stem sum (4 × 0.1).
+        return 0.1 * np.ones((N, 2), dtype=np.float32), SR
+
+    plan = [
+        {"tool": "set_transition_window",
+         "from_song_time_start": sec_per_bar, "to_song_time_start": 0.0,
+         "duration_bars": 1},
+        *[
+            {"tool": "crossfade_stem", "stem": s,
+             "from_song": "A", "to_song": "B",
+             "start_bar": 0, "duration_bars": 1, "curve": "equal_power"}
+            for s in ("vocals", "drums", "bass", "other")
+        ],
+    ]
+    with patch("soundfile.read", side_effect=steady_read):
+        result = render(plan, a, b, _FakeStorage())
+    decoded, _ = sf.read(io.BytesIO(result.wav_bytes), always_2d=True)
+    seam_sample = int(round(sec_per_bar * SR))
+    crossfade_samples = int(round(sec_per_bar * SR))
+    mid = seam_sample + crossfade_samples // 2
+    # Equal-power midpoint: cos(π/4)*0.4 + sin(π/4)*0.4 ≈ 0.5657
+    assert decoded[mid, 0] == pytest.approx(0.4 * np.sqrt(2.0), abs=1e-3)
+    # Compare against the linear case at the same midpoint: 0.4 (no boost).
+    plan_linear = [
+        {"tool": "set_transition_window",
+         "from_song_time_start": sec_per_bar, "to_song_time_start": 0.0,
+         "duration_bars": 1},
+        *[
+            {"tool": "crossfade_stem", "stem": s,
+             "from_song": "A", "to_song": "B",
+             "start_bar": 0, "duration_bars": 1, "curve": "linear"}
+            for s in ("vocals", "drums", "bass", "other")
+        ],
+    ]
+    with patch("soundfile.read", side_effect=steady_read):
+        result_lin = render(plan_linear, a, b, _FakeStorage())
+    decoded_lin, _ = sf.read(io.BytesIO(result_lin.wav_bytes), always_2d=True)
+    assert decoded_lin[mid, 0] == pytest.approx(0.4, abs=1e-3)
+
+
+def test_render_rejects_unsupported_curve():
+    """s_curve and exponential are reserved for Phase 9; the executor
+    refuses them rather than silently falling back to linear."""
+    a = _inputs(prefix="A")
+    b = _inputs(prefix="B")
+    plan = [
+        {"tool": "set_transition_window",
+         "from_song_time_start": 0.0, "to_song_time_start": 0.0,
+         "duration_bars": 1},
+        *[
+            {"tool": "crossfade_stem", "stem": s,
+             "from_song": "A", "to_song": "B",
+             "start_bar": 0, "duration_bars": 1, "curve": "s_curve"}
+            for s in ("vocals", "drums", "bass", "other")
+        ],
+    ]
+    with patch("soundfile.read", side_effect=_fake_sf_read()):
+        with pytest.raises(NotImplementedError, match="s_curve"):
+            render(plan, a, b, _FakeStorage())
