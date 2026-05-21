@@ -49,3 +49,27 @@ def test_pitch_classes_cover_octave():
     assert len(PITCH_CLASSES) == 12
     assert PITCH_CLASSES[0] == "C"
     assert PITCH_CLASSES[-1] == "B"
+
+
+def test_mode_flip_kicks_in_when_relative_tonic_dominates():
+    # Build a chroma that scores nearly equally well as C major and A minor
+    # under K-S, but where the A bin is much louder than the C bin. The
+    # mode-flip tiebreaker should pick A minor.
+    # Start with an even blend of the two profiles, then boost A.
+    chroma = (
+        _profile(0, "major") + _profile(9, "minor")
+    ) / 2
+    chroma[9] *= 3.0  # boost A
+    name, camelot = detect_key(chroma)
+    assert name == "Am"
+    assert camelot == "8A"
+
+
+def test_mode_flip_does_not_trigger_on_clear_major():
+    # Pure major profile — relative minor's correlation is much lower,
+    # so the tiebreaker should NOT fire even if we artificially boost
+    # the relative tonic.
+    chroma = _profile(0, "major").copy()
+    chroma[9] *= 1.5  # mild boost on A — not enough to override clear K-S signal
+    name, _ = detect_key(chroma)
+    assert name == "C"

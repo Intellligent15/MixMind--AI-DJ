@@ -207,9 +207,23 @@ class AnalysisService:
         )
         downbeats = beat_times[downbeat_offset::TIME_SIGNATURE]
 
-        chroma = librosa.feature.chroma_cqt(y=y, sr=sr)
-        chroma_mean = chroma.mean(axis=1)
-        key_name, camelot = detect_key(chroma_mean)
+        # Key detection: three layered improvements over bare chroma_cqt.
+        #   1. HPSS (harmonic-percussive source separation) strips drum
+        #      content from the signal. Percussion adds broadband chroma
+        #      noise that dilutes the actual tonal information.
+        #   2. chroma_cens (Chroma Energy Normalized Statistics) is a
+        #      quantized + smoothed chroma designed for global descriptors
+        #      like key — more robust than chroma_cqt's per-frame output.
+        #   3. Energy-weighted averaging: per-frame RMS as weight so loud
+        #      sections (where harmonic content is clearest) dominate the
+        #      estimate. Quiet intros / outros stop diluting the average.
+        y_harmonic = librosa.effects.harmonic(y)
+        chroma = librosa.feature.chroma_cens(y=y_harmonic, sr=sr)
+        rms = librosa.feature.rms(y=y_harmonic)[0]
+        n = min(rms.shape[0], chroma.shape[1])
+        weights = rms[:n] / (rms[:n].sum() + 1e-9)
+        chroma_weighted = (chroma[:, :n] * weights[None, :]).sum(axis=1)
+        key_name, camelot = detect_key(chroma_weighted)
 
         energy_curve = _rms_at_1hz(y, sr)
 
