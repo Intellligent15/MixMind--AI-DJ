@@ -177,3 +177,114 @@ def test_write_stem_persists_wav(tmp_path: Path):
     StemSeparationService.write_stem(tensor, 44100, dest)
     assert dest.exists()
     assert dest.stat().st_size > 0
+
+
+def _oom_then_succeed(succeed_on_call: int, sources_tensor: torch.Tensor):
+    """Builds an apply_model side_effect that raises an MPS OOM
+    RuntimeError on the first N-1 calls and returns the sources tensor on
+    call number `succeed_on_call` (1-indexed)."""
+    calls = {"n": 0}
+
+    def _side_effect(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] < succeed_on_call:
+            raise RuntimeError(
+                f"MPS backend out of memory (simulated, call {calls['n']})"
+            )
+        return sources_tensor.unsqueeze(0)
+
+    return _side_effect, calls
+
+
+def test_separate_retries_with_shifts_zero_on_mps_oom():
+    """First apply_model call OOMs at shifts=2; second succeeds at
+    shifts=0. Service should complete successfully and report the
+    expected stems."""
+    model, _ = _make_stub_model()
+    sources_tensor = torch.zeros(4, 2, 1000)
+    sources_tensor[3] = 0.5  # vocals
+
+    side_effect, calls = _oom_then_succeed(2, sources_tensor)
+
+    svc = StemSeparationService()
+    with (
+        patch("app.services.stems.service.get_model", return_value=model),
+        patch(
+            "app.services.stems.service.sf.read",
+            return_value=(np.zeros((1000, 2), dtype=np.float32), 44100),
+        ),
+        patch(
+            "app.services.stems.service.convert_audio",
+            side_effect=lambda wav, sr, msr, ch: wav,
+        ),
+        patch(
+            "app.services.stems.service.apply_model",
+            side_effect=side_effect,
+        ),
+    ):
+        result = svc.separate(Path("/fake/audio.wav"))
+
+    assert calls["n"] == 2  # original + 1 retry
+    assert abs(result.vocal_rms - 0.5) < 1e-6
+
+
+def test_separate_falls_back_to_cpu_when_both_mps_attempts_oom():
+    """Both shifts=2 and shifts=0 OOM on MPS; third attempt on CPU
+    succeeds."""
+    model, _ = _make_stub_model()
+    sources_tensor = torch.zeros(4, 2, 1000)
+    sources_tensor[3] = 0.3
+
+    side_effect, calls = _oom_then_succeed(3, sources_tensor)
+
+    svc = StemSeparationService()
+    with (
+        patch("app.services.stems.service.get_model", return_value=model),
+        patch(
+            "app.services.stems.service.sf.read",
+            return_value=(np.zeros((1000, 2), dtype=np.float32), 44100),
+        ),
+        patch(
+            "app.services.stems.service.convert_audio",
+            side_effect=lambda wav, sr, msr, ch: wav,
+        ),
+        patch(
+            "app.services.stems.service.apply_model",
+            side_effect=side_effect,
+        ),
+    ):
+        result = svc.separate(Path("/fake/audio.wav"))
+
+    assert calls["n"] == 3  # original + shifts=0 retry + CPU retry
+    assert abs(result.vocal_rms - 0.3) < 1e-6
+    # Model should be back on its original device after CPU fallback.
+    model.to.assert_called_with(svc._device)
+
+
+def test_separate_re_raises_non_oom_runtime_errors():
+    """A RuntimeError that isn't OOM should propagate immediately, not
+    trigger the fallback chain."""
+    model, _ = _make_stub_model()
+    svc = StemSeparationService()
+    with (
+        patch("app.services.stems.service.get_model", return_value=model),
+        patch(
+            "app.services.stems.service.sf.read",
+            return_value=(np.zeros((1000, 2), dtype=np.float32), 44100),
+        ),
+        patch(
+            "app.services.stems.service.convert_audio",
+            side_effect=lambda wav, sr, msr, ch: wav,
+        ),
+        patch(
+            "app.services.stems.service.apply_model",
+            side_effect=RuntimeError("CUDA error: unspecified launch failure"),
+        ) as mock_apply,
+    ):
+        try:
+            svc.separate(Path("/fake/audio.wav"))
+            assert False, "expected RuntimeError to propagate"
+        except RuntimeError as exc:
+            assert "CUDA" in str(exc)
+    # Only one call — no retries on non-OOM errors.
+    assert mock_apply.call_count == 1

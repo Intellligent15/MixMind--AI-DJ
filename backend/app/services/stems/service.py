@@ -118,6 +118,73 @@ class StemSeparationService:
             self._model = model
         return self._model
 
+    def _apply_with_oom_fallback(
+        self, model, wav: torch.Tensor
+    ) -> torch.Tensor:
+        """Call demucs apply_model with a graceful OOM fallback chain.
+
+        Tries in order:
+          1. Original device (MPS / CUDA) with shifts=2  — best quality.
+          2. Original device with shifts=0               — saves ~half the
+             peak working set (no shifted-output accumulation).
+          3. CPU with shifts=0                           — slow but unlimited
+             memory; the safety net for very long songs.
+
+        Returns the (sources, channels, samples) tensor from apply_model.
+
+        Why this exists: MPS heap caps around 9 GiB on M-series. With
+        shifts=2 the accumulated shifted_out tensor roughly doubles peak
+        memory during apply_model. Long songs (~10+ minutes) can push past
+        the cap. Rather than fail the whole separation, we degrade
+        gracefully — first by dropping the quality bump, then by giving
+        up on GPU acceleration entirely.
+        """
+        def _attempt(device: torch.device, shifts: int) -> torch.Tensor:
+            if device.type == "mps":
+                torch.mps.empty_cache()
+            with torch.no_grad():
+                return apply_model(
+                    model,
+                    wav[None].to(device),
+                    split=True,
+                    overlap=0.25,
+                    shifts=shifts,
+                    progress=False,
+                )[0]
+
+        try:
+            return _attempt(self._device, shifts=2)
+        except RuntimeError as exc:
+            if "out of memory" not in str(exc).lower():
+                raise
+            logger.warning(
+                "stem separation OOM at shifts=2 on %s; retrying with "
+                "shifts=0 (vocal-bleed artifacts may be more audible)",
+                self._device,
+            )
+
+        try:
+            return _attempt(self._device, shifts=0)
+        except RuntimeError as exc:
+            if "out of memory" not in str(exc).lower():
+                raise
+            logger.warning(
+                "stem separation OOM at shifts=0 on %s; falling back to "
+                "CPU (this will be ~5-10× slower)",
+                self._device,
+            )
+
+        # CPU fallback. nn.Module.to() is in-place, so we move the cached
+        # model to CPU for this run, then restore to the original device so
+        # subsequent (smaller) songs still get GPU acceleration.
+        model.to("cpu")
+        if self._device.type == "mps":
+            torch.mps.empty_cache()
+        try:
+            return _attempt(torch.device("cpu"), shifts=0)
+        finally:
+            model.to(self._device)
+
     def separate(self, audio_path: Path) -> SeparationResult:
         model = self._load_model()
 
@@ -128,23 +195,7 @@ class StemSeparationService:
         wav = torch.from_numpy(audio.T).float()
         wav = convert_audio(wav, sample_rate, model.samplerate, model.audio_channels)
 
-        # apply_model wants a (batch, channels, samples) tensor and returns
-        # (batch, sources, channels, samples). split=True chunks long inputs
-        # to keep peak memory bounded; overlap=0.25 is the demucs default.
-        # shifts=2 averages two passes with random time shifts — costs ~2×
-        # but recovers most of the bleed artifacts we lose by not using the
-        # _ft bagged variant (vocals dimming when other stems get loud).
-        with torch.no_grad():
-            sources = apply_model(
-                model,
-                wav[None].to(self._device),
-                split=True,
-                overlap=0.25,
-                shifts=2,
-                progress=False,
-            )[0]
-
-        sources = sources.cpu()
+        sources = self._apply_with_oom_fallback(model, wav).cpu()
 
         # model.sources is the canonical ordering; STEM_NAMES is our wire
         # ordering. Build a dict to make the caller insensitive to that.
