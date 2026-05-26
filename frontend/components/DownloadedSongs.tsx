@@ -264,6 +264,28 @@ export function DownloadedSongs() {
     },
   });
 
+  const deleteSong = useMutation({
+    mutationFn: (id: string) => api.deleteSong(id),
+    onMutate: async (id: string) => {
+      // Optimistic: drop the song from the visible list immediately.
+      await qc.cancelQueries({ queryKey: ["songs"] });
+      const previous = qc.getQueryData<Song[]>(["songs"]);
+      qc.setQueryData<Song[] | undefined>(["songs"], (list) =>
+        list?.filter((s) => s.id !== id),
+      );
+      return { previous };
+    },
+    onError: (_err, _id, ctx) => {
+      // Roll back on failure.
+      if (ctx?.previous) {
+        qc.setQueryData<Song[]>(["songs"], ctx.previous);
+      }
+    },
+    onSettled: () => {
+      qc.invalidateQueries({ queryKey: ["songs"] });
+    },
+  });
+
   const transcribe = useMutation({
     mutationFn: (id: string) => api.triggerTranscribe(id),
     onMutate: (id: string) => {
@@ -341,6 +363,22 @@ export function DownloadedSongs() {
                 >
                   {display}
                 </span>
+                <button
+                  type="button"
+                  aria-label={`Delete ${s.title}`}
+                  title="Delete from library"
+                  onClick={() => {
+                    if (
+                      window.confirm(`Delete "${s.title}" from your library?`)
+                    ) {
+                      deleteSong.mutate(s.id);
+                    }
+                  }}
+                  disabled={deleteSong.isPending}
+                  className="text-sm opacity-50 hover:opacity-100 hover:text-red-500 px-2 disabled:opacity-30"
+                >
+                  ✕
+                </button>
               </div>
               {(s.status === "downloaded" ||
                 s.status === "analyzed" ||

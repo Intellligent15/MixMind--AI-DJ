@@ -1,5 +1,6 @@
 "use client";
 
+import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, type MixPlan, type MixPlanStatus } from "@/lib/api";
 
@@ -24,6 +25,7 @@ export function MixPlanDebug({
   nextTitle: string;
 }) {
   const qc = useQueryClient();
+  const [isPendingRender, setIsPendingRender] = useState(false);
 
   const planQ = useQuery({
     queryKey: ["mix-plan", mixPlanId],
@@ -33,29 +35,29 @@ export function MixPlanDebug({
     // are terminal-ish (pending = waiting on user, ready / failed = done).
     refetchInterval: (q) => {
       const p = q.state.data;
-      if (p && p.status === "rendering") return 1500;
+      if (isPendingRender || (p && p.status === "rendering")) return 1500;
       return false;
     },
   });
 
+  useEffect(() => {
+    const status = planQ.data?.status;
+    if (status === "ready" || status === "failed") {
+      setIsPendingRender(false);
+    }
+  }, [planQ.data?.status]);
+
   const render = useMutation({
     mutationFn: () => api.triggerRenderMixPlan(mixPlanId),
     onMutate: () => {
-      // Optimistic flip to "rendering" so the polling engages immediately,
-      // matching the pattern used by separate/transcribe on the song page.
+      setIsPendingRender(true);
       qc.setQueryData<MixPlan | null | undefined>(
         ["mix-plan", mixPlanId],
         (prev) => (prev ? { ...prev, status: "rendering", error_text: null } : prev)
       );
     },
-    // setQueryData by itself doesn't schedule a refetch — and refetchInterval
-    // only re-evaluates its callback after each fetch. Without an explicit
-    // invalidation here, the optimistic "rendering" state never gets polled,
-    // so the UI sits on "rendering" until the user manually navigates away.
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["mix-plan", mixPlanId] });
-    },
     onError: () => {
+      setIsPendingRender(false);
       qc.invalidateQueries({ queryKey: ["mix-plan", mixPlanId] });
     },
   });

@@ -47,6 +47,10 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     const body = await res.text();
     throw new Error(`${res.status} ${res.statusText}: ${body}`);
   }
+  // 204 No Content (and any empty body) — don't try to parse JSON.
+  if (res.status === 204) {
+    return undefined as T;
+  }
   return res.json() as Promise<T>;
 }
 
@@ -166,6 +170,8 @@ export const api = {
       body: JSON.stringify(payload),
     }),
   getSong: (id: string) => request<Song>(`/api/songs/${id}`),
+  deleteSong: (id: string) =>
+    request<void>(`/api/songs/${id}`, { method: "DELETE" }),
   audioUrl: (id: string) => `${API_BASE}/api/songs/${id}/audio`,
   triggerAnalyze: (id: string) =>
     request<Song>(`/api/songs/${id}/analyze`, { method: "POST" }),

@@ -73,6 +73,9 @@ export function StemsDebug({ songId, stems }: { songId: string; stems: Stems }) 
 
     // WaveSurfers exist for the waveform + cursor only. We mute them and
     // never call .play() — sound comes exclusively from the Web Audio graph.
+    // We create WS instances *without* a URL and feed them a Blob below,
+    // so each stem is fetched exactly once instead of twice (once by WS,
+    // once for decodeAudioData).
     const createdWs: WaveSurfer[] = [];
     for (const name of STEM_NAMES) {
       const el = containerRefs.current[name];
@@ -86,28 +89,35 @@ export function StemsDebug({ songId, stems }: { songId: string; stems: Stems }) 
         barWidth: 1,
         barGap: 1,
         barHeight: 0.7,
-        url: api.stemAudioUrl(songId, name),
       });
       ws.setVolume(0);
       wsRefs.current[name] = ws;
       createdWs.push(ws);
     }
 
-    // Decode all four stems in parallel. We pay the bytes twice (once for
-    // WS viz, once here) — acceptable for a debug page; can dedupe later
-    // by computing peaks ourselves and passing them to WS.
+    // Fetch each stem ONCE, share the bytes between WaveSurfer (Blob)
+    // and decodeAudioData (ArrayBuffer). decodeAudioData detaches the
+    // buffer it's given, so we hand it a fresh slice and keep the
+    // original for the Blob.
     Promise.all(
       STEM_NAMES.map(async (name) => {
         const resp = await fetch(api.stemAudioUrl(songId, name));
         if (!resp.ok) throw new Error(`stem ${name}: HTTP ${resp.status}`);
         const arr = await resp.arrayBuffer();
-        const buf = await ctx.decodeAudioData(arr);
-        return [name, buf] as const;
+        const blob = new Blob([arr], { type: "audio/wav" });
+        // decodeAudioData detaches its argument — pass a copy so the
+        // Blob stays usable for WaveSurfer to render the waveform.
+        const buf = await ctx.decodeAudioData(arr.slice(0));
+        return [name, buf, blob] as const;
       })
     )
-      .then((pairs) => {
+      .then((triples) => {
         if (cancelled) return;
-        for (const [name, buf] of pairs) buffersRef.current[name] = buf;
+        for (const [name, buf, blob] of triples) {
+          buffersRef.current[name] = buf;
+          // Feed the already-fetched bytes to WaveSurfer — no network.
+          wsRefs.current[name]?.loadBlob(blob);
+        }
         setIsLoading(false);
       })
       .catch((err) => {
