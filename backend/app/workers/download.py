@@ -63,19 +63,25 @@ def download_song(song_id: str) -> str | None:
 
         video_id = song.youtube_video_id
 
-    key = f"audio/{video_id}.wav"
-    dest = storage.path(key)
+    import tempfile
+    import asyncio
+    from pathlib import Path
 
-    try:
-        yt.download(video_id, dest)
-    except Exception:
-        logger.exception("download failed for %s", video_id)
-        with SessionLocal() as db:
-            song = db.get(Song, song_uuid)
-            if song is not None:
-                song.status = SongStatus.failed
-                db.commit()
-        raise
+    key = f"audio/{video_id}.wav"
+    
+    with tempfile.TemporaryDirectory() as tmpdir:
+        dest = Path(tmpdir) / f"{video_id}.wav"
+        try:
+            yt.download(video_id, dest)
+            asyncio.run(storage.upload_file(dest, key))
+        except Exception:
+            logger.exception("download failed for %s", video_id)
+            with SessionLocal() as db:
+                song = db.get(Song, song_uuid)
+                if song is not None:
+                    song.status = SongStatus.failed
+                    db.commit()
+            raise
 
     with SessionLocal() as db:
         song = db.get(Song, song_uuid)

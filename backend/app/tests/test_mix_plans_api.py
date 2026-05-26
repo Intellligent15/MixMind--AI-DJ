@@ -159,23 +159,25 @@ def test_get_audio_404_when_not_rendered(locked_pair):
     seed = client.post(f"/api/queues/{locked_pair['queue_id']}/mix_plans").json()
     plan_id = seed[0]["id"]
     r = client.get(f"/api/mix_plans/{plan_id}/audio")
-    assert r.status_code == 404
+    assert r.status_code == 409
 
 
 def test_get_audio_200_when_rendered(locked_pair, tmp_path: Path):
     seed = client.post(f"/api/queues/{locked_pair['queue_id']}/mix_plans").json()
     plan_id = seed[0]["id"]
-    # Drop a fake wav at the storage-resolved path.
     from app.services.storage import get_storage
     storage = get_storage()
     key = f"mixes/{plan_id}.wav"
-    full = storage.path(key)
-    full.parent.mkdir(parents=True, exist_ok=True)
-    # Minimal valid WAV: 44-byte RIFF header + a single sample.
+    
     import soundfile as sf
     import numpy as np
-    sf.write(str(full), np.zeros((100, 2), dtype=np.float32), 44100,
-             subtype="PCM_16")
+    import io
+    import asyncio
+    
+    buf = io.BytesIO()
+    sf.write(buf, np.zeros((100, 2), dtype=np.float32), 44100, format="WAV", subtype="PCM_16")
+    asyncio.run(storage.write(key, buf.getvalue()))
+    
     with SessionLocal() as db:
         row = db.scalar(
             select(MixPlan).where(MixPlan.id == uuid.UUID(plan_id))
@@ -187,7 +189,6 @@ def test_get_audio_200_when_rendered(locked_pair, tmp_path: Path):
     r = client.get(f"/api/mix_plans/{plan_id}/audio")
     assert r.status_code == 200
     assert r.headers["content-type"].startswith("audio/")
-    full.unlink()
 
 
 def test_get_audio_410_when_file_missing(locked_pair):

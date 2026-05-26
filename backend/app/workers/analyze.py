@@ -65,18 +65,23 @@ def analyze_song(song_id: str) -> str | None:
 
         audio_key = song.audio_path
 
-    audio_path = storage.path(audio_key)
+    import tempfile
+    import asyncio
+    from pathlib import Path
 
-    try:
-        result = service.analyze(audio_path)
-    except Exception:
-        logger.exception("analysis failed for song %s", song_id)
-        with SessionLocal() as db:
-            song = db.get(Song, song_uuid)
-            if song is not None:
-                song.status = SongStatus.failed
-                db.commit()
-        raise
+    with tempfile.TemporaryDirectory() as tmpdir:
+        audio_path = Path(tmpdir) / "audio.wav"
+        try:
+            asyncio.run(storage.download_file(audio_key, audio_path))
+            result = service.analyze(audio_path)
+        except Exception:
+            logger.exception("analysis failed for song %s", song_id)
+            with SessionLocal() as db:
+                song = db.get(Song, song_uuid)
+                if song is not None:
+                    song.status = SongStatus.failed
+                    db.commit()
+            raise
 
     with SessionLocal() as db:
         existing = (

@@ -39,19 +39,18 @@ SOFT_CLIP_CEILING = 0.999
 LARGE_SHIFT_THRESHOLD = 2
 
 
-def _load_and_sum_stems(inputs: SongRenderInputs, storage) -> np.ndarray:
-    """Read all 4 stems via storage, decode to float32 stereo, sum.
+def _load_and_sum_stems(inputs: SongRenderInputs) -> np.ndarray:
+    """Read all 4 stems from local paths, decode to float32 stereo, sum.
 
     Returns (samples, 2) float32. Raises MixerPreconditionError if any
     stem disagrees on sample rate or channel count.
     """
     arrays = []
     for stem in ("vocals", "drums", "bass", "other"):
-        key = inputs.stem_paths.get(stem)
-        if key is None:
+        path = inputs.stem_paths.get(stem)
+        if path is None:
             raise MixerPreconditionError(f"missing stem path: {stem!r}")
-        path = storage.path(key)
-        data, sr = sf.read(str(path), always_2d=True, dtype="float32")
+        data, sr = sf.read(path, always_2d=True, dtype="float32")
         if sr != REQUIRED_SAMPLE_RATE:
             raise MixerPreconditionError(
                 f"stem {stem} sample rate {sr} != required {REQUIRED_SAMPLE_RATE}"
@@ -122,7 +121,6 @@ def render(
     plan: MixPlanJSON,
     a: SongRenderInputs,
     b: SongRenderInputs,
-    storage,
 ) -> RenderedTransition:
     """Walk `plan` in order, produce a 44.1k stereo WAV.
 
@@ -131,8 +129,8 @@ def render(
     will grow the dispatch table.
     """
     # 1. Load + sum stems per song. Validates sr/channels.
-    a_mix = _load_and_sum_stems(a, storage)
-    b_mix = _load_and_sum_stems(b, storage)
+    a_mix = _load_and_sum_stems(a)
+    b_mix = _load_and_sum_stems(b)
 
     # 2. Time-stretch B to A's BPM (entire B). pyrubberband rate convention:
     #    rate > 1 = faster/shorter. To go from b.bpm to a.bpm we want

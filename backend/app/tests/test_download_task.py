@@ -7,7 +7,7 @@ The Celery task opens its own SessionLocal, so these tests use the real DB
 from __future__ import annotations
 
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -41,7 +41,7 @@ def song_id():
 def test_download_song_happy_path(song_id: str, tmp_path: Path):
     dest = tmp_path / "audio" / "out.wav"
 
-    storage = MagicMock()
+    storage = AsyncMock()
     storage.path.return_value = dest
 
     yt = MagicMock()
@@ -71,7 +71,7 @@ def test_download_song_happy_path(song_id: str, tmp_path: Path):
 
 
 def test_download_song_marks_failed_on_error(song_id: str, tmp_path: Path):
-    storage = MagicMock()
+    storage = AsyncMock()
     storage.path.return_value = tmp_path / "out.wav"
     yt = MagicMock()
     yt.download.side_effect = YouTubeDownloadError("boom")
@@ -99,8 +99,8 @@ def test_download_song_missing_row_logs_and_returns():
     import uuid as _uuid
 
     with (
-        patch("app.workers.download.get_storage", return_value=MagicMock()),
-        patch("app.workers.download.YouTubeService", return_value=MagicMock()),
+        patch("app.workers.download.get_storage", return_value=AsyncMock()),
+        patch("app.workers.download.YouTubeService", return_value=AsyncMock()),
     ):
         from app.workers.download import download_song
 
@@ -121,7 +121,7 @@ def test_download_song_skips_if_already_downloading(song_id: str):
 
     yt = MagicMock()
     with (
-        patch("app.workers.download.get_storage", return_value=MagicMock()),
+        patch("app.workers.download.get_storage", return_value=AsyncMock()),
         patch("app.workers.download.YouTubeService", return_value=yt),
     ):
         from app.workers.download import download_song
@@ -150,7 +150,7 @@ def test_download_song_skips_if_already_downloaded(song_id: str):
 
     yt = MagicMock()
     with (
-        patch("app.workers.download.get_storage", return_value=MagicMock()),
+        patch("app.workers.download.get_storage", return_value=AsyncMock()),
         patch("app.workers.download.YouTubeService", return_value=yt),
     ):
         from app.workers.download import download_song

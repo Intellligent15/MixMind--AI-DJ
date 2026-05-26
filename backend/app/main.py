@@ -12,7 +12,13 @@ app = FastAPI(title="AI DJ Backend", version="0.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    # Local-dev frontend + the deployed droplet's public address. If we
+    # ever grow more deploy targets, expose this via settings; for a
+    # single droplet the static list is fine.
+    allow_origins=[
+        "http://localhost:3000",
+        "http://137.184.211.233:3000",
+    ],
     allow_methods=["*"],
     allow_headers=["*"],
 )

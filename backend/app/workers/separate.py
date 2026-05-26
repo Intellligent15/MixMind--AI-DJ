@@ -6,9 +6,9 @@ import uuid
 
 from sqlalchemy import update
 
+from app.core.config import settings
 from app.core.db import SessionLocal
-from app.models import Song, SongStatus, Stems, StemsStatus
-from app.services.stems import STEM_NAMES, StemSeparationService
+from app.models import Song, SongStatus, Stems, StemsStatus, Transcription
 from app.services.storage import get_storage
 from app.workers import celery_app
 
@@ -20,6 +20,20 @@ logger = logging.getLogger(__name__)
 # are mid-flight and would clobber a winning task.
 CLAIMABLE_STATUSES = (SongStatus.analyzed, SongStatus.ready, SongStatus.failed)
 
+# Mirrors STEM_NAMES in app.services.stems. Duplicated here so this module
+# can be imported without pulling in torch/demucs (the slim worker image
+# on the droplet doesn't ship those — heavy ML goes via Modal).
+STEM_NAMES: tuple[str, ...] = ("vocals", "drums", "bass", "other")
+
+# Bind StemSeparationService at module top *if* the local stack is installed.
+# Same dual-context story as transcribe.py: lets tests `patch(
+# "app.workers.separate.StemSeparationService")` on macOS, gracefully
+# falls back to None on slim Linux containers without torch+demucs.
+try:
+    from app.services.stems import StemSeparationService  # noqa: F401
+except ImportError:
+    StemSeparationService = None  # type: ignore[assignment]
+
 
 def _stem_key(video_id: str, stem: str) -> str:
     return f"stems/{video_id}/{stem}.wav"
@@ -27,6 +41,23 @@ def _stem_key(video_id: str, stem: str) -> str:
 
 def _envelope_key(video_id: str) -> str:
     return f"stems/{video_id}/vocal_envelope.json"
+
+
+def _separate_via_modal(audio_key: str, video_id: str) -> dict:
+    """Dispatch separation to the deployed Modal app. Pass credentials
+    explicitly so the Modal side doesn't need its own `.env` or Secret."""
+    import modal
+
+    fn = modal.Function.from_name("ai-dj-gpu-workers", "run_separation")
+    return fn.remote(
+        audio_key,
+        video_id,
+        settings.s3_endpoint_url,
+        settings.s3_bucket_name,
+        settings.s3_access_key,
+        settings.s3_secret_key,
+        settings.s3_region_name,
+    )
 
 
 @celery_app.task(name="app.workers.separate.separate_stems")
@@ -45,10 +76,13 @@ def separate_stems(song_id: str) -> str | None:
     Stems row, not the Song row. The Song status reflects "what's the most
     advanced pipeline stage the song has fully cleared"; until Phase 6
     transcription lands, analyzed is still the terminal Song status.
+
+    When MODAL_TOKEN_ID is set, the heavy lift goes through Modal's GPUs
+    (the deployed `run_separation` function). Otherwise the worker runs
+    locally — which only works on a host with MPS/CUDA and torch+demucs.
     """
     song_uuid = uuid.UUID(song_id)
     storage = get_storage()
-    service = StemSeparationService()
 
     with SessionLocal() as db:
         song = db.get(Song, song_uuid)
@@ -81,52 +115,79 @@ def separate_stems(song_id: str) -> str | None:
         audio_key = song.audio_path
         video_id = song.youtube_video_id
 
-    audio_path = storage.path(audio_key)
+    import tempfile
+    import asyncio
+    from pathlib import Path
 
-    try:
-        result = service.separate(audio_path)
-    except Exception:
-        logger.exception("separation failed for song %s", song_id)
-        with SessionLocal() as db:
-            song = db.get(Song, song_uuid)
-            if song is not None:
-                song.status = SongStatus.failed
-                db.commit()
-        raise
+    use_modal = bool(settings.modal_token_id)
 
-    # Write the four WAVs through the storage path() resolver. Demucs gives
-    # us tensors; torchaudio.save needs a real filesystem path (which the
-    # local backend resolves directly, and a future S3 backend would buffer
-    # to a tempfile + sync on close).
-    keys: dict[str, str] = {}
-    for stem_name in STEM_NAMES:
-        key = _stem_key(video_id, stem_name)
-        dest = storage.path(key)
-        service.write_stem(result.stems[stem_name], result.sample_rate, dest)
-        keys[stem_name] = key
+    with tempfile.TemporaryDirectory() as tmpdir:
+        audio_path = Path(tmpdir) / "audio.wav"
 
-    # Sidecar JSON next to the four WAVs. Going through storage.path keeps
-    # the S3-swap discipline (spec → Storage Abstraction): the worker never
-    # touches cache/ directly.
-    envelope_key = _envelope_key(video_id)
-    envelope_dest = storage.path(envelope_key)
-    envelope_dest.parent.mkdir(parents=True, exist_ok=True)
-    envelope_dest.write_text(json.dumps(result.vocal_envelope))
+        try:
+            if use_modal:
+                result = _separate_via_modal(audio_key, video_id)
+                keys = {
+                    "vocals": result["vocals_path"],
+                    "drums": result["drums_path"],
+                    "bass": result["bass_path"],
+                    "other": result["other_path"],
+                }
+                envelope_key = result["vocal_envelope_path"]
+                vocal_rms = result["vocal_rms"]
+                model_name = result["model_name"]
+            else:
+                if StemSeparationService is None:
+                    raise RuntimeError(
+                        "separate_stems: local Demucs unavailable "
+                        "(torch+demucs not installed) and MODAL_TOKEN_ID unset"
+                    )
+                service = StemSeparationService()
+                asyncio.run(storage.download_file(audio_key, audio_path))
+                result = service.separate(audio_path)
+                keys = {}
+                for stem_name in STEM_NAMES:
+                    key = _stem_key(video_id, stem_name)
+                    dest = Path(tmpdir) / f"{stem_name}.wav"
+                    service.write_stem(result.stems[stem_name], result.sample_rate, dest)
+                    asyncio.run(storage.upload_file(dest, key))
+                    keys[stem_name] = key
+
+                envelope_key = _envelope_key(video_id)
+                envelope_dest = Path(tmpdir) / "vocal_envelope.json"
+                envelope_dest.write_text(json.dumps(result.vocal_envelope))
+                asyncio.run(storage.upload_file(envelope_dest, envelope_key))
+                vocal_rms = result.vocal_rms
+                model_name = service.model_name
+
+        except Exception:
+            logger.exception("separation failed for song %s", song_id)
+            with SessionLocal() as db:
+                song = db.get(Song, song_uuid)
+                if song is not None:
+                    song.status = SongStatus.failed
+                    db.commit()
+            raise
 
     with SessionLocal() as db:
-        existing = db.query(Stems).filter(Stems.song_id == song_uuid).one_or_none()
-        if existing is not None:
-            db.delete(existing)
-            db.flush()
+        existing_stems = db.query(Stems).filter(Stems.song_id == song_uuid).one_or_none()
+        if existing_stems is not None:
+            db.delete(existing_stems)
+        
+        existing_trans = db.query(Transcription).filter(Transcription.song_id == song_uuid).one_or_none()
+        if existing_trans is not None:
+            db.delete(existing_trans)
+            
+        db.flush()
         stems_row = Stems(
             song_id=song_uuid,
-            model_name=service.model_name,
+            model_name=model_name,
             status=StemsStatus.separated,
             vocals_path=keys["vocals"],
             drums_path=keys["drums"],
             bass_path=keys["bass"],
             other_path=keys["other"],
-            vocal_rms=result.vocal_rms,
+            vocal_rms=vocal_rms,
             vocal_envelope_path=envelope_key,
         )
         db.add(stems_row)
@@ -136,5 +197,17 @@ def separate_stems(song_id: str) -> str | None:
         # until Phase 6 lands transcription and Phase 7+ lands `ready`.
         song.status = SongStatus.analyzed
         db.commit()
+
+    # Auto-chain into transcription. The vocal stem has just changed
+    # (Demucs is non-deterministic), so any previous transcription is
+    # stale; we deleted it above. Dispatch via send_task by name so this
+    # module doesn't need to import the transcribe worker (which would
+    # pull in mlx-whisper on environments that don't have it).
+    # transcribe_song's atomic claim makes a duplicate dispatch a no-op,
+    # so it's safe for both the first-separation chain and re-separation.
+    celery_app.send_task(
+        "app.workers.transcribe.transcribe_song",
+        args=[str(song_uuid)],
+    )
 
     return str(song_uuid)

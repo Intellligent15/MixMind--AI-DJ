@@ -3,8 +3,7 @@ from __future__ import annotations
 import logging
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, status
-from fastapi.responses import FileResponse
+from fastapi import APIRouter, Depends, Header, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -16,8 +15,8 @@ from app.models import (
     Song,
     SongStatus,
 )
+from app.api.songs import _stream_audio_response
 from app.schemas import MixPlanRead
-from app.services.storage import get_storage
 from app.workers import celery_app
 
 logger = logging.getLogger(__name__)
@@ -157,15 +156,18 @@ def render_mix_plan(mix_plan_id: uuid.UUID, db: Session = Depends(get_db)):
     return {"status": "accepted"}
 
 
-@router.get(
-    "/api/mix_plans/{mix_plan_id}/audio",
-)
-def get_mix_plan_audio(mix_plan_id: uuid.UUID, db: Session = Depends(get_db)):
-    row = db.get(MixPlan, mix_plan_id)
-    if row is None or row.rendered_audio_path is None:
-        raise HTTPException(status_code=404, detail="no rendered audio")
-    storage = get_storage()
-    path = storage.path(row.rendered_audio_path)
-    if not path.exists():
-        raise HTTPException(status_code=410, detail="rendered audio missing on disk")
-    return FileResponse(path, media_type="audio/wav")
+@router.get("/api/mix_plans/{mix_plan_id}/audio")
+async def get_mix_plan_audio(
+    mix_plan_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    range: str | None = Header(default=None),
+):
+    plan = db.get(MixPlan, mix_plan_id)
+    if plan is None:
+        raise HTTPException(status_code=404, detail="mix plan not found")
+    if plan.status != MixPlanStatus.ready or not plan.rendered_audio_path:
+        raise HTTPException(
+            status_code=409,
+            detail=f"audio not available (status={plan.status.value})",
+        )
+    return await _stream_audio_response(plan.rendered_audio_path, "audio/wav", range)

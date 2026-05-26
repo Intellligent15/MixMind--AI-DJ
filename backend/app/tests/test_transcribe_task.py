@@ -7,7 +7,7 @@ end, mock out the TranscriptionService so we don't pull down MLX weights.
 from __future__ import annotations
 
 import uuid
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -87,7 +87,7 @@ def _patched_service(result: TranscriptionResult | None = None):
 
 def test_transcribe_song_happy_path(analyzed_song_with_stems: str):
     service = _patched_service()
-    storage = MagicMock()
+    storage = AsyncMock()
     storage.path.side_effect = lambda key: f"/tmp/{key}"
 
     with (
@@ -134,7 +134,7 @@ def test_transcribe_song_skips_when_vocal_rms_below_threshold(
 
     service = _patched_service()
     with (
-        patch("app.workers.transcribe.get_storage", return_value=MagicMock()),
+        patch("app.workers.transcribe.get_storage", return_value=AsyncMock()),
         patch(
             "app.workers.transcribe.TranscriptionService", return_value=service
         ),
@@ -168,7 +168,7 @@ def test_transcribe_song_marks_failed_on_error(analyzed_song_with_stems: str):
     service.model_name = "large-v3"
 
     with (
-        patch("app.workers.transcribe.get_storage", return_value=MagicMock()),
+        patch("app.workers.transcribe.get_storage", return_value=AsyncMock()),
         patch(
             "app.workers.transcribe.TranscriptionService", return_value=service
         ),
@@ -213,7 +213,7 @@ def test_transcribe_song_fails_when_no_stems_row():
 
     try:
         with (
-            patch("app.workers.transcribe.get_storage", return_value=MagicMock()),
+            patch("app.workers.transcribe.get_storage", return_value=AsyncMock()),
             patch(
                 "app.workers.transcribe.TranscriptionService",
                 return_value=_patched_service(),
@@ -254,7 +254,7 @@ def test_transcribe_song_skips_wrong_status(analyzed_song_with_stems: str):
 
     service = _patched_service()
     with (
-        patch("app.workers.transcribe.get_storage", return_value=MagicMock()),
+        patch("app.workers.transcribe.get_storage", return_value=AsyncMock()),
         patch(
             "app.workers.transcribe.TranscriptionService", return_value=service
         ),
@@ -279,7 +279,7 @@ def test_transcribe_song_skips_if_already_transcribing(
 
     service = _patched_service()
     with (
-        patch("app.workers.transcribe.get_storage", return_value=MagicMock()),
+        patch("app.workers.transcribe.get_storage", return_value=AsyncMock()),
         patch(
             "app.workers.transcribe.TranscriptionService", return_value=service
         ),
@@ -294,7 +294,7 @@ def test_transcribe_song_skips_if_already_transcribing(
 
 def test_transcribe_song_missing_row_logs_and_returns():
     with (
-        patch("app.workers.transcribe.get_storage", return_value=MagicMock()),
+        patch("app.workers.transcribe.get_storage", return_value=AsyncMock()),
         patch(
             "app.workers.transcribe.TranscriptionService",
             return_value=_patched_service(),
@@ -325,7 +325,7 @@ def test_transcribe_song_replaces_existing_transcription_row(
 
     service = _patched_service()
     with (
-        patch("app.workers.transcribe.get_storage", return_value=MagicMock()),
+        patch("app.workers.transcribe.get_storage", return_value=AsyncMock()),
         patch(
             "app.workers.transcribe.TranscriptionService", return_value=service
         ),

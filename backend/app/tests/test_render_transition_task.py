@@ -8,7 +8,7 @@ don't run real rubberband or load real WAVs.
 from __future__ import annotations
 
 import uuid
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -118,7 +118,7 @@ def _patched_render():
 
 
 def test_render_transition_happy_path(pair_with_plan):
-    storage = MagicMock()
+    storage = AsyncMock()
     storage.write = MagicMock()
     # storage.write is async in the protocol; the worker calls it sync.
     # We use a sync MagicMock — the worker code uses asyncio.run for it.
@@ -169,7 +169,7 @@ def test_render_transition_atomic_claim_loser(pair_with_plan):
 
 
 def test_render_transition_marks_failed_on_executor_error(pair_with_plan):
-    storage = MagicMock()
+    storage = AsyncMock()
     async def _write(key, data):
         return f"/abs/{key}"
     storage.write = _write

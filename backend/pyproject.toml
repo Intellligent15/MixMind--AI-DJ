@@ -19,6 +19,15 @@ dependencies = [
     "numpy>=2.4.5",
     "scipy>=1.17.1",
     "soundfile>=0.13.1",
+    "aioboto3>=15.5.0",
+    "modal>=1.4.3",
+    # pyrubberband is needed by services/mixer/executor.py — render_transition
+    # runs in the worker container, which on the droplet is the slim image
+    # (no torch/demucs/mlx-whisper, since Modal handles those). Pyrubberband
+    # is pure-Python over the `rubberband` CLI binary (apt-installed in the
+    # Dockerfile), so keeping it in the default deps is cheap and means the
+    # docker worker can render mixes.
+    "pyrubberband>=0.4.0",
 ]
 
 [build-system]
@@ -37,14 +46,14 @@ dev = [
 ]
 # Native-worker-only deps. The FastAPI container never imports these
 # (api/songs.py + api/queues.py dispatch separate_stems by task name),
-# so the dockerized backend skips the ~2 GB torch + demucs install via
-# `uv sync --no-dev --no-default-groups`.
+# and the dockerized worker on the droplet delegates to Modal — so the
+# docker images skip the ~2 GB torch + demucs install. Only the macOS
+# native worker pulls these in (start-dev.sh runs `uv sync --group worker`).
 worker = [
     "demucs>=4.0.1",
     "mlx-whisper>=0.4.3",
     "torch>=2.12.0",
     "torchaudio>=2.11.0",
-    "pyrubberband>=0.4.0",
 ]
 
 [tool.uv]

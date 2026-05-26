@@ -118,25 +118,36 @@ def render_transition(mix_plan_id: str) -> str | None:
 
         a_bundle = _to_bundle(a_analysis, a.duration_seconds)
         b_bundle = _to_bundle(b_analysis, b.duration_seconds)
-        a_inputs = SongRenderInputs(
-            stem_paths=_stem_paths(a_stems), analysis=a_bundle
-        )
-        b_inputs = SongRenderInputs(
-            stem_paths=_stem_paths(b_stems), analysis=b_bundle
-        )
         existing_plan_json = row.plan_json
 
-    # Phase 2: generate plan_json if absent (Phase 9 will replace this
-    # branch with an LLM call).
     plan_json = existing_plan_json or build_pair_plan(a_bundle, b_bundle)
 
-    # Phase 3: render via the executor.
-    try:
-        result = render(plan_json, a_inputs, b_inputs, storage)
-    except Exception as exc:
-        logger.exception("render_transition: %s render failed", mix_plan_id)
-        _mark_failed(plan_uuid, f"{type(exc).__name__}: {exc}")
-        raise
+    import tempfile
+    from pathlib import Path
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmp = Path(tmpdir)
+        
+        async def _download_stems(stems: Stems, prefix: str):
+            paths = {}
+            for k, key in _stem_paths(stems).items():
+                dest = tmp / f"{prefix}_{k}.wav"
+                await storage.download_file(key, dest)
+                paths[k] = str(dest)
+            return paths
+
+        a_paths = asyncio.run(_download_stems(a_stems, "a"))
+        b_paths = asyncio.run(_download_stems(b_stems, "b"))
+        
+        a_inputs = SongRenderInputs(stem_paths=a_paths, analysis=a_bundle)
+        b_inputs = SongRenderInputs(stem_paths=b_paths, analysis=b_bundle)
+
+        try:
+            result = render(plan_json, a_inputs, b_inputs)
+        except Exception as exc:
+            logger.exception("render_transition: %s render failed", mix_plan_id)
+            _mark_failed(plan_uuid, f"{type(exc).__name__}: {exc}")
+            raise
 
     # Phase 4: persist output via storage, flip to ready.
     key = f"mixes/{mix_plan_id}.wav"

@@ -89,6 +89,22 @@ def test_get_song_404(db_session: Session):
     assert r.status_code == 404
 
 
+def test_delete_song_removes_row(db_session: Session):
+    client = _client(db_session)
+    with patch("app.api.songs.download_song.delay"):
+        created = client.post("/api/songs", json=_payload()).json()
+    r = client.delete(f"/api/songs/{created['id']}")
+    assert r.status_code == 204
+    # Subsequent GET should 404.
+    assert client.get(f"/api/songs/{created['id']}").status_code == 404
+
+
+def test_delete_song_idempotent_on_missing(db_session: Session):
+    client = _client(db_session)
+    r = client.delete("/api/songs/00000000-0000-0000-0000-000000000000")
+    assert r.status_code == 204
+
+
 def test_list_songs(db_session: Session):
     client = _client(db_session)
     with patch("app.api.songs.download_song.delay"):
@@ -119,8 +135,8 @@ def test_audio_streams_file_with_range_support(
     db_session: Session, tmp_storage: LocalFilesystemStorage
 ):
     key = "audio/abc123.wav"
-    tmp_storage.path(key).parent.mkdir(parents=True, exist_ok=True)
-    tmp_storage.path(key).write_bytes(b"RIFF" + b"\x00" * 100)
+    tmp_storage._path(key).parent.mkdir(parents=True, exist_ok=True)
+    tmp_storage._path(key).write_bytes(b"RIFF" + b"\x00" * 100)
 
     song = Song(
         youtube_video_id="abc123",
@@ -343,8 +359,8 @@ def test_get_stem_audio_streams_file(
     song = _analyzed_song(db_session, vid="streamstems")
     _stems_row(db_session, song)
     key = f"stems/{song.youtube_video_id}/vocals.wav"
-    tmp_storage.path(key).parent.mkdir(parents=True, exist_ok=True)
-    tmp_storage.path(key).write_bytes(b"RIFF" + b"\x00" * 50)
+    tmp_storage._path(key).parent.mkdir(parents=True, exist_ok=True)
+    tmp_storage._path(key).write_bytes(b"RIFF" + b"\x00" * 50)
 
     client = _client(db_session)
     r = client.get(f"/api/songs/{song.id}/stems/vocals")

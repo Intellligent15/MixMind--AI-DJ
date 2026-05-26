@@ -15,11 +15,23 @@ from app.models import (
     TranscriptionStatus,
 )
 from app.services.storage import get_storage
-from app.services.transcription import (
-    DEFAULT_MODEL_NAME,
-    TranscriptionService,
-)
 from app.workers import celery_app
+
+# Duplicated from app.services.transcription so this module can be imported
+# without pulling in mlx_whisper (which is macOS/MLX-only — the slim Linux
+# worker image on the droplet doesn't ship it, since heavy transcription
+# goes via Modal).
+DEFAULT_MODEL_NAME = "large-v3"
+
+# Bind TranscriptionService at module top *if* the local stack is installed.
+# On macOS dev / native worker this lets unit tests `patch(
+# "app.workers.transcribe.TranscriptionService")` like they always have.
+# On a slim Linux container without mlx_whisper, the import fails — we set
+# it to None and the runtime takes the Modal branch instead.
+try:
+    from app.services.transcription import TranscriptionService  # noqa: F401
+except ImportError:
+    TranscriptionService = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
 
@@ -112,6 +124,7 @@ def transcribe_song(song_id: str) -> str | None:
 
         vocal_rms = float(stems.vocal_rms or 0.0)
         vocals_key = stems.vocals_path
+        video_id = song.youtube_video_id
 
     # Skip-if-instrumental decision. Threshold lives in settings so the
     # user can tune it without code changes.
@@ -141,43 +154,82 @@ def transcribe_song(song_id: str) -> str | None:
             db.commit()
         return str(song_uuid)
 
-    service = TranscriptionService()
-    vocals_path = storage.path(vocals_key)
+    import tempfile
+    import asyncio
+    from pathlib import Path
 
-    try:
-        result = service.transcribe(vocals_path)
-    except Exception:
-        logger.exception("transcription failed for song %s", song_id)
-        with SessionLocal() as db:
-            _delete_existing(db, song_uuid)
-            row = Transcription(
-                song_id=song_uuid,
-                model_name=service.model_name,
-                status=TranscriptionStatus.error,
-                language=None,
-                segments=[],
-                vocal_rms_threshold=threshold,
-                vocal_rms_observed=vocal_rms,
-                duration_seconds=None,
-            )
-            db.add(row)
-            song = db.get(Song, song_uuid)
-            if song is not None:
-                song.status = SongStatus.failed
-            db.commit()
-        raise
+    use_modal = bool(settings.modal_token_id)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        vocals_path = Path(tmpdir) / "vocals.wav"
+
+        try:
+            if use_modal:
+                import modal
+
+                fn = modal.Function.from_name(
+                    "ai-dj-gpu-workers", "run_transcription"
+                )
+                result = fn.remote(
+                    vocals_key,
+                    video_id,
+                    settings.s3_endpoint_url,
+                    settings.s3_bucket_name,
+                    settings.s3_access_key,
+                    settings.s3_secret_key,
+                    settings.s3_region_name,
+                )
+                # Modal returns segments inline (already JSON-shaped).
+                segments = result["segments"]
+                language = result["language"]
+                duration_seconds = result["duration"]
+                model_name = result["model_name"]
+            else:
+                if TranscriptionService is None:
+                    raise RuntimeError(
+                        "transcribe_song: local Whisper unavailable "
+                        "(mlx_whisper not installed) and MODAL_TOKEN_ID unset"
+                    )
+                service = TranscriptionService()
+                asyncio.run(storage.download_file(vocals_key, vocals_path))
+                result = service.transcribe(vocals_path)
+                language = result.language
+                segments = result.segments
+                duration_seconds = result.duration_seconds
+                model_name = service.model_name
+                
+        except Exception:
+            logger.exception("transcription failed for song %s", song_id)
+            with SessionLocal() as db:
+                _delete_existing(db, song_uuid)
+                row = Transcription(
+                    song_id=song_uuid,
+                    model_name=DEFAULT_MODEL_NAME,
+                    status=TranscriptionStatus.error,
+                    language=None,
+                    segments=[],
+                    vocal_rms_threshold=threshold,
+                    vocal_rms_observed=vocal_rms,
+                    duration_seconds=None,
+                )
+                db.add(row)
+                song = db.get(Song, song_uuid)
+                if song is not None:
+                    song.status = SongStatus.failed
+                db.commit()
+            raise
 
     with SessionLocal() as db:
         _delete_existing(db, song_uuid)
         row = Transcription(
             song_id=song_uuid,
-            model_name=service.model_name,
+            model_name=model_name,
             status=TranscriptionStatus.success,
-            language=result.language,
-            segments=result.segments,
+            language=language,
+            segments=segments,
             vocal_rms_threshold=threshold,
             vocal_rms_observed=vocal_rms,
-            duration_seconds=result.duration_seconds,
+            duration_seconds=duration_seconds,
         )
         db.add(row)
         song = db.get(Song, song_uuid)

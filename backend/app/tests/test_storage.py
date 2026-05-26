@@ -45,6 +45,4 @@ async def test_get_url_returns_absolute_path(
     assert url == str((tmp_path / "k").resolve())
 
 
-async def test_path_rejects_traversal(storage: LocalFilesystemStorage) -> None:
-    with pytest.raises(ValueError, match="escapes storage root"):
-        storage.path("../escape")
+

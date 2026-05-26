@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import uuid
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -63,7 +63,7 @@ def _fake_result() -> AnalysisResult:
 
 
 def test_analyze_song_happy_path(downloaded_song: str, tmp_path: Path):
-    storage = MagicMock()
+    storage = AsyncMock()
     storage.path.return_value = tmp_path / "fake.wav"
 
     service = MagicMock()
@@ -96,7 +96,7 @@ def test_analyze_song_happy_path(downloaded_song: str, tmp_path: Path):
 
 
 def test_analyze_song_marks_failed_on_error(downloaded_song: str, tmp_path: Path):
-    storage = MagicMock()
+    storage = AsyncMock()
     storage.path.return_value = tmp_path / "fake.wav"
     service = MagicMock()
     service.analyze.side_effect = RuntimeError("librosa boom")
@@ -132,7 +132,7 @@ def test_analyze_song_skips_wrong_status(downloaded_song: str):
 
     service = MagicMock()
     with (
-        patch("app.workers.analyze.get_storage", return_value=MagicMock()),
+        patch("app.workers.analyze.get_storage", return_value=AsyncMock()),
         patch("app.workers.analyze.AnalysisService", return_value=service),
     ):
         from app.workers.analyze import analyze_song
@@ -145,8 +145,8 @@ def test_analyze_song_skips_wrong_status(downloaded_song: str):
 
 def test_analyze_song_missing_row_logs_and_returns():
     with (
-        patch("app.workers.analyze.get_storage", return_value=MagicMock()),
-        patch("app.workers.analyze.AnalysisService", return_value=MagicMock()),
+        patch("app.workers.analyze.get_storage", return_value=AsyncMock()),
+        patch("app.workers.analyze.AnalysisService", return_value=AsyncMock()),
     ):
         from app.workers.analyze import analyze_song
 
@@ -163,7 +163,7 @@ def test_analyze_song_skips_if_already_analyzing(downloaded_song: str):
 
     service = MagicMock()
     with (
-        patch("app.workers.analyze.get_storage", return_value=MagicMock()),
+        patch("app.workers.analyze.get_storage", return_value=AsyncMock()),
         patch("app.workers.analyze.AnalysisService", return_value=service),
     ):
         from app.workers.analyze import analyze_song
@@ -200,7 +200,7 @@ def test_analyze_song_replaces_existing_analysis(downloaded_song: str, tmp_path:
         song.status = SongStatus.analyzed
         db.commit()
 
-    storage = MagicMock()
+    storage = AsyncMock()
     storage.path.return_value = tmp_path / "fake.wav"
     service = MagicMock()
     service.analyze.return_value = _fake_result()

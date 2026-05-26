@@ -1,14 +1,15 @@
 from __future__ import annotations
 
+import logging
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, status
-from fastapi.responses import FileResponse
-from sqlalchemy import select
+from fastapi import APIRouter, Depends, Header, HTTPException, Response, status
+from fastapi.responses import StreamingResponse
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_db
-from app.models import Analysis, Song, SongStatus, Stems, Transcription
+from app.models import Analysis, MixPlan, Song, SongStatus, Stems, Transcription
 from app.schemas import (
     AnalysisRead,
     SongCreate,
@@ -71,8 +72,149 @@ def get_song(song_id: uuid.UUID, db: Session = Depends(get_db)) -> Song:
     return song
 
 
+@router.delete(
+    "/{song_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    response_class=Response,
+)
+async def delete_song(
+    song_id: uuid.UUID, db: Session = Depends(get_db)
+) -> Response:
+    """Delete a song row + every blob it owns in object storage.
+
+    Cascading FKs handle the DB side (analyses/stems/transcriptions/
+    mix_plans/queue_items go with the song). For storage we enumerate
+    the blobs explicitly: the song's audio, each stem WAV + vocal
+    envelope, any rendered MixPlan WAVs for pairs touching this song,
+    and the transcription JSON the Modal path uploads as a sidecar.
+
+    Storage deletes are best-effort: a missing blob (or transient
+    network blip) won't block the DB delete. Idempotent — a missing
+    song row still 204s.
+    """
+    logger = logging.getLogger(__name__)
+    song = db.get(Song, song_id)
+    if song is None:
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+    keys: list[str] = []
+    if song.audio_path:
+        keys.append(song.audio_path)
+
+    stems = db.scalar(select(Stems).where(Stems.song_id == song_id))
+    if stems is not None:
+        for k in (
+            stems.vocals_path,
+            stems.drums_path,
+            stems.bass_path,
+            stems.other_path,
+            stems.vocal_envelope_path,
+        ):
+            if k:
+                keys.append(k)
+
+    # The Modal transcription path uploads a sidecar JSON keyed by
+    # youtube_video_id (the local mlx-whisper path doesn't, but
+    # storage.delete is idempotent on misses, so an extra attempt is
+    # free).
+    keys.append(f"transcriptions/{song.youtube_video_id}.json")
+
+    plans = db.scalars(
+        select(MixPlan).where(
+            or_(MixPlan.from_song_id == song_id, MixPlan.to_song_id == song_id)
+        )
+    ).all()
+    for plan in plans:
+        if plan.rendered_audio_path:
+            keys.append(plan.rendered_audio_path)
+
+    storage = get_storage()
+    for key in keys:
+        try:
+            await storage.delete(key)
+        except FileNotFoundError:
+            # Already gone — nothing to clean up.
+            pass
+        except Exception:
+            # Any other failure: log and move on so we don't strand
+            # the DB row.
+            logger.warning(
+                "delete_song: failed to delete storage key %r", key,
+                exc_info=True,
+            )
+
+    db.delete(song)
+    db.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+def _parse_range_header(value: str | None, total: int | None = None) -> tuple[int | None, int | None]:
+    """Parse a single 'bytes=lo-hi' Range header. Returns (lo, hi).
+
+    We only support a single byte range — that's all browsers ever ask for
+    in practice. `total` lets us resolve open-ended ranges (`bytes=0-`)
+    when known; otherwise leave hi=None and let the storage backend
+    interpret it. Returns (None, None) for an unparsable / missing header
+    (caller falls back to full-body)."""
+    if not value or not value.startswith("bytes="):
+        return None, None
+    spec = value[len("bytes="):].split(",", 1)[0].strip()
+    if "-" not in spec:
+        return None, None
+    lo_s, hi_s = spec.split("-", 1)
+    lo = int(lo_s) if lo_s else 0
+    hi: int | None
+    if hi_s:
+        hi = int(hi_s)
+    else:
+        hi = (total - 1) if total is not None else None
+    return lo, hi
+
+
+async def _stream_audio_response(
+    key: str,
+    media_type: str,
+    range_header: str | None,
+) -> StreamingResponse:
+    """Shared streaming-with-Range body for the audio + stem endpoints.
+
+    Streams bytes through the backend so the browser sees a same-origin
+    response (CORS handled by the FastAPI middleware) — DO Spaces' own
+    CORS on presigned URLs is unreliable, so this is the simpler path."""
+    lo, hi = _parse_range_header(range_header)
+    storage = get_storage()
+    try:
+        iterator, total_size, content_length = await storage.stream(
+            key, start=lo, end=hi,
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=410, detail="audio missing in storage") from exc
+
+    headers = {
+        "Accept-Ranges": "bytes",
+        "Content-Length": str(content_length),
+        # Stems and downloaded audio change only on re-separate / re-download.
+        # 5 minutes is a sweet spot: long enough that the debug page round-trip
+        # (waveform render → play → seek) doesn't re-hit storage, short enough
+        # that a re-separate quickly becomes visible on the next visit.
+        "Cache-Control": "private, max-age=300",
+    }
+    if lo is not None:
+        # Partial response: include Content-Range and use 206.
+        effective_hi = (hi if hi is not None else total_size - 1)
+        headers["Content-Range"] = f"bytes {lo}-{effective_hi}/{total_size}"
+        return StreamingResponse(
+            iterator, status_code=206, media_type=media_type, headers=headers,
+        )
+    return StreamingResponse(iterator, media_type=media_type, headers=headers)
+
+
 @router.get("/{song_id}/audio")
-def get_song_audio(song_id: uuid.UUID, db: Session = Depends(get_db)) -> FileResponse:
+async def get_song_audio(
+    song_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    range: str | None = Header(default=None),
+):
     song = db.get(Song, song_id)
     if song is None:
         raise HTTPException(status_code=404, detail="song not found")
@@ -81,10 +223,7 @@ def get_song_audio(song_id: uuid.UUID, db: Session = Depends(get_db)) -> FileRes
             status_code=409,
             detail=f"audio not available (status={song.status.value})",
         )
-    path = get_storage().path(song.audio_path)
-    if not path.exists():
-        raise HTTPException(status_code=410, detail="audio file missing on disk")
-    return FileResponse(path, media_type="audio/wav", filename=path.name)
+    return await _stream_audio_response(song.audio_path, "audio/wav", range)
 
 
 @router.post(
@@ -152,9 +291,12 @@ def get_song_stems(song_id: uuid.UUID, db: Session = Depends(get_db)) -> Stems:
 
 
 @router.get("/{song_id}/stems/{stem_name}")
-def get_song_stem_audio(
-    song_id: uuid.UUID, stem_name: str, db: Session = Depends(get_db)
-) -> FileResponse:
+async def get_song_stem_audio(
+    song_id: uuid.UUID,
+    stem_name: str,
+    db: Session = Depends(get_db),
+    range: str | None = Header(default=None),
+):
     if stem_name not in STEM_NAMES:
         raise HTTPException(
             status_code=404,
@@ -176,10 +318,7 @@ def get_song_stem_audio(
     if key is None:
         raise HTTPException(status_code=409, detail=f"{stem_name} stem not written yet")
 
-    path = get_storage().path(key)
-    if not path.exists():
-        raise HTTPException(status_code=410, detail="stem file missing on disk")
-    return FileResponse(path, media_type="audio/wav", filename=path.name)
+    return await _stream_audio_response(key, "audio/wav", range)
 
 
 # Same gate as the transcribe_song worker's CLAIMABLE_STATUSES — keep in

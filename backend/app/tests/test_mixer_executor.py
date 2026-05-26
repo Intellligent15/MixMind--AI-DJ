@@ -101,7 +101,7 @@ def test_render_happy_path_no_stretch_no_shift():
     ]
 
     with patch("soundfile.read", side_effect=_fake_sf_read()):
-        result = render(plan, a, b, _FakeStorage())
+        result = render(plan, a, b)
 
     assert result.sample_rate == SR
     assert not result.pitch_shift_warning
@@ -134,7 +134,7 @@ def test_render_seam_alignment_identical_bpm():
     ]
 
     with patch("soundfile.read", side_effect=_fake_sf_read()):
-        result = render(plan, a, b, _FakeStorage())
+        result = render(plan, a, b)
 
     decoded, _ = sf.read(io.BytesIO(result.wav_bytes), always_2d=True)
     seam_sample = int(round(sec_per_bar * SR))
@@ -180,7 +180,7 @@ def test_render_calls_time_stretch_with_correct_rate():
         patch("soundfile.read", side_effect=_fake_sf_read()),
         patch("pyrubberband.pyrb.time_stretch", side_effect=fake_stretch),
     ):
-        render(plan, a, b, _FakeStorage())
+        render(plan, a, b)
 
     assert captured["rate"] == pytest.approx(120.0 / 128.0)
 
@@ -211,7 +211,7 @@ def test_render_calls_pitch_shift_with_correct_semitones():
         patch("soundfile.read", side_effect=_fake_sf_read()),
         patch("pyrubberband.pyrb.pitch_shift", side_effect=fake_shift),
     ):
-        result = render(plan, a, b, _FakeStorage())
+        result = render(plan, a, b)
 
     assert captured["n_steps"] == -2
     # |δ|=2 is NOT > 2 → no warning. (Plan text used -3 with a "not warning"
@@ -240,7 +240,7 @@ def test_render_pitch_shift_warning_flag_when_large():
         patch("soundfile.read", side_effect=_fake_sf_read()),
         patch("pyrubberband.pyrb.pitch_shift", side_effect=lambda y, sr, n_steps: y),
     ):
-        result = render(plan, a, b, _FakeStorage())
+        result = render(plan, a, b)
     assert result.pitch_shift_warning
 
 
@@ -256,7 +256,7 @@ def test_render_precondition_rejects_wrong_sample_rate():
 
     with patch("soundfile.read", side_effect=bad_sr_read):
         with pytest.raises(MixerPreconditionError, match="sample rate"):
-            render(plan, a, b, _FakeStorage())
+            render(plan, a, b)
 
 
 def test_render_precondition_rejects_mono():
@@ -271,7 +271,7 @@ def test_render_precondition_rejects_mono():
 
     with patch("soundfile.read", side_effect=mono_read):
         with pytest.raises(MixerPreconditionError, match="channels"):
-            render(plan, a, b, _FakeStorage())
+            render(plan, a, b)
 
 
 def test_render_soft_clips_loud_sum():
@@ -296,7 +296,7 @@ def test_render_soft_clips_loud_sum():
         return 0.4 * np.ones((N, 2), dtype=np.float32), SR
 
     with patch("soundfile.read", side_effect=loud_read):
-        result = render(plan, a, b, _FakeStorage())
+        result = render(plan, a, b)
 
     decoded, _ = sf.read(io.BytesIO(result.wav_bytes), always_2d=True)
     assert decoded.max() <= 0.999 + 1e-5
@@ -332,7 +332,7 @@ def test_render_clamps_crossfade_when_stems_shorter_than_plan(caplog):
 
     with patch("soundfile.read", side_effect=short_read), \
          caplog.at_level("WARNING"):
-        result = render(plan, a, b, _FakeStorage())
+        result = render(plan, a, b)
 
     # Should have logged the clamp.
     assert any("clamping crossfade" in rec.message for rec in caplog.records)
@@ -374,7 +374,7 @@ def test_render_rejects_when_no_overlap_available():
 
     with patch("soundfile.read", side_effect=_fake_sf_read()):
         with pytest.raises(MixerPreconditionError, match="no overlap"):
-            render(plan, a, b, _FakeStorage())
+            render(plan, a, b)
 
 
 def test_render_equal_power_curve_keeps_loudness_flat_at_midpoint():
@@ -405,7 +405,7 @@ def test_render_equal_power_curve_keeps_loudness_flat_at_midpoint():
         ],
     ]
     with patch("soundfile.read", side_effect=steady_read):
-        result = render(plan, a, b, _FakeStorage())
+        result = render(plan, a, b)
     decoded, _ = sf.read(io.BytesIO(result.wav_bytes), always_2d=True)
     seam_sample = int(round(sec_per_bar * SR))
     crossfade_samples = int(round(sec_per_bar * SR))
@@ -425,7 +425,7 @@ def test_render_equal_power_curve_keeps_loudness_flat_at_midpoint():
         ],
     ]
     with patch("soundfile.read", side_effect=steady_read):
-        result_lin = render(plan_linear, a, b, _FakeStorage())
+        result_lin = render(plan_linear, a, b)
     decoded_lin, _ = sf.read(io.BytesIO(result_lin.wav_bytes), always_2d=True)
     assert decoded_lin[mid, 0] == pytest.approx(0.4, abs=1e-3)
 
@@ -448,4 +448,4 @@ def test_render_rejects_unsupported_curve():
     ]
     with patch("soundfile.read", side_effect=_fake_sf_read()):
         with pytest.raises(NotImplementedError, match="s_curve"):
-            render(plan, a, b, _FakeStorage())
+            render(plan, a, b)

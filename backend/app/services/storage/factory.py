@@ -1,12 +1,19 @@
 from functools import lru_cache
 
 from app.core.config import settings
-from app.services.storage.base import StorageBackend
-from app.services.storage.local import LocalFilesystemStorage
+from .base import StorageBackend
+from .local import LocalFilesystemStorage
+from .s3 import S3Storage
 
 
-@lru_cache(maxsize=1)
+@lru_cache()
 def get_storage() -> StorageBackend:
-    if settings.storage_backend == "local":
-        return LocalFilesystemStorage(settings.local_storage_path)
-    raise ValueError(f"unknown STORAGE_BACKEND: {settings.storage_backend!r}")
+    if settings.storage_backend == "s3":
+        return S3Storage(
+            endpoint_url=settings.s3_endpoint_url,
+            bucket_name=settings.s3_bucket_name,
+            access_key=settings.s3_access_key,
+            secret_key=settings.s3_secret_key,
+            region_name=settings.s3_region_name,
+        )
+    return LocalFilesystemStorage(root=settings.local_storage_path)
