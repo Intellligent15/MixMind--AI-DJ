@@ -1,8 +1,11 @@
 # AI DJ — base compose stack.
 #
-# Note: the Celery worker is intentionally NOT defined here on macOS.
-# It runs natively via start-dev.sh so it can access MPS (and later rubberband-cli).
-# On a Linux host, the worker can be added to this file with no other changes.
+# The dockerized `worker` is profile-gated to `prod`. On macOS dev the
+# worker runs natively (start-dev.sh) so it can use MPS for Demucs/Whisper;
+# the compose worker would only race it. On the droplet:
+#   COMPOSE_PROFILES=prod docker compose up -d --build
+# brings the worker container up — it has no GPU and delegates heavy ML
+# to Modal via app/workers/modal_stubs.py.
 
 services:
   postgres:
@@ -34,11 +37,10 @@ services:
   backend:
     build:
       context: ./backend
+    env_file: ./backend/.env
     environment:
       DATABASE_URL: postgresql+psycopg://aidj:aidj@postgres:5432/aidj
       REDIS_URL: redis://redis:6379/0
-      STORAGE_BACKEND: local
-      LOCAL_STORAGE_PATH: /app/cache
       LOG_LEVEL: INFO
     ports:
       - "8000:8000"
@@ -53,16 +55,45 @@ services:
   frontend:
     build:
       context: ./frontend
+      args:
+        # Baked into the client bundle by Next.js. Override at build time
+        # for prod deploys, e.g. NEXT_PUBLIC_API_BASE=http://<droplet>:8000.
+        NEXT_PUBLIC_API_BASE: ${NEXT_PUBLIC_API_BASE:-http://localhost:8000}
     environment:
       # Server-side fetches from the frontend container use docker network DNS.
       BACKEND_URL: http://backend:8000
-      # Browser-side fetches go directly from the user's browser to the host
-      # backend port. NEXT_PUBLIC_ prefix bakes this into the client bundle.
-      NEXT_PUBLIC_API_BASE: http://localhost:8000
+      # Same value as the build arg above — also kept at runtime for any
+      # client-side code paths that re-read it (next dev hot-reload).
+      NEXT_PUBLIC_API_BASE: ${NEXT_PUBLIC_API_BASE:-http://localhost:8000}
     ports:
       - "3000:3000"
     depends_on:
       - backend
+
+  worker:
+    profiles: ["prod"]
+    build:
+      context: ./backend
+    command: ["celery", "-A", "app.workers", "worker", "--loglevel=INFO", "--pool=solo"]
+    env_file: ./backend/.env
+    environment:
+      DATABASE_URL: postgresql+psycopg://aidj:aidj@postgres:5432/aidj
+      REDIS_URL: redis://redis:6379/0
+      # YouTube anti-bot blocks datacenter IPs unless yt-dlp passes a
+      # logged-in browser session. Drop a Netscape cookies.txt at
+      # ./cookies.txt on the droplet (gitignored) and yt-dlp will use it.
+      YT_DLP_COOKIES_FILE: /app/cookies.txt
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./cache:/app/cache
+      # Not :ro — yt-dlp rewrites the cookie jar on cleanup to refresh
+      # session tokens. Mounting read-only causes a secondary OSError
+      # that buries the real download error in the logs.
+      - ./cookies.txt:/app/cookies.txt
 
 volumes:
   postgres_data:

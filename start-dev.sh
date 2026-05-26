@@ -63,8 +63,14 @@ echo
 # group entirely so its image stays small; only the native worker needs
 # the ML stack.
 #
-# --pool=solo: single-process, serial task execution. Required for torch
-# + MPS, which crashes (SIGABRT) under the default prefork pool when a
-# Demucs task runs in a forked worker process on macOS. Single-user
-# pipeline doesn't lose anything to serial execution anyway.
-exec uv run --group worker celery -A app.workers worker --loglevel=info --pool=solo
+# --pool=threads --concurrency=4: lets the worker run up to 4 tasks
+# concurrently in OS threads. Safe now that heavy ML runs on Modal —
+# the local worker mostly orchestrates I/O (yt-dlp download, S3
+# transfers, blocking modal.Function.remote() calls), all of which
+# release the GIL or are network-bound. We avoid --pool=prefork
+# specifically because torch + MPS crashes (SIGABRT) under fork on
+# macOS; threads sidestep that since they share the parent's memory.
+# Bump --concurrency higher only if you want more songs in-flight than
+# Modal's free tier wants to spin up at once (each parallel separation
+# is its own GPU container).
+exec uv run --group worker celery -A app.workers worker --loglevel=info --pool=threads --concurrency=4

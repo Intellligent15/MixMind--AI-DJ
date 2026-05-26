@@ -62,3 +62,11 @@ logs/
 *.sqlite
 *.sqlite3
 *.db
+
+# Deployment artifacts (built by deploy script, never committed)
+*.tar.gz
+*.zip
+
+# Browser-session cookies for yt-dlp (never commit — bypasses YouTube auth)
+cookies.txt
+

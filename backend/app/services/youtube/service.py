@@ -7,7 +7,29 @@ from typing import Any
 
 import yt_dlp
 
+from app.core.config import settings
+
 logger = logging.getLogger(__name__)
+
+
+def _cookies_opt() -> dict[str, Any]:
+    """Yield a `cookiefile` opt iff settings.yt_dlp_cookies_file points at
+    a real, non-empty file. Returning {} on miss lets the caller spread it
+    into any opts dict without conditionals. We treat empty files as
+    "not configured" because the docker bind-mount on the droplet
+    pre-creates an empty placeholder so the mount works even before the
+    user has dropped their cookies in."""
+    path = settings.yt_dlp_cookies_file
+    if not path:
+        return {}
+    p = Path(path)
+    if not p.is_file():
+        logger.warning("yt_dlp_cookies_file=%s not a file; ignoring", path)
+        return {}
+    if p.stat().st_size == 0:
+        logger.warning("yt_dlp_cookies_file=%s is empty; ignoring", path)
+        return {}
+    return {"cookiefile": path}
 
 
 @dataclass(frozen=True)
@@ -36,6 +58,7 @@ class YouTubeService:
             "skip_download": True,
             "extract_flat": "in_playlist",
             "default_search": f"ytsearch{limit}",
+            **_cookies_opt(),
         }
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(query, download=False)
@@ -58,7 +81,15 @@ class YouTubeService:
         opts: dict[str, Any] = {
             "quiet": True,
             "no_warnings": True,
-            "format": "bestaudio/best",
+            # Lenient format chain: prefer pure-audio m4a, then any bestaudio
+            # with a real audio codec, then any best with audio. The plain
+            # "bestaudio/best" we used before fails on videos where YouTube
+            # only serves DASH/HLS adaptive formats — common when cookies
+            # carry Premium- or region-specific entitlements.
+            "format": (
+                "bestaudio[ext=m4a]/bestaudio[acodec!=none]/"
+                "best[acodec!=none]/bestaudio/best"
+            ),
             "outtmpl": out_template + ".%(ext)s",
             "postprocessors": [
                 {
@@ -67,6 +98,7 @@ class YouTubeService:
                 }
             ],
             "overwrites": True,
+            **_cookies_opt(),
         }
         url = f"https://www.youtube.com/watch?v={video_id}"
         try:
