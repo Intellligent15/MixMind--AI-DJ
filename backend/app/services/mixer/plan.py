@@ -117,6 +117,9 @@ def build_pair_plan(a: AnalysisBundle, b: AnalysisBundle) -> MixPlanJSON:
         )
         duration_bars = MIN_DURATION_BARS
 
+    # Calculate pitch shift
+    n_steps = compute_pitch_shift(a.key, b.key)
+
     plan: MixPlanJSON = [
         {
             "tool": "set_transition_window",
@@ -126,10 +129,47 @@ def build_pair_plan(a: AnalysisBundle, b: AnalysisBundle) -> MixPlanJSON:
         }
     ]
 
-    # No pitch_shift in Phase 7. The LARGE_SHIFT_THRESHOLD constant
-    # below is retained for Phase 9's LLM-side reasoning; the threshold
-    # is "what counts as a large shift" in the broader system, not just
-    # a parameter to this generator.
+    # Calculate post-crossfade space for B
+    sec_per_bar_b = (60.0 / b.bpm) * b.time_signature
+    crossfade_end_b = seam_b + (duration_bars * sec_per_bar_b)
+    ramp_duration_bars = 8
+    ramp_end_b = crossfade_end_b + (ramp_duration_bars * sec_per_bar_b)
+
+    can_ramp = b.duration >= ramp_end_b
+
+    if not can_ramp:
+        logger.warning(
+            "build_pair_plan: song B too short to accommodate tempo/pitch ramp "
+            "(duration=%.2fs, need=%.2fs). Falling back to permanent shifts.",
+            b.duration, ramp_end_b
+        )
+        if n_steps != 0:
+            plan.append({
+                "tool": "pitch_shift",
+                "song": "B",
+                "semitones": n_steps,
+            })
+    else:
+        # Emit tempo ramp
+        plan.append({
+            "tool": "set_tempo_ramp",
+            "song": "B",
+            "start_time": crossfade_end_b,
+            "end_time": ramp_end_b,
+            "start_bpm": a.bpm,
+            "end_bpm": b.bpm,
+        })
+        # Emit temporary pitch shift if needed
+        if n_steps != 0:
+            plan.append({
+                "tool": "temporary_pitch_shift",
+                "song": "B",
+                "start_time": crossfade_end_b,
+                "semitones": n_steps,
+                "fade_in_bars": 0,
+                "hold_bars": 0,
+                "fade_out_bars": ramp_duration_bars,
+            })
 
     for stem in ("vocals", "drums", "bass", "other"):
         plan.append({
@@ -139,9 +179,6 @@ def build_pair_plan(a: AnalysisBundle, b: AnalysisBundle) -> MixPlanJSON:
             "to_song": "B",
             "start_bar": 0,
             "duration_bars": duration_bars,
-            # equal_power is the standard for crossfading different
-            # tracks — keeps perceived loudness flat across the fade.
-            # Linear has an audible -3 dB dip at the midpoint.
             "curve": "equal_power",
         })
     return plan

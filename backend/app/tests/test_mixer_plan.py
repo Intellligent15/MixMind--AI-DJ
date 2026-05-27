@@ -4,7 +4,7 @@ dicts. No DB, no audio."""
 
 from __future__ import annotations
 
-from app.services.mixer.plan import build_pair_plan
+from app.services.mixer.plan import build_pair_plan, compute_pitch_shift
 from app.services.mixer.types import AnalysisBundle
 
 
@@ -90,17 +90,25 @@ def test_build_pair_plan_tempo_difference():
     assert window["duration_bars"] == 16  # both songs have plenty
 
 
-def test_build_pair_plan_never_emits_pitch_shift_even_when_keys_differ():
-    # Phase 7's hand-built generator does not pitch-shift. The LLM in
-    # Phase 9 may emit pitch_shift / temporary_pitch_shift, but the
-    # stand-in generator stays neutral on key matching.
+def test_build_pair_plan_emits_temporary_pitch_shift_for_key_mismatch():
+    # Phase 7's hand-built generator now emits temporary_pitch_shift and
+    # set_tempo_ramp to put the song back to its original tempo/key after
+    # the transition.
     for b_key in ("D", "F#", "Am", "G#m"):
         a = _bundle(key="C")
         b = _bundle(key=b_key)
         plan = build_pair_plan(a, b)
-        assert not any(c["tool"] == "pitch_shift" for c in plan), (
-            f"unexpected pitch_shift in plan for C → {b_key}: {plan}"
-        )
+        
+        has_temp_pitch = any(c["tool"] == "temporary_pitch_shift" for c in plan)
+        has_perm_pitch = any(c["tool"] == "pitch_shift" for c in plan)
+        
+        n_steps = compute_pitch_shift("C", b_key)
+        if n_steps != 0:
+            assert has_temp_pitch, f"expected temporary_pitch_shift for C -> {b_key}"
+            assert not has_perm_pitch
+        else:
+            assert not has_temp_pitch
+            assert not has_perm_pitch
 
 
 def test_compute_pitch_shift_remains_available_for_phase_9():

@@ -132,44 +132,23 @@ def render(
     a_mix = _load_and_sum_stems(a)
     b_mix = _load_and_sum_stems(b)
 
-    # 2. Time-stretch B to A's BPM (entire B). pyrubberband rate convention:
-    #    rate > 1 = faster/shorter. To go from b.bpm to a.bpm we want
-    #    rate = a.bpm / b.bpm. When a < b, rate < 1 → B is slowed (longer).
-    stretch_factor = b.analysis.bpm / a.analysis.bpm  # how much longer B becomes
-    if abs(1.0 - stretch_factor) > 1e-6:
-        rate = a.analysis.bpm / b.analysis.bpm
-        b_mix = np.asarray(
-            pyrb.time_stretch(b_mix, REQUIRED_SAMPLE_RATE, rate),
-            dtype=np.float32,
-        )
-
-    # 3. Walk the plan, collecting state.
+    # 2. Walk the plan to extract tools
     window: dict | None = None
-    pitch_shift_warning = False
     stem_calls: list[dict] = []
+    perm_pitch = None
+    temp_pitch = None
+    tempo_ramp = None
 
     for call in plan:
         tool = call["tool"]
         if tool == "set_transition_window":
             window = call
         elif tool == "pitch_shift":
-            if call["song"] != "B":
-                raise NotImplementedError(
-                    f"pitch_shift on song {call['song']!r} not supported in Phase 7"
-                )
-            n_steps = int(call["semitones"])
-            if n_steps != 0:
-                if abs(n_steps) > LARGE_SHIFT_THRESHOLD:
-                    logger.warning(
-                        "render: large pitch shift applied (n_steps=%d); "
-                        "expect pyrubberband artifacts",
-                        n_steps,
-                    )
-                    pitch_shift_warning = True
-                b_mix = np.asarray(
-                    pyrb.pitch_shift(b_mix, REQUIRED_SAMPLE_RATE, n_steps),
-                    dtype=np.float32,
-                )
+            perm_pitch = call
+        elif tool == "temporary_pitch_shift":
+            temp_pitch = call
+        elif tool == "set_tempo_ramp":
+            tempo_ramp = call
         elif tool == "crossfade_stem":
             stem_calls.append(call)
         else:
@@ -177,6 +156,103 @@ def render(
 
     if window is None:
         raise MixerPreconditionError("plan is missing set_transition_window")
+
+    # 3. Time-stretch B
+    rate_A = a.analysis.bpm / b.analysis.bpm  # rubberband rate convention
+    stretch_factor = 1.0 / rate_A             # how much longer B becomes
+    
+    if tempo_ramp:
+        # Variable time stretch
+        start_orig = tempo_ramp["start_time"]
+        end_orig = tempo_ramp["end_time"]
+        start_samp = int(start_orig * REQUIRED_SAMPLE_RATE)
+        end_samp = int(end_orig * REQUIRED_SAMPLE_RATE)
+        
+        time_map = [(0, 0)]
+        if start_samp > 0:
+            time_map.append((start_samp, int(start_samp / rate_A)))
+            
+        ramp_len = end_samp - start_samp
+        if ramp_len > 0:
+            num_points = 10
+            t_source = np.linspace(0, ramp_len, num_points)
+            rates = np.linspace(rate_A, 1.0, num_points)
+            t_target = np.zeros_like(t_source)
+            for i in range(1, num_points):
+                dt = t_source[i] - t_source[i-1]
+                avg_rate = (rates[i] + rates[i-1]) / 2.0
+                t_target[i] = t_target[i-1] + dt / avg_rate
+                
+            for s, t in zip(t_source[1:], t_target[1:]):
+                time_map.append((int(start_samp + s), int(start_samp / rate_A + t)))
+                
+        last_source = time_map[-1][0]
+        last_target = time_map[-1][1]
+        remaining = b_mix.shape[0] - last_source
+        if remaining > 0:
+            time_map.append((b_mix.shape[0], int(last_target + remaining)))
+            
+        b_mix_stretched = np.asarray(
+            pyrb.timemap_stretch(b_mix, REQUIRED_SAMPLE_RATE, time_map),
+            dtype=np.float32
+        )
+        fade_out_target_len = int(t_target[-1]) if ramp_len > 0 else 0
+    else:
+        # Constant time stretch
+        if abs(1.0 - stretch_factor) > 1e-6:
+            b_mix_stretched = np.asarray(
+                pyrb.time_stretch(b_mix, REQUIRED_SAMPLE_RATE, rate_A),
+                dtype=np.float32,
+            )
+        else:
+            b_mix_stretched = b_mix
+        fade_out_target_len = 0
+
+    # 4. Pitch shift B
+    pitch_shift_warning = False
+    
+    def apply_pitch(audio, semitones):
+        nonlocal pitch_shift_warning
+        if abs(semitones) > LARGE_SHIFT_THRESHOLD:
+            logger.warning(
+                "render: large pitch shift applied (n_steps=%d); expect artifacts",
+                semitones,
+            )
+            pitch_shift_warning = True
+        return np.asarray(
+            pyrb.pitch_shift(audio, REQUIRED_SAMPLE_RATE, semitones),
+            dtype=np.float32,
+        )
+
+    if perm_pitch and int(perm_pitch["semitones"]) != 0:
+        b_mix = apply_pitch(b_mix_stretched, int(perm_pitch["semitones"]))
+    elif temp_pitch and int(temp_pitch["semitones"]) != 0:
+        semitones = int(temp_pitch["semitones"])
+        b_shifted = apply_pitch(b_mix_stretched, semitones)
+        
+        # Crossfade from shifted back to original
+        fade_start_samp = int(temp_pitch["start_time"] * REQUIRED_SAMPLE_RATE / rate_A)
+        # Using the same target length calculated during the tempo ramp
+        fade_end_samp = fade_start_samp + fade_out_target_len
+        
+        # Clamp fade_end_samp to avoid out of bounds
+        fade_start_samp = min(fade_start_samp, b_mix_stretched.shape[0])
+        fade_end_samp = min(fade_end_samp, b_mix_stretched.shape[0])
+        crossfade_len = fade_end_samp - fade_start_samp
+        
+        b_mix = np.copy(b_shifted)
+        if crossfade_len > 0:
+            t = np.linspace(0.0, 1.0, crossfade_len, endpoint=False, dtype=np.float32)
+            gain_shifted = np.cos(t * (np.pi / 2.0))
+            gain_unshifted = np.sin(t * (np.pi / 2.0))
+            b_mix[fade_start_samp:fade_end_samp] = (
+                gain_shifted[:, None] * b_shifted[fade_start_samp:fade_end_samp] +
+                gain_unshifted[:, None] * b_mix_stretched[fade_start_samp:fade_end_samp]
+            )
+        b_mix[fade_end_samp:] = b_mix_stretched[fade_end_samp:]
+    else:
+        b_mix = b_mix_stretched
+
     if len(stem_calls) != 4:
         raise MixerPreconditionError(
             f"plan must have 4 crossfade_stem calls, got {len(stem_calls)}"
