@@ -48,11 +48,7 @@ export function Player() {
   const items = queueQuery.data?.items ?? [];
 
   // Background polling of each queue song so a not-yet-downloaded next-up
-  // becomes playable mid-set without a full queue refetch — and so the
-  // upcoming-songs list reflects intermediate processing stages
-  // (downloading → analyzing → separating → transcribing → ready). Only
-  // stop polling on terminal states; otherwise users can't see the
-  // pipeline progress while listening.
+  // becomes playable mid-set without a full queue refetch.
   const songQueries = useQueries({
     queries: items.map((item) => ({
       queryKey: ["song", item.song.id],
@@ -61,7 +57,8 @@ export function Player() {
       refetchInterval: (q: { state: { data?: Song } }) => {
         const s = q.state.data;
         if (!s) return 1000;
-        if (s.status === "ready" || s.status === "failed") return false;
+        if (s.status === "failed") return false;
+        if (isPlayable(s) && s.status !== "downloaded") return false;
         return 1000;
       },
     })),
