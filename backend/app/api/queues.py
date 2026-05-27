@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime, timezone
 
 from celery import chain
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, Header, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -17,7 +17,7 @@ from app.models import (
     Stems,
     Transcription,
 )
-from app.schemas import QueueItemAdd, QueueRead, QueueReorder
+from app.schemas import QueueItemAdd, QueueRead, QueueReorder, QueueRenderRead
 from app.workers import celery_app
 from app.workers.analyze import analyze_song
 from app.workers.download import download_song
@@ -75,15 +75,25 @@ def _compact_positions(db: Session, queue_id: uuid.UUID) -> None:
 
 
 @router.post("", response_model=QueueRead, status_code=status.HTTP_201_CREATED)
-def create_queue(db: Session = Depends(get_db)) -> Queue:
-    existing_unlocked = db.scalar(
-        select(Queue).where(Queue.locked.is_(False)).order_by(Queue.created_at.desc())
-    )
-    if existing_unlocked is not None:
-        raise HTTPException(
-            status_code=409,
-            detail="an unlocked queue already exists",
-        )
+async def create_queue(db: Session = Depends(get_db)) -> Queue:
+    from app.models.queue_render import QueueRender
+    from app.services.storage import get_storage
+    import logging
+    
+    storage = get_storage()
+    old_queues = list(db.scalars(select(Queue)).all())
+    for old_q in old_queues:
+        render_row = db.scalar(select(QueueRender).where(QueueRender.queue_id == old_q.id))
+        if render_row and render_row.rendered_audio_path:
+            try:
+                await storage.delete(render_row.rendered_audio_path)
+            except FileNotFoundError:
+                pass
+            except Exception as e:
+                logging.getLogger(__name__).warning(f"Failed to delete old mix: {e}")
+        db.delete(old_q)
+    db.commit()
+
     queue = Queue()
     db.add(queue)
     db.commit()
@@ -234,6 +244,17 @@ def _enqueue_pipeline_for_song(song: Song, db: Session) -> None:
         db.scalar(select(Transcription.id).where(Transcription.song_id == song.id))
         is not None
     )
+    
+    from app.models.lyrics import Lyrics, LyricsFetchStatus
+    has_lyrics = (
+        db.scalar(select(Lyrics.id).where(
+            (Lyrics.song_id == song.id) & 
+            (Lyrics.fetch_status.in_([LyricsFetchStatus.success, LyricsFetchStatus.not_found, LyricsFetchStatus.error]))
+        )) is not None
+    )
+    
+    if not has_lyrics:
+        _TaskShim("app.workers.fetch_lyrics.fetch_lyrics").delay(sid)
 
     if song.status in (SongStatus.pending, SongStatus.failed) and not song.audio_path:
         # Full chain. We don't try to skip the tail when has_stems/
@@ -292,3 +313,71 @@ def lock_queue(queue_id: uuid.UUID, db: Session = Depends(get_db)) -> Queue:
     _seed_mix_plans(queue, db)
 
     return queue
+
+
+@router.post(
+    "/{queue_id}/stitch",
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def stitch_queue_route(queue_id: uuid.UUID, db: Session = Depends(get_db)):
+    from app.models.queue_render import QueueRender, QueueRenderStatus
+    
+    queue = db.get(Queue, queue_id)
+    if not queue:
+        raise HTTPException(status_code=404, detail="queue not found")
+    if not queue.locked:
+        raise HTTPException(status_code=409, detail="queue must be locked to stitch")
+        
+    render_row = db.scalar(select(QueueRender).where(QueueRender.queue_id == queue_id))
+    if not render_row:
+        render_row = QueueRender(queue_id=queue_id)
+        db.add(render_row)
+    else:
+        render_row.status = QueueRenderStatus.pending
+        render_row.error_text = None
+    db.commit()
+    db.refresh(render_row)
+    
+    from app.models import MixPlan, MixPlanStatus
+    from celery import chord
+
+    mix_plans = db.scalars(select(MixPlan).where(MixPlan.queue_id == queue_id)).all()
+    render_tasks = []
+    for mp in mix_plans:
+        if mp.status != MixPlanStatus.ready:
+            render_tasks.append(_TaskShim("app.workers.render_transition.render_transition").si(str(mp.id)))
+
+    stitch_task = _TaskShim("app.workers.stitch_queue.stitch_queue").si(str(queue_id))
+    
+    if render_tasks:
+        chord(render_tasks)(stitch_task)
+    else:
+        stitch_task.delay()
+
+    return {"message": "Stitching started"}
+
+
+@router.get("/{queue_id}/mix", response_model=QueueRenderRead)
+def get_queue_mix(queue_id: uuid.UUID, db: Session = Depends(get_db)):
+    from app.models.queue_render import QueueRender
+    
+    render_row = db.scalar(select(QueueRender).where(QueueRender.queue_id == queue_id))
+    if not render_row:
+        raise HTTPException(status_code=404, detail="no mix found for queue")
+    return render_row
+
+
+@router.get("/{queue_id}/mix/audio")
+async def get_queue_mix_audio(
+    queue_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    range: str | None = Header(default=None),
+):
+    from app.models.queue_render import QueueRender, QueueRenderStatus
+    from app.api.songs import _stream_audio_response
+    
+    render_row = db.scalar(select(QueueRender).where(QueueRender.queue_id == queue_id))
+    if not render_row or render_row.status != QueueRenderStatus.ready or not render_row.rendered_audio_path:
+        raise HTTPException(status_code=404, detail="mix audio not ready")
+        
+    return await _stream_audio_response(render_row.rendered_audio_path, "audio/flac", range, download_filename="mix.flac")

@@ -154,16 +154,18 @@ class TranscriptionService:
         self.model_repo = model_repo
         self.model_name = model_name
 
-    def transcribe(self, vocals_path: Path) -> TranscriptionResult:
+    def transcribe(self, vocals_path: Path, initial_prompt: str | None = None) -> TranscriptionResult:
         logger.info(
             "transcribing %s with mlx-whisper %s", vocals_path, self.model_repo
         )
-        # All overrides live in WHISPER_OPTIONS at module scope — see
-        # there for the rationale on each knob.
+        options = dict(WHISPER_OPTIONS)
+        if initial_prompt:
+            options["initial_prompt"] = initial_prompt
+
         raw = mlx_whisper.transcribe(
             str(vocals_path),
             path_or_hf_repo=self.model_repo,
-            **WHISPER_OPTIONS,
+            **options,
         )
 
         segments: list[dict] = []

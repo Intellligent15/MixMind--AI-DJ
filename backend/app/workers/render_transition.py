@@ -147,7 +147,7 @@ def render_transition(mix_plan_id: str) -> str | None:
         except Exception as exc:
             logger.exception("render_transition: %s render failed", mix_plan_id)
             _mark_failed(plan_uuid, f"{type(exc).__name__}: {exc}")
-            raise
+            return None
 
     # Phase 4: persist output via storage, flip to ready.
     key = f"mixes/{mix_plan_id}.wav"

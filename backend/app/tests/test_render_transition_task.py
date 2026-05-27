@@ -184,8 +184,8 @@ def test_render_transition_marks_failed_on_executor_error(pair_with_plan):
         ),
     ):
         from app.workers.render_transition import render_transition
-        with pytest.raises(RuntimeError):
-            render_transition(pair_with_plan["plan_id"])
+        result = render_transition(pair_with_plan["plan_id"])
+        assert result is None
 
     with SessionLocal() as db:
         row = db.get(MixPlan, uuid.UUID(pair_with_plan["plan_id"]))

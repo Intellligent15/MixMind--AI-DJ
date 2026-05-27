@@ -20,6 +20,8 @@ class Settings(BaseSettings):
     
     modal_token_id: str = ""
     modal_token_secret: str = ""
+    
+    genius_access_token: str = ""
 
     # Path to a Netscape-format cookies.txt that yt-dlp passes to YouTube.
     # Required on cloud hosts (the droplet) — YouTube's anti-bot system

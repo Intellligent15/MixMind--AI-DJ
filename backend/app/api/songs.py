@@ -16,6 +16,7 @@ from app.schemas import (
     SongRead,
     StemsRead,
     TranscriptionRead,
+    LyricsRead,
 )
 from app.services.storage import get_storage
 from app.workers import celery_app
@@ -175,6 +176,7 @@ async def _stream_audio_response(
     key: str,
     media_type: str,
     range_header: str | None,
+    download_filename: str | None = None,
 ) -> StreamingResponse:
     """Shared streaming-with-Range body for the audio + stem endpoints.
 
@@ -199,6 +201,9 @@ async def _stream_audio_response(
         # that a re-separate quickly becomes visible on the next visit.
         "Cache-Control": "private, max-age=300",
     }
+    if download_filename:
+        headers["Content-Disposition"] = f'attachment; filename="{download_filename}"'
+        
     if lo is not None:
         # Partial response: include Content-Range and use 206.
         effective_hi = (hi if hi is not None else total_size - 1)
@@ -368,3 +373,67 @@ def get_song_transcription(
     if transcription is None:
         raise HTTPException(status_code=404, detail="transcription not available")
     return transcription
+
+
+@router.get("/{song_id}/lyrics", response_model=LyricsRead)
+def get_song_lyrics(
+    song_id: uuid.UUID, db: Session = Depends(get_db)
+):
+    from app.models.lyrics import Lyrics
+    
+    song = db.get(Song, song_id)
+    if song is None:
+        raise HTTPException(status_code=404, detail="song not found")
+    lyrics = db.scalar(select(Lyrics).where(Lyrics.song_id == song_id))
+    if lyrics is None:
+        raise HTTPException(status_code=404, detail="lyrics not available")
+    return lyrics
+
+
+@router.get("/{song_id}/vocal_safe_regions")
+async def get_song_vocal_safe_regions(
+    song_id: uuid.UUID,
+    db: Session = Depends(get_db),
+    word_prob_min: float = 0.35,
+    segment_logprob_min: float = -1.2,
+    stem_rms_presence: float = 0.02,
+    stem_rms_quiet: float = 0.01,
+    min_safe_region_seconds: float = 1.5,
+):
+    import json
+    from app.models.lyrics import Lyrics
+    from app.services.vocal_safety.safety import vocal_safe_regions
+    
+    song = db.get(Song, song_id)
+    if song is None:
+        raise HTTPException(status_code=404, detail="song not found")
+        
+    transcription = db.scalar(select(Transcription).where(Transcription.song_id == song_id))
+    stems = db.scalar(select(Stems).where(Stems.song_id == song_id))
+    lyrics = db.scalar(select(Lyrics).where(Lyrics.song_id == song_id))
+    
+    if not transcription or not stems or not stems.vocal_envelope_path:
+        raise HTTPException(status_code=409, detail="song not fully processed yet")
+        
+    storage = get_storage()
+    try:
+        envelope_data = await storage.read(stems.vocal_envelope_path)
+        envelope = json.loads(envelope_data)
+    except Exception:
+        raise HTTPException(status_code=500, detail="failed to read vocal envelope")
+        
+    aligned_words = lyrics.aligned_words if lyrics else None
+    
+    regions = vocal_safe_regions(
+        transcription_segments=transcription.segments,
+        envelope=envelope,
+        aligned_words=aligned_words,
+        word_prob_min=word_prob_min,
+        segment_logprob_min=segment_logprob_min,
+        stem_rms_presence=stem_rms_presence,
+        stem_rms_quiet=stem_rms_quiet,
+        min_safe_region_seconds=min_safe_region_seconds,
+        duration_seconds=song.duration_seconds or 0.0,
+    )
+    
+    return {"regions": regions}

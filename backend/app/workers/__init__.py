@@ -13,6 +13,9 @@ celery_app = Celery(
         "app.workers.separate",
         "app.workers.transcribe",
         "app.workers.render_transition",
+        "app.workers.stitch_queue",
+        "app.workers.fetch_lyrics",
+        "app.workers.align_lyrics",
     ],
 )
 

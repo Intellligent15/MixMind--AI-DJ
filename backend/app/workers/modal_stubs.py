@@ -195,6 +195,7 @@ def run_transcription(
     s3_access_key: str,
     s3_secret: str,
     s3_region: str,
+    initial_prompt: str | None = None,
 ) -> dict:
     """Whisper large-v3 transcription of the vocal stem. Mirrors the
     shape of TranscriptionService.transcribe(): per-segment text + word-
@@ -214,11 +215,14 @@ def run_transcription(
         s3.download_file(s3_bucket, vocals_key, str(local))
 
         model = whisper.load_model("large-v3")
-        result = model.transcribe(
-            str(local),
-            word_timestamps=True,
-            verbose=False,
-        )
+        kwargs = {
+            "word_timestamps": True,
+            "verbose": False,
+        }
+        if initial_prompt:
+            kwargs["initial_prompt"] = initial_prompt
+            
+        result = model.transcribe(str(local), **kwargs)
 
         segments = []
         for seg in result.get("segments", []):

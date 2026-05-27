@@ -126,6 +126,13 @@ def transcribe_song(song_id: str) -> str | None:
         vocals_key = stems.vocals_path
         video_id = song.youtube_video_id
 
+        from app.models.lyrics import Lyrics
+        lyrics = db.scalar(select(Lyrics).where(Lyrics.song_id == song_uuid))
+        initial_prompt = None
+        if lyrics and lyrics.text:
+            # Take roughly the first 200 words as initial prompt
+            initial_prompt = " ".join(lyrics.text.split()[:200])
+
     # Skip-if-instrumental decision. Threshold lives in settings so the
     # user can tune it without code changes.
     if vocal_rms < threshold:
@@ -152,6 +159,9 @@ def transcribe_song(song_id: str) -> str | None:
             assert song is not None
             song.status = SongStatus.ready
             db.commit()
+            
+        from app.workers.align_lyrics import align_lyrics_task
+        align_lyrics_task.delay(str(song_uuid))
         return str(song_uuid)
 
     import tempfile
@@ -178,6 +188,7 @@ def transcribe_song(song_id: str) -> str | None:
                     settings.s3_access_key,
                     settings.s3_secret_key,
                     settings.s3_region_name,
+                    initial_prompt,
                 )
                 # Modal returns segments inline (already JSON-shaped).
                 segments = result["segments"]
@@ -192,7 +203,7 @@ def transcribe_song(song_id: str) -> str | None:
                     )
                 service = TranscriptionService()
                 asyncio.run(storage.download_file(vocals_key, vocals_path))
-                result = service.transcribe(vocals_path)
+                result = service.transcribe(vocals_path, initial_prompt=initial_prompt)
                 language = result.language
                 segments = result.segments
                 duration_seconds = result.duration_seconds
@@ -236,5 +247,8 @@ def transcribe_song(song_id: str) -> str | None:
         assert song is not None
         song.status = SongStatus.ready
         db.commit()
+
+    from app.workers.align_lyrics import align_lyrics_task
+    align_lyrics_task.delay(str(song_uuid))
 
     return str(song_uuid)
