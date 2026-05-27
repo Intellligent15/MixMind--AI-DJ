@@ -98,23 +98,12 @@ def transcribe_song(song_id: str) -> str | None:
         db.commit()
 
         if claim.rowcount == 0:
-            # The atomic UPDATE didn't match. Either another worker won
-            # the claim (status != one of CLAIMABLE_STATUSES) or the song
-            # was deleted between the SELECT above and the UPDATE — the
-            # latter happens when the user clicks Delete on a song with
-            # a queued task. db.refresh would raise InvalidRequestError
-            # on a missing row; db.get returns None cleanly.
-            current = db.get(Song, song_uuid)
-            if current is None:
-                logger.info(
-                    "transcribe_song: %s no longer exists, skipping", song_id
-                )
-            else:
-                logger.info(
-                    "transcribe_song: %s already %s, skipping duplicate dispatch",
-                    song_id,
-                    current.status.value,
-                )
+            db.refresh(song)
+            logger.info(
+                "transcribe_song: %s already %s, skipping duplicate dispatch",
+                song_id,
+                song.status.value,
+            )
             return None
 
         stems = db.scalar(select(Stems).where(Stems.song_id == song_uuid))

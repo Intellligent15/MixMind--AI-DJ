@@ -99,20 +99,11 @@ def render_transition(mix_plan_id: str) -> str | None:
         )
         db.commit()
         if claim.rowcount == 0:
-            # See transcribe.py for the same fix — db.refresh raises if
-            # the row was deleted between SELECT and UPDATE (e.g. user
-            # deleted a song that nuked the cascading MixPlan rows).
-            current = db.get(MixPlan, plan_uuid)
-            if current is None:
-                logger.info(
-                    "render_transition: %s no longer exists, skipping",
-                    mix_plan_id,
-                )
-            else:
-                logger.info(
-                    "render_transition: %s already %s, skipping",
-                    mix_plan_id, current.status.value,
-                )
+            db.refresh(row)
+            logger.info(
+                "render_transition: %s already %s, skipping",
+                mix_plan_id, row.status.value,
+            )
             return None
 
         # Snapshot what we need outside the session.

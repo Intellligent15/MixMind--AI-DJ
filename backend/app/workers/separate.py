@@ -104,20 +104,12 @@ def separate_stems(song_id: str) -> str | None:
         db.commit()
 
         if claim.rowcount == 0:
-            # See transcribe.py for the same fix — db.refresh raises if
-            # the row was deleted between SELECT and UPDATE. db.get is
-            # null-safe.
-            current = db.get(Song, song_uuid)
-            if current is None:
-                logger.info(
-                    "separate_stems: %s no longer exists, skipping", song_id
-                )
-            else:
-                logger.info(
-                    "separate_stems: %s already %s, skipping duplicate dispatch",
-                    song_id,
-                    current.status.value,
-                )
+            db.refresh(song)
+            logger.info(
+                "separate_stems: %s already %s, skipping duplicate dispatch",
+                song_id,
+                song.status.value,
+            )
             return None
 
         audio_key = song.audio_path

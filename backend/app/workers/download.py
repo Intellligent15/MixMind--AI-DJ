@@ -53,21 +53,13 @@ def download_song(song_id: str) -> str | None:
         db.commit()
 
         if claim.rowcount == 0:
-            # See transcribe.py for the same fix — db.refresh raises if
-            # the row was deleted between SELECT and UPDATE. db.get is
-            # null-safe.
-            current = db.get(Song, song_uuid)
-            if current is None:
-                logger.info(
-                    "download_song: %s no longer exists, skipping", song_id
-                )
-                return None
+            db.refresh(song)
             logger.info(
                 "download_song: %s already %s, skipping duplicate dispatch",
                 song_id,
-                current.status.value,
+                song.status.value,
             )
-            return current.audio_path
+            return song.audio_path
 
         video_id = song.youtube_video_id
 
