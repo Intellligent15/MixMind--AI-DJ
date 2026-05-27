@@ -158,6 +158,18 @@ export type MixPlan = {
   updated_at: string;
 };
 
+export type QueueRenderStatus = "pending" | "rendering" | "ready" | "failed";
+
+export type QueueRender = {
+  id: string;
+  queue_id: string;
+  rendered_audio_path: string | null;
+  status: QueueRenderStatus;
+  error_text: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
 export const api = {
   search: (q: string, limit = 10) =>
     request<SearchResult[]>(
@@ -187,6 +199,10 @@ export const api = {
     request<Song>(`/api/songs/${id}/transcribe`, { method: "POST" }),
   getTranscription: (id: string) =>
     request<Transcription>(`/api/songs/${id}/transcription`),
+  getLyrics: (id: string) =>
+    request<any>(`/api/songs/${id}/lyrics`),
+  getVocalSafeRegions: (id: string) =>
+    request<{ regions: { start: number; end: number; safe: boolean; reason: string }[] }>(`/api/songs/${id}/vocal_safe_regions`),
 
   getCurrentQueue: () => request<Queue>(`/api/queues/current`),
   createQueue: () => request<Queue>(`/api/queues`, { method: "POST" }),
@@ -220,6 +236,18 @@ export const api = {
   triggerRenderMixPlan: (id: string) =>
     request<void>(`/api/mix_plans/${id}/render`, { method: "POST" }),
   mixPlanAudioUrl: (id: string) => `${API_BASE}/api/mix_plans/${id}/audio`,
+
+  stitchQueue: (queueId: string) =>
+    request<{message: string}>(`/api/queues/${queueId}/stitch`, { method: "POST" }),
+  getQueueMix: async (queueId: string): Promise<QueueRender | null> => {
+    try {
+      return await request<QueueRender>(`/api/queues/${queueId}/mix`);
+    } catch (err) {
+      if (isStatusError(err, 404)) return null;
+      throw err;
+    }
+  },
+  queueMixAudioUrl: (queueId: string) => `${API_BASE}/api/queues/${queueId}/mix/audio`,
 };
 
 // Distinguishes a `request()` 4xx/5xx from a network error so callers can

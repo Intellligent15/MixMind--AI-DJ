@@ -1,8 +1,10 @@
 "use client";
 
 import { useEffect, useRef } from "react";
+import { useQuery } from "@tanstack/react-query";
+import { api, type Analysis, type Song } from "@/lib/api";
 import WaveSurfer from "wavesurfer.js";
-import type { Analysis, Song } from "@/lib/api";
+import RegionsPlugin from "wavesurfer.js/dist/plugins/regions.esm.js";
 
 const SECTION_COLORS = [
   "rgba(56, 189, 248, 0.25)",
@@ -18,7 +20,6 @@ const SECTION_COLORS = [
 ];
 
 function colorForLabel(label: string): string {
-  // Stable-hash the label so the same section_N always gets the same colour.
   let h = 0;
   for (let i = 0; i < label.length; i++) h = (h * 31 + label.charCodeAt(i)) | 0;
   return SECTION_COLORS[Math.abs(h) % SECTION_COLORS.length];
@@ -36,9 +37,20 @@ export function WaveformDebug({
   const containerRef = useRef<HTMLDivElement | null>(null);
   const overlayRef = useRef<HTMLDivElement | null>(null);
   const wsRef = useRef<WaveSurfer | null>(null);
+  const regionsPluginRef = useRef<RegionsPlugin | null>(null);
+
+  const safeRegionsQuery = useQuery({
+    queryKey: ["vocal_safe_regions", song.id],
+    queryFn: () => api.getVocalSafeRegions(song.id),
+    retry: false,
+  });
 
   useEffect(() => {
     if (!containerRef.current) return;
+    
+    const regions = RegionsPlugin.create();
+    regionsPluginRef.current = regions;
+    
     const ws = WaveSurfer.create({
       container: containerRef.current,
       waveColor: "#94a3b8",
@@ -49,13 +61,36 @@ export function WaveformDebug({
       barGap: 1,
       barHeight: 0.6,
       url: audioUrl,
+      plugins: [regions],
     });
     wsRef.current = ws;
+    
     return () => {
       ws.destroy();
       wsRef.current = null;
+      regionsPluginRef.current = null;
     };
   }, [audioUrl]);
+  
+  useEffect(() => {
+    const regionsPlugin = regionsPluginRef.current;
+    if (!regionsPlugin || !safeRegionsQuery.data) return;
+    
+    // Clear existing
+    regionsPlugin.clearRegions();
+    
+    // Add safe regions
+    safeRegionsQuery.data.regions.forEach((r) => {
+      regionsPlugin.addRegion({
+        start: r.start,
+        end: r.end,
+        content: "Safe",
+        color: "rgba(34, 197, 94, 0.2)",
+        drag: false,
+        resize: false,
+      });
+    });
+  }, [safeRegionsQuery.data]);
 
   // Draw beat/downbeat ticks and section bands as an absolutely-positioned
   // overlay that mirrors the waveform's width. We use the audio duration from

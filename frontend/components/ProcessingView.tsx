@@ -148,11 +148,6 @@ export function ProcessingView() {
     })),
   });
 
-  // Poll each song individually so we get fast updates without re-fetching
-  // the whole queue. The worker bounces Song.status back to `analyzed`
-  // after separating and to `ready` after transcribing in transactions
-  // separate from inserting the row, so we can't stop polling at any
-  // terminal Song.status — we have to wait until both rows exist.
   const songQueries = useQueries({
     queries: items.map((item, idx) => ({
       queryKey: ["song", item.song.id],
@@ -161,9 +156,7 @@ export function ProcessingView() {
       refetchInterval: (q: { state: { data?: Song } }) => {
         const s = q.state.data;
         if (!s) return 1000;
-        if (s.status === "failed") return false;
-        const hasTranscription = !!transcriptionQueries[idx]?.data;
-        if (hasTranscription) return false;
+        if (s.status === "failed" || s.status === "ready") return false;
         return 1000;
       },
     })),
