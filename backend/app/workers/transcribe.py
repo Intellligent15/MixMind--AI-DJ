@@ -126,13 +126,6 @@ def transcribe_song(song_id: str) -> str | None:
         vocals_key = stems.vocals_path
         video_id = song.youtube_video_id
 
-        # Removed the 200-word lyrics injection. When condition_on_previous_text=False,
-        # Whisper injects the initial_prompt at the start of *every* 30-second window.
-        # Injecting the first 200 words of the song at minute 4:00 severely degrades
-        # the model's accuracy because the audio contradicts the forced context.
-        # We rely purely on the standard anti-hallucination instruction prompt instead.
-        initial_prompt = None
-
     # Skip-if-instrumental decision. Threshold lives in settings so the
     # user can tune it without code changes.
     if vocal_rms < threshold:
@@ -186,7 +179,6 @@ def transcribe_song(song_id: str) -> str | None:
                     settings.s3_access_key,
                     settings.s3_secret_key,
                     settings.s3_region_name,
-                    initial_prompt,
                 )
                 # Modal returns segments inline (already JSON-shaped).
                 segments = result["segments"]
@@ -201,7 +193,7 @@ def transcribe_song(song_id: str) -> str | None:
                     )
                 service = TranscriptionService()
                 asyncio.run(storage.download_file(vocals_key, vocals_path))
-                result = service.transcribe(vocals_path, initial_prompt=initial_prompt)
+                result = service.transcribe(vocals_path)
                 language = result.language
                 segments = result.segments
                 duration_seconds = result.duration_seconds
