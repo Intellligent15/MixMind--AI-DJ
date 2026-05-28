@@ -128,3 +128,28 @@ def test_align_no_anchors_leaves_timestamps_none():
     assert all(a["start"] is None for a in out["aligned_words"])
     assert all(a["end"] is None for a in out["aligned_words"])
     assert out["alignment_status"] == LyricsAlignmentStatus.low_quality
+
+
+def test_align_quality_weighs_phonetic_subs_at_half():
+    # 3 matches + 1 phonetic substitution (there ↔ their) →
+    # (3 + 0.5) / 4 = 0.875.
+    segs = _whisper([
+        ("love", 0.0, 0.3, 0.95),
+        ("me", 0.4, 0.6, 0.95),
+        ("there", 0.7, 0.9, 0.95),
+        ("forever", 1.0, 1.5, 0.95),
+    ])
+    out = align_lyrics(segs, "love me their forever")
+    assert abs(out["alignment_quality"] - 0.875) < 1e-6
+    assert out["alignment_status"] == LyricsAlignmentStatus.success
+
+
+def test_align_low_quality_when_mostly_misaligned():
+    # 0 matches + 4 non-phonetic subs → (0 + 0.4) / 4 = 0.1 < 0.3.
+    segs = _whisper([
+        ("zzz", 0.0, 0.3, 0.9), ("qqq", 0.3, 0.6, 0.9),
+        ("xxx", 0.6, 0.9, 0.9), ("yyy", 0.9, 1.2, 0.9),
+    ])
+    out = align_lyrics(segs, "love me tender forever")
+    assert out["alignment_quality"] < 0.3
+    assert out["alignment_status"] == LyricsAlignmentStatus.low_quality

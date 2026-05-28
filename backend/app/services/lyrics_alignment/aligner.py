@@ -223,11 +223,34 @@ def align_lyrics(transcription_segments: list[dict[str, Any]], genius_text: str)
             a["source"] = "interpolated"
             # a["start"] and a["end"] remain None.
 
-    matched_count = sum(1 for a in aligned if a["source"] == "whisper_match")
-    quality = matched_count / len(aligned) if aligned else 0.0
-    status = LyricsAlignmentStatus.success
-    if quality < 0.3:
-        status = LyricsAlignmentStatus.low_quality
+    # Weight matches 1.0, phonetic subs 0.5, other subs 0.1.
+    # Interpolations contribute 0 but count toward the denominator so
+    # alignments with many gaps are correctly flagged low_quality.
+    matches = 0
+    phonetic_subs = 0
+    other_subs = 0
+    interpolated_count = 0
+    for a in aligned:
+        if a["source"] == "whisper_match":
+            matches += 1
+        elif a["source"] == "whisper_substitution":
+            if a.get("_phonetic_hit"):
+                phonetic_subs += 1
+            else:
+                other_subs += 1
+        elif a["source"] == "interpolated":
+            interpolated_count += 1
+
+    denom = matches + phonetic_subs + other_subs + interpolated_count
+    quality = (
+        (matches + 0.5 * phonetic_subs + 0.1 * other_subs) / denom
+        if denom else 0.0
+    )
+    status = (
+        LyricsAlignmentStatus.low_quality
+        if quality < 0.3
+        else LyricsAlignmentStatus.success
+    )
 
     for a in aligned:
         a.pop("_phonetic_hit", None)
