@@ -25,12 +25,31 @@ def fetch_lyrics_task(self: Any, song_id: uuid.UUID | str) -> str | None:
             logger.error(f"fetch_lyrics: song {song_id} not found")
             return None
 
+        from sqlalchemy.exc import IntegrityError
+
         lyrics = db.scalar(select(Lyrics).where(Lyrics.song_id == song_id))
         if not lyrics:
             lyrics = Lyrics(song_id=song_id)
             db.add(lyrics)
-            db.commit()
-            
+            try:
+                db.commit()
+            except IntegrityError:
+                # A concurrent worker beat us to it. Rollback and
+                # re-read instead of crashing.
+                db.rollback()
+                lyrics = db.scalar(
+                    select(Lyrics).where(Lyrics.song_id == song_id)
+                )
+                if lyrics is None:
+                    # Shouldn't happen — unique constraint either holds
+                    # a row or doesn't. Defensive log + retry.
+                    logger.error(
+                        "fetch_lyrics: %s IntegrityError but row not found",
+                        song_id,
+                    )
+                    raise self.retry(countdown=30)
+
+
         if lyrics.fetch_status == LyricsFetchStatus.success:
             logger.info(f"fetch_lyrics: {song_id} already has lyrics, skipping")
             return str(song_id)
