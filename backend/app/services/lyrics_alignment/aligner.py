@@ -180,43 +180,48 @@ def align_lyrics(transcription_segments: list[dict[str, Any]], genius_text: str)
             # Words in Whisper not in Genius. Drop them.
             pass
 
-    # Pass 2: Interpolate missing timestamps
+    # Pass 2: Interpolate missing timestamps. Non-zero duration for
+    # interpolated words; leave None when neither neighbour anchors.
     for i, a in enumerate(aligned):
-        if a["start"] is None:
-            prev_end = None
-            prev_idx = -1
-            for k in range(i - 1, -1, -1):
-                if aligned[k]["start"] is not None:
-                    prev_end = aligned[k]["end"]
-                    prev_idx = k
-                    break
+        if a["start"] is not None:
+            continue
 
-            next_start = None
-            next_idx = len(aligned)
-            for k in range(i + 1, len(aligned)):
-                if aligned[k]["start"] is not None:
-                    next_start = aligned[k]["start"]
-                    next_idx = k
-                    break
+        prev_idx: int | None = None
+        next_idx: int | None = None
+        for k in range(i - 1, -1, -1):
+            if aligned[k]["start"] is not None:
+                prev_idx = k
+                break
+        for k in range(i + 1, len(aligned)):
+            if aligned[k]["start"] is not None:
+                next_idx = k
+                break
 
-            if prev_end is not None and next_start is not None:
-                fraction = (i - prev_idx) / (next_idx - prev_idx)
-                duration = next_start - prev_end
-                a["start"] = prev_end + fraction * duration
-                a["end"] = prev_end + fraction * duration
-                a["source"] = "interpolated"
-            elif prev_end is not None:
-                a["start"] = prev_end + 0.1
-                a["end"] = prev_end + 0.2
-                a["source"] = "interpolated"
-            elif next_start is not None:
-                a["start"] = max(0.0, next_start - 0.2)
-                a["end"] = max(0.0, next_start - 0.1)
-                a["source"] = "interpolated"
-            else:
-                a["start"] = 0.0
-                a["end"] = 0.0
-                a["source"] = "interpolated"
+        if prev_idx is not None and next_idx is not None:
+            prev_end = aligned[prev_idx]["end"]
+            next_start = aligned[next_idx]["start"]
+            gap_span = max(next_start - prev_end, 1e-3)
+            slot = (i - prev_idx) / (next_idx - prev_idx)
+            per_word = gap_span / (next_idx - prev_idx)
+            t_center = prev_end + slot * gap_span
+            a["start"] = t_center
+            a["end"] = t_center + per_word
+            a["source"] = "interpolated"
+        elif prev_idx is not None:
+            prev_end = aligned[prev_idx]["end"]
+            a["start"] = prev_end + 0.05
+            a["end"] = prev_end + 0.15
+            a["source"] = "interpolated"
+        elif next_idx is not None:
+            next_start = aligned[next_idx]["start"]
+            a["start"] = max(0.0, next_start - 0.15)
+            a["end"] = max(0.0, next_start - 0.05)
+            a["source"] = "interpolated"
+        else:
+            # No anchor on either side — leave timestamps None.
+            # Downstream consumers (vocal_safety) must skip these.
+            a["source"] = "interpolated"
+            # a["start"] and a["end"] remain None.
 
     matched_count = sum(1 for a in aligned if a["source"] == "whisper_match")
     quality = matched_count / len(aligned) if aligned else 0.0

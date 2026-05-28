@@ -107,3 +107,24 @@ def test_align_nonphonetic_substitution_lower_confidence():
     assert a["source"] == "whisper_substitution"
     # Non-phonetic factor 0.4 → 0.36; well below the phonetic case.
     assert a["confidence"] < 0.5
+
+
+def test_align_interpolated_word_has_nonzero_duration():
+    # "the" is missing in Whisper between "hold" and "line".
+    segs = _whisper([
+        ("hold", 0.0, 0.3, 0.95),
+        ("line", 1.0, 1.3, 0.95),
+    ])
+    out = align_lyrics(segs, "hold the line")
+    interp = [a for a in out["aligned_words"] if a["source"] == "interpolated"]
+    assert len(interp) == 1
+    assert interp[0]["start"] < interp[0]["end"]  # non-zero duration
+    assert 0.3 <= interp[0]["start"] <= 1.0
+
+
+def test_align_no_anchors_leaves_timestamps_none():
+    # Whisper produced no usable words at all.
+    out = align_lyrics([], "love me tender")
+    assert all(a["start"] is None for a in out["aligned_words"])
+    assert all(a["end"] is None for a in out["aligned_words"])
+    assert out["alignment_status"] == LyricsAlignmentStatus.low_quality
