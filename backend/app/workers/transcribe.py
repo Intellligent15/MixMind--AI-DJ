@@ -159,9 +159,7 @@ def transcribe_song(song_id: str) -> str | None:
             assert song is not None
             song.status = SongStatus.ready
             db.commit()
-            
-        from app.workers.align_lyrics import align_lyrics_task
-        align_lyrics_task.delay(str(song_uuid))
+
         return str(song_uuid)
 
     import tempfile

@@ -38,8 +38,21 @@ def align_lyrics_task(self: Any, song_id: uuid.UUID | str) -> str | None:
             logger.info(f"align_lyrics: no transcription for {song_id}")
             return str(song_id)
             
+        if transcription.status == TranscriptionStatus.skipped_instrumental:
+            # No vocals to align — surface this as a non-error state
+            # so the UI doesn't show a misleading "alignment failed".
+            logger.info(
+                "align_lyrics: %s is instrumental; marking whisper_only",
+                song_id,
+            )
+            lyrics.alignment_status = LyricsAlignmentStatus.whisper_only
+            db.commit()
+            return str(song_id)
         if transcription.status != TranscriptionStatus.success:
-            logger.info(f"align_lyrics: transcription status is {transcription.status}, skipping alignment")
+            logger.info(
+                "align_lyrics: %s transcription status is %s, marking error",
+                song_id, transcription.status,
+            )
             lyrics.alignment_status = LyricsAlignmentStatus.error
             db.commit()
             return str(song_id)
