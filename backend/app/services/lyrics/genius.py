@@ -67,12 +67,21 @@ async def search_genius_song(title: str, artist: str | None) -> dict | None:
         if not hits:
             return None
 
-        # Take the first song hit
-        for hit in hits:
-            if hit["type"] == "song":
-                return hit["result"]
-                
-    return None
+        song_hits = [h["result"] for h in hits if h.get("type") == "song"]
+        if not song_hits:
+            return None
+
+        if artist:
+            artist_tokens = {t for t in re.split(r"\W+", artist.lower()) if t}
+            artist_tokens.discard("vevo")
+            for hit in song_hits:
+                primary = (hit.get("primary_artist") or {}).get("name", "")
+                hit_tokens = {t for t in re.split(r"\W+", primary.lower()) if t}
+                if artist_tokens & hit_tokens:
+                    return hit
+            # No overlap on any hit — fall through to first hit below.
+
+        return song_hits[0]
 
 
 async def scrape_genius_lyrics(url: str) -> str | None:
