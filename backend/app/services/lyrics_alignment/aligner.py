@@ -9,6 +9,84 @@ def _clean_word(w: str) -> str:
     return re.sub(r"[^a-z0-9]", "", w.lower())
 
 
+_SOUNDEX_MAP = {
+    "b": "1", "f": "1", "p": "1", "v": "1",
+    "c": "2", "g": "2", "j": "2", "k": "2", "q": "2", "s": "2", "x": "2", "z": "2",
+    "d": "3", "t": "3",
+    "l": "4",
+    "m": "5", "n": "5",
+    "r": "6",
+}
+# H and W are "transparent" in classical American Soundex — they don't
+# count toward the code, but they also don't reset the dedupe state.
+# Vowels (and Y) DO reset.
+_SOUNDEX_TRANSPARENT = {"h", "w"}
+
+
+def _soundex(word: str) -> str:
+    """Classical American Soundex: first letter + up to 3 digit codes."""
+    w = re.sub(r"[^a-z]", "", word.lower())
+    if not w:
+        return ""
+    first = w[0]
+    digits: list[str] = []
+    last_code = _SOUNDEX_MAP.get(first, "")
+    for ch in w[1:]:
+        code = _SOUNDEX_MAP.get(ch)
+        if code is None:
+            if ch in _SOUNDEX_TRANSPARENT:
+                continue  # transparent — preserve last_code
+            last_code = ""  # vowel/y — resets dedupe
+            continue
+        if code == last_code:
+            continue
+        digits.append(code)
+        last_code = code
+        if len(digits) == 3:
+            break
+    return first.upper() + "".join(digits).ljust(3, "0")
+
+
+# Genius uses U+00D7 (×) or ASCII 'x' followed by a digit, optionally
+# parenthesised. "(×4)", "(x4)" are the common shapes.
+_REPEAT_RE = re.compile(r"\(\s*[x×]\s*(\d+)\s*\)", re.IGNORECASE)
+
+
+def _expand_repeat_markers(text: str) -> str:
+    """Expand ``(×N)`` markers: repeat the immediately preceding block
+    (the contiguous run of non-blank lines ending at the marker line)
+    so it appears N times total. Strips the marker."""
+    lines = text.split("\n")
+    out: list[str] = []
+    for line in lines:
+        m = _REPEAT_RE.search(line)
+        if not m:
+            out.append(line)
+            continue
+
+        n = int(m.group(1))
+        # Find the block we're repeating — everything appended since
+        # the last blank line (or the doc start).
+        block_end = len(out)
+        block_start = block_end
+        for k in range(block_end - 1, -1, -1):
+            if out[k].strip() == "":
+                block_start = k + 1
+                break
+            block_start = k
+        block = out[block_start:block_end]
+
+        # Block currently appears once. Add (n - 1) more copies.
+        for _ in range(max(0, n - 1)):
+            out.extend(block)
+
+        # Preserve any text on the marker line beyond the marker itself.
+        remainder = _REPEAT_RE.sub("", line).strip()
+        if remainder:
+            out.append(remainder)
+    return "\n".join(out)
+
+
 def align_lyrics(transcription_segments: list[dict[str, Any]], genius_text: str) -> dict[str, Any]:
     """
     Align authoritative Genius text with Whisper transcription timestamps.
