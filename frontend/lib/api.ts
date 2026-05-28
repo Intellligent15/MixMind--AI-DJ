@@ -158,6 +158,17 @@ export type MixPlan = {
   updated_at: string;
 };
 
+export type VocalSafeRegion = {
+  start: number;
+  end: number;
+  safe: boolean;
+  reason: string;
+};
+
+export type VocalSafeRegionsResponse = {
+  regions: VocalSafeRegion[];
+};
+
 export type QueueRenderStatus = "pending" | "rendering" | "ready" | "failed";
 
 export type QueueRender = {
@@ -202,7 +213,7 @@ export const api = {
   getLyrics: (id: string) =>
     request<any>(`/api/songs/${id}/lyrics`),
   getVocalSafeRegions: (id: string) =>
-    request<{ regions: { start: number; end: number; safe: boolean; reason: string }[] }>(`/api/songs/${id}/vocal_safe_regions`),
+    request<VocalSafeRegionsResponse>(`/api/songs/${id}/vocal_safe_regions`),
 
   getCurrentQueue: () => request<Queue>(`/api/queues/current`),
   createQueue: () => request<Queue>(`/api/queues`, { method: "POST" }),
