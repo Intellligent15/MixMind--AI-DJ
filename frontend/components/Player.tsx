@@ -158,7 +158,8 @@ export function Player() {
   const safeRegionsQuery = useQuery({
     queryKey: ["vocal_safe_regions", current?.id],
     queryFn: () => current ? api.getVocalSafeRegions(current.id) : null,
-    enabled: !!current?.id && (!mixData || mixData.status !== "ready"),
+    // Only useful when we're actually rendering the per-song waveform.
+    enabled: !!current?.id && activeMode === "queue",
     retry: false,
   });
 
