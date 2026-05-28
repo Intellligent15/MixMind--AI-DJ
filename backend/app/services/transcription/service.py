@@ -160,7 +160,8 @@ class TranscriptionService:
         )
         options = dict(WHISPER_OPTIONS)
         if initial_prompt:
-            options["initial_prompt"] = initial_prompt
+            base_prompt = options.get("initial_prompt", "")
+            options["initial_prompt"] = f"{base_prompt}\n\nLyrics:\n{initial_prompt}"
 
         raw = mlx_whisper.transcribe(
             str(vocals_path),

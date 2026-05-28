@@ -29,6 +29,7 @@ def fetch_lyrics_task(self: Any, song_id: uuid.UUID | str) -> str | None:
         if not lyrics:
             lyrics = Lyrics(song_id=song_id)
             db.add(lyrics)
+            db.commit()
             
         if lyrics.fetch_status == LyricsFetchStatus.success:
             logger.info(f"fetch_lyrics: {song_id} already has lyrics, skipping")

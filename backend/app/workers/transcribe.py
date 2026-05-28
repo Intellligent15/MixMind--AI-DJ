@@ -126,12 +126,12 @@ def transcribe_song(song_id: str) -> str | None:
         vocals_key = stems.vocals_path
         video_id = song.youtube_video_id
 
-        from app.models.lyrics import Lyrics
-        lyrics = db.scalar(select(Lyrics).where(Lyrics.song_id == song_uuid))
+        # Removed the 200-word lyrics injection. When condition_on_previous_text=False,
+        # Whisper injects the initial_prompt at the start of *every* 30-second window.
+        # Injecting the first 200 words of the song at minute 4:00 severely degrades
+        # the model's accuracy because the audio contradicts the forced context.
+        # We rely purely on the standard anti-hallucination instruction prompt instead.
         initial_prompt = None
-        if lyrics and lyrics.text:
-            # Take roughly the first 200 words as initial prompt
-            initial_prompt = " ".join(lyrics.text.split()[:200])
 
     # Skip-if-instrumental decision. Threshold lives in settings so the
     # user can tune it without code changes.

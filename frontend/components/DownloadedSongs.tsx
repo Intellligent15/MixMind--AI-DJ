@@ -425,13 +425,13 @@ export function DownloadedSongs() {
                     type="button"
                     onClick={() => separate.mutate(s.id)}
                     disabled={isMidSeparation || separate.isPending}
-                    className="text-sm border rounded px-3 py-1 hover:bg-black/5 dark:hover:bg-white/10 disabled:opacity-50"
+                    className="text-sm border rounded px-3 py-1 hover:bg-black/5 dark:hover:bg-white/10 disabled:opacity-50 whitespace-nowrap"
                   >
                     {isMidSeparation
-                      ? "Separating…"
+                      ? "Separating & Transcribing…"
                       : hasStems
-                        ? "Re-separate stems"
-                        : "Separate stems"}
+                        ? "Re-separate & Transcribe"
+                        : "Separate & Transcribe"}
                   </button>
                 )}
                 {(transcribable || s.status === "transcribing") && (

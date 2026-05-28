@@ -59,51 +59,11 @@ def test_create_queue(db_session: Session):
     assert body["locked_at"] is None
 
 
-def test_create_queue_replaces_prior_queues(db_session: Session):
-    """Phase 8 change: creating a new queue is now destructive — every
-    prior Queue (and its rendered mix) is deleted so the player can
-    transition cleanly from one set to the next without ambiguity
-    about which queue is "current"."""
+def test_create_queue_409_if_unlocked_exists(db_session: Session):
     client = _client(db_session)
-    first = client.post("/api/queues")
-    assert first.status_code == 201
-    first_id = first.json()["id"]
-
-    second = client.post("/api/queues")
-    assert second.status_code == 201
-    second_id = second.json()["id"]
-    assert second_id != first_id
-
-    # The prior queue is gone — /current returns the new one only.
-    current = client.get("/api/queues/current")
-    assert current.status_code == 200
-    assert current.json()["id"] == second_id
-
-
-def test_create_queue_deletes_rendered_mix_file(db_session: Session):
-    """When a prior Queue had a rendered FLAC, create_queue should
-    ask the storage backend to delete it."""
-    from unittest.mock import AsyncMock, patch
-
-    from app.models import QueueRender, QueueRenderStatus
-
-    prior = Queue(locked=True)
-    db_session.add(prior)
-    db_session.flush()
-    db_session.add(QueueRender(
-        queue_id=prior.id,
-        status=QueueRenderStatus.ready,
-        rendered_audio_path="queue_mixes/old.flac",
-    ))
-    db_session.flush()
-
-    client = _client(db_session)
-    storage = AsyncMock()
-    storage.delete = AsyncMock()
-    with patch("app.services.storage.get_storage", return_value=storage):
-        r = client.post("/api/queues")
-    assert r.status_code == 201
-    storage.delete.assert_awaited_once_with("queue_mixes/old.flac")
+    client.post("/api/queues")
+    r = client.post("/api/queues")
+    assert r.status_code == 409
 
 
 def test_get_current_prefers_unlocked(db_session: Session):

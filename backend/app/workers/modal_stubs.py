@@ -218,9 +218,27 @@ def run_transcription(
         kwargs = {
             "word_timestamps": True,
             "verbose": False,
+            "compression_ratio_threshold": 3.0,
+            "logprob_threshold": -1.2,
+            "no_speech_threshold": 0.45,
+            "hallucination_silence_threshold": 1.5,
+            "condition_on_previous_text": False,
+            "temperature": (0.0, 0.2),
+            "language": "en",
+            "best_of": 3,
+            "suppress_tokens": [-1],
+            "suppress_blank": True,
         }
+        
+        base_prompt = (
+            "Transcribe only the sung or spoken vocals. Do not add "
+            "descriptions of music, applause, silence, or instrumental "
+            "sounds."
+        )
         if initial_prompt:
-            kwargs["initial_prompt"] = initial_prompt
+            kwargs["initial_prompt"] = f"{base_prompt}\n\nLyrics:\n{initial_prompt}"
+        else:
+            kwargs["initial_prompt"] = base_prompt
             
         result = model.transcribe(str(local), **kwargs)
 

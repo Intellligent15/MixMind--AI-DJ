@@ -74,22 +74,32 @@ export function WaveformDebug({
   
   useEffect(() => {
     const regionsPlugin = regionsPluginRef.current;
-    if (!regionsPlugin || !safeRegionsQuery.data) return;
+    const ws = wsRef.current;
+    if (!regionsPlugin || !ws || !safeRegionsQuery.data) return;
     
-    // Clear existing
-    regionsPlugin.clearRegions();
-    
-    // Add safe regions
-    safeRegionsQuery.data.regions.forEach((r) => {
-      regionsPlugin.addRegion({
-        start: r.start,
-        end: r.end,
-        content: "Safe",
-        color: "rgba(34, 197, 94, 0.2)",
-        drag: false,
-        resize: false,
+    const renderRegions = () => {
+      regionsPlugin.clearRegions();
+      safeRegionsQuery.data.regions.forEach((r) => {
+        regionsPlugin.addRegion({
+          start: r.start,
+          end: r.end,
+          content: "Safe",
+          color: "rgba(34, 197, 94, 0.2)",
+          drag: false,
+          resize: false,
+        });
       });
-    });
+    };
+
+    if (ws.getDuration() > 0) {
+      renderRegions();
+    } else {
+      ws.once("decode", renderRegions);
+    }
+    
+    return () => {
+      ws.un("decode", renderRegions);
+    };
   }, [safeRegionsQuery.data]);
 
   // Draw beat/downbeat ticks and section bands as an absolutely-positioned

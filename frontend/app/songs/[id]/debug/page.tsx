@@ -112,6 +112,23 @@ export default function SongDebugPage({
       return false;
     },
   });
+  const lyricsQ = useQuery({
+    queryKey: ["lyrics", id],
+    queryFn: async () => {
+      try {
+        return await api.getLyrics(id);
+      } catch (err) {
+        if (isStatusError(err, 404)) return null;
+        throw err;
+      }
+    },
+    retry: false,
+    refetchInterval: (q) => {
+      if (q.state.data?.alignment_status === "success" || q.state.data?.alignment_status === "low_quality") return false;
+      if (transcriptionQ.data) return 1500;
+      return false;
+    },
+  });
 
   // If the page mounts and we land mid-separation or mid-transcription,
   // kick the awaiting flag on automatically.
@@ -301,19 +318,22 @@ export default function SongDebugPage({
                   awaitingStems ||
                   songQ.data.status === "separating"
                 }
-                className="text-sm border rounded px-3 py-1 hover:bg-black/5 dark:hover:bg-white/10 disabled:opacity-50"
+                className="text-sm border rounded px-3 py-1 hover:bg-black/5 dark:hover:bg-white/10 disabled:opacity-50 whitespace-nowrap"
               >
                 {separate.isPending ||
                 awaitingStems ||
                 songQ.data.status === "separating"
-                  ? "Separating…"
-                  : "Separate stems"}
+                  ? "Separating & Transcribing…"
+                  : "Separate & Transcribe"}
               </button>
             </section>
           )}
 
           {transcriptionAvailable && (
-            <TranscriptionDebug transcription={transcriptionQ.data!} />
+            <TranscriptionDebug 
+              transcription={transcriptionQ.data!} 
+              lyrics={lyricsQ.data ?? null} 
+            />
           )}
           {!transcriptionAvailable && stemsAvailable && (
             <section className="flex items-center justify-between border rounded p-3">

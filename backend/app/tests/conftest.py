@@ -59,11 +59,9 @@ def _force_local_storage_for_tests() -> Generator[Path, None, None]:
 # ... CASCADE handles the FKs. queue_items and queues are listed for clarity
 # even though the CASCADE from songs would catch them via queue_items.song_id.
 _TRUNCATE_TABLES = (
-    "queue_renders",
     "mix_plans",
     "queue_items",
     "queues",
-    "lyrics",
     "transcriptions",
     "stems",
     "analyses",

@@ -62,6 +62,7 @@ def create_song(payload: SongCreate, db: Session = Depends(get_db)) -> Song:
     db.commit()
     db.refresh(song)
     download_song.delay(str(song.id))
+    celery_app.send_task("app.workers.fetch_lyrics.fetch_lyrics", args=[str(song.id)])
     return song
 
 
@@ -422,7 +423,10 @@ async def get_song_vocal_safe_regions(
     except Exception:
         raise HTTPException(status_code=500, detail="failed to read vocal envelope")
         
-    aligned_words = lyrics.aligned_words if lyrics else None
+    from app.models.lyrics import LyricsAlignmentStatus
+    aligned_words = None
+    if lyrics and lyrics.alignment_status == LyricsAlignmentStatus.success:
+        aligned_words = lyrics.aligned_words
     
     regions = vocal_safe_regions(
         transcription_segments=transcription.segments,
