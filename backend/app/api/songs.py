@@ -420,8 +420,15 @@ async def get_song_vocal_safe_regions(
     try:
         envelope_data = await storage.read(stems.vocal_envelope_path)
         envelope = json.loads(envelope_data)
-    except Exception:
-        raise HTTPException(status_code=500, detail="failed to read vocal envelope")
+    except Exception as exc:
+        logging.getLogger(__name__).exception(
+            "vocal_safe_regions: failed to read envelope at %s",
+            stems.vocal_envelope_path,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"failed to read vocal envelope: {type(exc).__name__}",
+        )
         
     from app.models.lyrics import LyricsAlignmentStatus
     aligned_words = None
