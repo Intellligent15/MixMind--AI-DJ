@@ -100,7 +100,7 @@ export function WaveformDebug({
     return () => {
       ws.un("decode", renderRegions);
     };
-  }, [safeRegionsQuery.data]);
+  }, [safeRegionsQuery.data, audioUrl]);
 
   // Draw beat/downbeat ticks and section bands as an absolutely-positioned
   // overlay that mirrors the waveform's width. We use the audio duration from
