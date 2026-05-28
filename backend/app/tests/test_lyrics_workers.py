@@ -81,3 +81,64 @@ def test_align_lyrics_marks_whisper_only_for_instrumental(
             Lyrics.song_id == uuid.UUID(instrumental_song)
         ))
         assert row.alignment_status == LyricsAlignmentStatus.whisper_only
+
+
+def test_align_lyrics_marks_error_when_lyrics_never_arrive(monkeypatch):
+    """If the Lyrics row never lands (Genius down / song never matches),
+    we retry a few times and eventually mark alignment_status=error so
+    the UI doesn't show 'pending' forever."""
+    sid = uuid.uuid4()
+    # No Lyrics row, no Song — task should retry then give up.
+    # Force max_retries to 1 for test speed.
+    from app.workers.align_lyrics import align_lyrics_task
+
+    # We can't easily test the .retry() exhaustion path via .apply()
+    # because .apply() runs once and records the Retry exception.
+    # Instead, simulate the "exhausted retries" code path by directly
+    # calling the bound function with a self stub whose .retry() raises
+    # MaxRetriesExceededError immediately.
+    from celery.exceptions import MaxRetriesExceededError
+    from app.workers.align_lyrics import align_lyrics_task as task
+
+    class _FakeSelf:
+        max_retries = 5
+        request = type("R", (), {"retries": 5})()  # already at limit
+
+        def retry(self, *args, **kwargs):
+            raise MaxRetriesExceededError()
+
+    # Seed a Lyrics row with not_attempted and no Song so the path
+    # hits the "no transcription" / "no lyrics" branches with a
+    # retry-exhausted self.
+    with SessionLocal() as db:
+        s = Song(
+            youtube_video_id=f"alg-{uuid.uuid4().hex[:8]}",
+            title="X",
+            duration_seconds=10.0,
+            audio_path="audio/x.wav",
+            status=SongStatus.downloaded,
+        )
+        db.add(s)
+        db.commit()
+        sid = s.id
+        db.add(Lyrics(
+            song_id=sid,
+            fetch_status=LyricsFetchStatus.not_attempted,
+        ))
+        db.commit()
+
+    # Call the underlying function with the fake self. For a bind=True
+    # Celery task, `task.run` is already bound to the real task instance,
+    # so reach through to the raw function to inject our fake self.
+    raw_fn = task.__wrapped__.__func__
+    try:
+        raw_fn(_FakeSelf(), str(sid))
+    except MaxRetriesExceededError:
+        pass
+
+    with SessionLocal() as db:
+        row = db.scalar(select(Lyrics).where(Lyrics.song_id == sid))
+        assert row.alignment_status == LyricsAlignmentStatus.error
+        db.execute(Lyrics.__table__.delete().where(Lyrics.song_id == sid))
+        db.execute(Song.__table__.delete().where(Song.id == sid))
+        db.commit()

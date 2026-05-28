@@ -2,6 +2,7 @@ import logging
 import uuid
 from typing import Any
 
+from celery.exceptions import MaxRetriesExceededError
 from sqlalchemy import select
 
 from app.workers import celery_app
@@ -18,29 +19,64 @@ def align_lyrics_task(self: Any, song_id: uuid.UUID | str) -> str | None:
     if isinstance(song_id, str):
         song_id = uuid.UUID(song_id)
 
+    # Exponential backoff for "row not ready yet" retries — Genius
+    # fetch can take 30-90s on a cold cache; fixed 10s gives up too soon.
+    countdowns = [10, 20, 40, 80, 120]
+    countdown_for_retry = countdowns[min(self.request.retries, len(countdowns) - 1)]
+
+    def _mark_error_and_exit(reason: str) -> str | None:
+        with SessionLocal() as db:
+            row = db.scalar(select(Lyrics).where(Lyrics.song_id == song_id))
+            if row is not None:
+                row.alignment_status = LyricsAlignmentStatus.error
+                db.commit()
+        logger.warning("align_lyrics: %s gave up — %s", song_id, reason)
+        return str(song_id)
+
     with SessionLocal() as db:
         lyrics = db.scalar(select(Lyrics).where(Lyrics.song_id == song_id))
         if not lyrics:
-            # fetch_lyrics probably hasn't created the row yet
-            raise self.retry(countdown=10)
+            try:
+                raise self.retry(countdown=countdown_for_retry)
+            except MaxRetriesExceededError:
+                return _mark_error_and_exit("lyrics row never created")
 
         if lyrics.fetch_status == LyricsFetchStatus.not_attempted:
-            raise self.retry(countdown=10)
-            
+            try:
+                raise self.retry(countdown=countdown_for_retry)
+            except MaxRetriesExceededError:
+                return _mark_error_and_exit("fetch_lyrics never completed")
+
+        if lyrics.fetch_status == LyricsFetchStatus.not_found:
+            # No Genius match exists; alignment isn't possible.
+            logger.info(
+                "align_lyrics: %s has no Genius match; marking whisper_only",
+                song_id,
+            )
+            lyrics.alignment_status = LyricsAlignmentStatus.whisper_only
+            db.commit()
+            return str(song_id)
+
         if lyrics.fetch_status != LyricsFetchStatus.success:
-            logger.info(f"align_lyrics: fetch_status is {lyrics.fetch_status}, skipping alignment")
+            # fetch_status == error — Genius call failed earlier.
+            logger.info(
+                "align_lyrics: %s fetch_status=%s, marking error",
+                song_id, lyrics.fetch_status,
+            )
             lyrics.alignment_status = LyricsAlignmentStatus.error
             db.commit()
             return str(song_id)
 
-        transcription = db.scalar(select(Transcription).where(Transcription.song_id == song_id))
+        transcription = db.scalar(
+            select(Transcription).where(Transcription.song_id == song_id)
+        )
         if not transcription:
-            logger.info(f"align_lyrics: no transcription for {song_id}")
-            return str(song_id)
-            
+            try:
+                raise self.retry(countdown=countdown_for_retry)
+            except MaxRetriesExceededError:
+                return _mark_error_and_exit("transcription never created")
+
         if transcription.status == TranscriptionStatus.skipped_instrumental:
-            # No vocals to align — surface this as a non-error state
-            # so the UI doesn't show a misleading "alignment failed".
             logger.info(
                 "align_lyrics: %s is instrumental; marking whisper_only",
                 song_id,
@@ -50,14 +86,18 @@ def align_lyrics_task(self: Any, song_id: uuid.UUID | str) -> str | None:
             return str(song_id)
         if transcription.status != TranscriptionStatus.success:
             logger.info(
-                "align_lyrics: %s transcription status is %s, marking error",
+                "align_lyrics: %s transcription=%s, marking error",
                 song_id, transcription.status,
             )
             lyrics.alignment_status = LyricsAlignmentStatus.error
             db.commit()
             return str(song_id)
 
-        if lyrics.alignment_status in (LyricsAlignmentStatus.success, LyricsAlignmentStatus.low_quality):
+        if lyrics.alignment_status in (
+            LyricsAlignmentStatus.success,
+            LyricsAlignmentStatus.low_quality,
+            LyricsAlignmentStatus.whisper_only,
+        ):
             return str(song_id)
 
         try:
@@ -65,12 +105,18 @@ def align_lyrics_task(self: Any, song_id: uuid.UUID | str) -> str | None:
             lyrics.aligned_words = result["aligned_words"]
             lyrics.alignment_quality = result["alignment_quality"]
             lyrics.alignment_status = result["alignment_status"]
-            logger.info(f"align_lyrics: {song_id} aligned with quality {lyrics.alignment_quality:.2f}")
-        except Exception as e:
-            logger.error(f"align_lyrics: error for {song_id}: {e}", exc_info=True)
+            logger.info(
+                "align_lyrics: %s aligned, quality=%.2f",
+                song_id, lyrics.alignment_quality,
+            )
+        except Exception as exc:
+            logger.exception("align_lyrics: %s aligner raised", song_id)
             lyrics.alignment_status = LyricsAlignmentStatus.error
             db.commit()
-            raise self.retry(exc=e, countdown=30)
+            try:
+                raise self.retry(exc=exc, countdown=30)
+            except MaxRetriesExceededError:
+                return _mark_error_and_exit(f"aligner kept raising: {exc}")
 
         db.commit()
 
