@@ -195,7 +195,6 @@ def run_transcription(
     s3_access_key: str,
     s3_secret: str,
     s3_region: str,
-    initial_prompt: str | None = None,
 ) -> dict:
     """Whisper large-v3 transcription of the vocal stem. Mirrors the
     shape of TranscriptionService.transcribe(): per-segment text + word-
@@ -224,22 +223,18 @@ def run_transcription(
             "hallucination_silence_threshold": 1.5,
             "condition_on_previous_text": False,
             "temperature": (0.0, 0.2),
-            "language": "en",
+            # No language= — let Whisper auto-detect to match the local path.
             "best_of": 3,
             "suppress_tokens": [-1],
             "suppress_blank": True,
         }
         
-        base_prompt = (
+        kwargs["initial_prompt"] = (
             "Transcribe only the sung or spoken vocals. Do not add "
             "descriptions of music, applause, silence, or instrumental "
             "sounds."
         )
-        if initial_prompt:
-            kwargs["initial_prompt"] = f"{base_prompt}\n\nLyrics:\n{initial_prompt}"
-        else:
-            kwargs["initial_prompt"] = base_prompt
-            
+
         result = model.transcribe(str(local), **kwargs)
 
         segments = []
