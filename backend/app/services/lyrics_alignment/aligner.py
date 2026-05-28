@@ -101,7 +101,11 @@ def align_lyrics(transcription_segments: list[dict[str, Any]], genius_text: str)
 
     # Split genius lyrics into words
     # Remove bracketed section headers like [Chorus]
+    # NEW: strip section headers, then expand (×N) chorus markers
+    # before tokenising. Order matters — markers like (×3) sit on
+    # their own lines and must be visible to _expand_repeat_markers.
     clean_text = re.sub(r"\[.*?\]", "", genius_text)
+    clean_text = _expand_repeat_markers(clean_text)
     genius_words = [w for w in re.split(r"\s+", clean_text) if w]
     genius_clean = [_clean_word(w) for w in genius_words]
 
@@ -139,13 +143,21 @@ def align_lyrics(transcription_segments: list[dict[str, Any]], genius_text: str)
                 j = j1 + idx
                 if j < j2:
                     w = whisper_words[j]
-                    sim = difflib.SequenceMatcher(None, genius_clean[i], w["clean"]).ratio()
+                    g_phon = _soundex(genius_clean[i])
+                    w_phon = _soundex(w["clean"])
+                    # Phonetic match → trustworthy timing despite wrong
+                    # word ("there"/"their"). Non-phonetic → likely
+                    # pairing two unrelated words; low conf.
+                    phonetic_hit = bool(g_phon) and g_phon == w_phon
+                    sub_factor = 0.7 if phonetic_hit else 0.4
                     aligned.append({
                         "word": genius_words[i],
                         "start": w["start"],
                         "end": w["end"],
-                        "confidence": w["probability"] * sim,
+                        "confidence": w["probability"] * sub_factor,
                         "source": "whisper_substitution",
+                        # Internal bookkeeping — stripped before return.
+                        "_phonetic_hit": phonetic_hit,
                     })
                 else:
                     aligned.append({
@@ -211,6 +223,9 @@ def align_lyrics(transcription_segments: list[dict[str, Any]], genius_text: str)
     status = LyricsAlignmentStatus.success
     if quality < 0.3:
         status = LyricsAlignmentStatus.low_quality
+
+    for a in aligned:
+        a.pop("_phonetic_hit", None)
 
     return {
         "aligned_words": aligned,

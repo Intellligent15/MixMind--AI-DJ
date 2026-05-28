@@ -55,3 +55,55 @@ def test_expand_repeat_marker_no_repeats_when_absent():
     text = "Just a verse\nNo marker here"
     out = _expand_repeat_markers(text)
     assert out == text
+
+
+def _whisper(words: list[tuple[str, float, float, float]], avg_logprob: float = -0.2) -> list[dict]:
+    return [{
+        "start": words[0][1] if words else 0.0,
+        "end": words[-1][2] if words else 0.0,
+        "text": " ".join(w[0] for w in words),
+        "avg_logprob": avg_logprob,
+        "no_speech_prob": 0.01,
+        "compression_ratio": 1.5,
+        "temperature": 0.0,
+        "words": [
+            {"word": w, "start": s, "end": e, "probability": p}
+            for (w, s, e, p) in words
+        ],
+    }]
+
+
+def test_align_expands_repeated_chorus_marker():
+    # Whisper transcribes the chorus 3×; Genius lists it once with "(×3)".
+    segs = _whisper([
+        ("Hey", 0.0, 0.5, 0.95), ("now", 0.5, 1.0, 0.95),
+        ("Hey", 2.0, 2.5, 0.95), ("now", 2.5, 3.0, 0.95),
+        ("Hey", 4.0, 4.5, 0.95), ("now", 4.5, 5.0, 0.95),
+    ])
+    out = align_lyrics(segs, "Hey now\n(×3)")
+    aligned = out["aligned_words"]
+    assert len(aligned) == 6
+    assert sum(1 for a in aligned if a["source"] == "whisper_match") == 6
+    assert aligned[0]["start"] == 0.0
+    assert aligned[-1]["end"] == 5.0
+
+
+def test_align_phonetic_substitution_high_confidence():
+    # "there" vs "their" — same Soundex (T600). Substitution with
+    # elevated confidence because phonetics match.
+    segs = _whisper([("there", 1.0, 1.3, 0.9)])
+    out = align_lyrics(segs, "their")
+    a = out["aligned_words"][0]
+    assert a["source"] == "whisper_substitution"
+    # Phonetic substitution factor = 0.7; raw prob 0.9 → 0.63
+    assert a["confidence"] > 0.5
+
+
+def test_align_nonphonetic_substitution_lower_confidence():
+    # "flame" vs "name" — completely different phonetics, low conf.
+    segs = _whisper([("flame", 0.7, 1.0, 0.9)])
+    out = align_lyrics(segs, "name")
+    a = out["aligned_words"][0]
+    assert a["source"] == "whisper_substitution"
+    # Non-phonetic factor 0.4 → 0.36; well below the phonetic case.
+    assert a["confidence"] < 0.5
