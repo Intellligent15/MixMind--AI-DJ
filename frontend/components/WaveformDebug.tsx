@@ -4,7 +4,6 @@ import { useEffect, useRef } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { api, type Analysis, type Song } from "@/lib/api";
 import WaveSurfer from "wavesurfer.js";
-import RegionsPlugin from "wavesurfer.js/dist/plugins/regions.esm.js";
 
 const SECTION_COLORS = [
   "rgba(56, 189, 248, 0.25)",
@@ -37,7 +36,6 @@ export function WaveformDebug({
   const containerRef = useRef<HTMLDivElement | null>(null);
   const overlayRef = useRef<HTMLDivElement | null>(null);
   const wsRef = useRef<WaveSurfer | null>(null);
-  const regionsPluginRef = useRef<RegionsPlugin | null>(null);
 
   const safeRegionsQuery = useQuery({
     queryKey: ["vocal_safe_regions", song.id],
@@ -47,10 +45,7 @@ export function WaveformDebug({
 
   useEffect(() => {
     if (!containerRef.current) return;
-    
-    const regions = RegionsPlugin.create();
-    regionsPluginRef.current = regions;
-    
+
     const ws = WaveSurfer.create({
       container: containerRef.current,
       waveColor: "#94a3b8",
@@ -61,46 +56,14 @@ export function WaveformDebug({
       barGap: 1,
       barHeight: 0.6,
       url: audioUrl,
-      plugins: [regions],
     });
     wsRef.current = ws;
-    
+
     return () => {
       ws.destroy();
       wsRef.current = null;
-      regionsPluginRef.current = null;
     };
   }, [audioUrl]);
-  
-  useEffect(() => {
-    const regionsPlugin = regionsPluginRef.current;
-    const ws = wsRef.current;
-    if (!regionsPlugin || !ws || !safeRegionsQuery.data) return;
-    
-    const renderRegions = () => {
-      regionsPlugin.clearRegions();
-      safeRegionsQuery.data.regions.forEach((r) => {
-        regionsPlugin.addRegion({
-          start: r.start,
-          end: r.end,
-          content: "Safe",
-          color: "rgba(34, 197, 94, 0.2)",
-          drag: false,
-          resize: false,
-        });
-      });
-    };
-
-    if (ws.getDuration() > 0) {
-      renderRegions();
-    } else {
-      ws.once("decode", renderRegions);
-    }
-    
-    return () => {
-      ws.un("decode", renderRegions);
-    };
-  }, [safeRegionsQuery.data]);
 
   // Draw beat/downbeat ticks and section bands as an absolutely-positioned
   // overlay that mirrors the waveform's width. We use the audio duration from
@@ -115,12 +78,32 @@ export function WaveformDebug({
 
   return (
     <div className="flex flex-col gap-2">
+      {safeRegionsQuery.isError && (
+        <p className="text-xs text-amber-700 dark:text-amber-400">
+          Safe regions unavailable yet (stems / transcription / envelope
+          pending).
+        </p>
+      )}
       <div className="relative">
         <div ref={containerRef} />
         <div
           ref={overlayRef}
           className="absolute inset-0 pointer-events-none"
         >
+          {(safeRegionsQuery.data?.regions ?? []).map((r, i) => (
+            <div
+              key={`safe-${i}`}
+              className="absolute top-0 bottom-0"
+              style={{
+                left: `${(r.start / duration) * 100}%`,
+                width: `${((r.end - r.start) / duration) * 100}%`,
+                background: "rgba(34, 197, 94, 0.18)",
+                borderLeft: "1px dashed rgba(22, 163, 74, 0.5)",
+                borderRight: "1px dashed rgba(22, 163, 74, 0.5)",
+              }}
+              title={`Safe: ${r.start.toFixed(1)}s–${r.end.toFixed(1)}s`}
+            />
+          ))}
           {analysis.sections.map((sec, i) => (
             <div
               key={`sec-${i}`}

@@ -2,6 +2,27 @@
 
 import type { Transcription } from "@/lib/api";
 
+type AlignedWord = {
+  word: string;
+  start: number | null;
+  end: number | null;
+  confidence: number | null;
+  source: "whisper_match" | "whisper_substitution" | "interpolated";
+};
+
+export type LyricsView = {
+  text: string | null;
+  fetch_status: string;
+  aligned_words: AlignedWord[] | null;
+  alignment_status:
+    | "not_attempted"
+    | "success"
+    | "whisper_only"
+    | "low_quality"
+    | "error";
+  alignment_quality: number | null;
+};
+
 function fmt(seconds: number): string {
   const m = Math.floor(seconds / 60);
   const s = (seconds - m * 60).toFixed(2);
@@ -26,7 +47,7 @@ export function TranscriptionDebug({
   lyrics,
 }: {
   transcription: Transcription;
-  lyrics?: any;
+  lyrics?: LyricsView | null;
 }) {
   const isSkipped = transcription.status === "skipped_instrumental";
   const isError = transcription.status === "error";
@@ -61,12 +82,20 @@ export function TranscriptionDebug({
         </div>
       </header>
 
-      <dl className="grid grid-cols-2 md:grid-cols-4 gap-2 text-xs">
+      <dl className="grid grid-cols-2 md:grid-cols-5 gap-2 text-xs">
         <Stat label="Model" value={transcription.model_name} />
         <Stat label="Language" value={transcription.language ?? "—"} />
         <Stat
           label="Segments"
           value={transcription.segments.length.toString()}
+        />
+        <Stat
+          label="Vocal RMS"
+          value={
+            transcription.vocal_rms_observed != null
+              ? transcription.vocal_rms_observed.toFixed(4)
+              : "—"
+          }
         />
         <Stat
           label="Alignment Q"
@@ -96,16 +125,20 @@ export function TranscriptionDebug({
       {lyrics?.aligned_words && lyrics.aligned_words.length > 0 ? (
         <ul className="max-h-72 overflow-y-auto flex flex-col gap-2 text-xs">
           {(() => {
-            const lines: { start: number; end: number; words: any[] }[] = [];
-            let currentLine: { start: number; end: number; words: any[] } | null = null;
-            
-            lyrics.aligned_words.forEach((w: any) => {
+            type Line = { start: number | null; end: number | null; words: AlignedWord[] };
+            const lines: Line[] = [];
+            let currentLine: Line | null = null;
+
+            lyrics.aligned_words.forEach((w: AlignedWord) => {
               if (!currentLine) {
                 currentLine = { start: w.start, end: w.end, words: [w] };
                 lines.push(currentLine);
               } else {
-                const gap = (w.start ?? 0) - (currentLine.words[currentLine.words.length - 1].end ?? 0);
-                if (gap > 0.5 || currentLine.words.length >= 15) {
+                const lastWord = currentLine.words[currentLine.words.length - 1];
+                const gap = (w.start ?? 0) - (lastWord.end ?? 0);
+                const longGap = gap > 1.0;
+                const veryLong = currentLine.words.length >= 24;
+                if (longGap || veryLong) {
                   currentLine = { start: w.start, end: w.end, words: [w] };
                   lines.push(currentLine);
                 } else {
@@ -124,8 +157,13 @@ export function TranscriptionDebug({
                   {line.start != null ? fmt(line.start) : "--"} → {line.end != null ? fmt(line.end) : "--"}
                 </span>
                 <span className="flex-1 flex flex-wrap gap-1">
-                  {line.words.map((w, j) => {
-                    const isLowConf = w.confidence != null && w.confidence < 0.5;
+                  {line.words.map((w: AlignedWord, j: number) => {
+                    // Phonetic substitutions land around 0.6 even when
+                    // Whisper was confident; only flag genuinely
+                    // unreliable words (non-phonetic subs / interpolated).
+                    const isLowConf =
+                      w.source === "interpolated" ||
+                      (w.confidence != null && w.confidence < 0.35);
                     return (
                       <span 
                         key={j} 

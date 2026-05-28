@@ -158,11 +158,23 @@ export function Player() {
   const safeRegionsQuery = useQuery({
     queryKey: ["vocal_safe_regions", current?.id],
     queryFn: () => current ? api.getVocalSafeRegions(current.id) : null,
-    enabled: !!current?.id && (!mixData || mixData.status !== "ready"),
+    // Only useful when we're actually rendering the per-song waveform.
+    enabled: !!current?.id && activeMode === "queue",
     retry: false,
   });
 
-  const regionsPluginRef = useRef<any>(null);
+  type RegionsPluginInstance = {
+    clearRegions: () => void;
+    addRegion: (opts: {
+      start: number;
+      end: number;
+      content?: string;
+      color?: string;
+      drag?: boolean;
+      resize?: boolean;
+    }) => void;
+  };
+  const regionsPluginRef = useRef<RegionsPluginInstance | null>(null);
 
   // WaveSurfer setup
   useEffect(() => {
@@ -201,9 +213,6 @@ export function Player() {
       localWs = ws;
       wsRef.current = ws;
 
-      // Plot regions immediately if the API query had already resolved
-      plotRegions();
-
       ws.on("ready", () => {
         setDuration(ws.getDuration());
         ws.play().then(
@@ -236,20 +245,24 @@ export function Player() {
 
   const plotRegions = useCallback(() => {
     const regionsPlugin = regionsPluginRef.current;
-    if (!regionsPlugin || !safeRegionsQuery.data) return;
-    
+    if (!regionsPlugin) return;
+    // Always clear first — covers the "flipped to mix mode" case
+    // where stale per-song regions would otherwise persist.
     regionsPlugin.clearRegions();
-    safeRegionsQuery.data.regions.forEach((r: any) => {
+    if (activeMode !== "queue") return;
+    if (!safeRegionsQuery.data) return;
+    safeRegionsQuery.data.regions.forEach((r) => {
       regionsPlugin.addRegion({
         start: r.start,
         end: r.end,
-        content: "Safe",
+        // Drop the noisy "Safe" label — visual band is enough.
+        content: "",
         color: "rgba(34, 197, 94, 0.2)",
         drag: false,
         resize: false,
       });
     });
-  }, [safeRegionsQuery.data]);
+  }, [safeRegionsQuery.data, activeMode]);
 
   useEffect(() => {
     plotRegions();
