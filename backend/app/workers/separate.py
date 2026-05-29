@@ -10,7 +10,7 @@ from app.core.config import settings
 from app.core.db import SessionLocal
 from app.models import Song, SongStatus, Stems, StemsStatus, Transcription
 from app.services.storage import get_storage
-from app.workers import celery_app
+from app.workers import PRI_TRANSCRIBE, celery_app
 
 logger = logging.getLogger(__name__)
 
@@ -197,17 +197,18 @@ def separate_stems(song_id: str) -> str | None:
         # until Phase 6 lands transcription and Phase 7+ lands `ready`.
         song.status = SongStatus.analyzed
         db.commit()
+        wants_pipeline = bool(song.pipeline_requested)
 
-    # Auto-chain into transcription. The vocal stem has just changed
-    # (Demucs is non-deterministic), so any previous transcription is
-    # stale; we deleted it above. Dispatch via send_task by name so this
-    # module doesn't need to import the transcribe worker (which would
-    # pull in mlx-whisper on environments that don't have it).
-    # transcribe_song's atomic claim makes a duplicate dispatch a no-op,
-    # so it's safe for both the first-separation chain and re-separation.
-    celery_app.send_task(
-        "app.workers.transcribe.transcribe_song",
-        args=[str(song_uuid)],
-    )
+    # Auto-chain into transcription IFF the user wants the full pipeline.
+    # Dispatch via send_task by name so this module doesn't need to import
+    # the transcribe worker (which pulls in mlx-whisper on environments
+    # that don't have it). transcribe_song's atomic claim makes duplicate
+    # dispatch a no-op.
+    if wants_pipeline:
+        celery_app.send_task(
+            "app.workers.transcribe.transcribe_song",
+            args=[str(song_uuid)],
+            priority=PRI_TRANSCRIBE,
+        )
 
     return str(song_uuid)

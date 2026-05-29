@@ -242,3 +242,54 @@ def test_separate_stems_replaces_existing_stems_row(
         assert rows[0].vocal_rms == pytest.approx(0.12)
         # New paths use the actual video id, not "old".
         assert "/old/" not in (rows[0].vocals_path or "")
+
+
+def test_separate_dispatches_transcribe_when_pipeline_requested(
+    analyzed_song: str,
+):
+    sid = uuid.UUID(analyzed_song)
+    with SessionLocal() as db:
+        song = db.get(Song, sid)
+        song.pipeline_requested = True
+        db.commit()
+
+    storage = AsyncMock()
+    service = _patch_service_returning(_fake_result())
+
+    with (
+        patch("app.workers.separate.get_storage", return_value=storage),
+        patch(
+            "app.workers.separate.StemSeparationService", return_value=service
+        ),
+        patch("app.workers.separate.celery_app.send_task") as send_mock,
+    ):
+        from app.workers import PRI_TRANSCRIBE
+        from app.workers.separate import separate_stems
+
+        separate_stems(analyzed_song)
+
+    send_mock.assert_called_once_with(
+        "app.workers.transcribe.transcribe_song",
+        args=[analyzed_song],
+        priority=PRI_TRANSCRIBE,
+    )
+
+
+def test_separate_does_not_dispatch_transcribe_when_pipeline_not_requested(
+    analyzed_song: str,
+):
+    storage = AsyncMock()
+    service = _patch_service_returning(_fake_result())
+
+    with (
+        patch("app.workers.separate.get_storage", return_value=storage),
+        patch(
+            "app.workers.separate.StemSeparationService", return_value=service
+        ),
+        patch("app.workers.separate.celery_app.send_task") as send_mock,
+    ):
+        from app.workers.separate import separate_stems
+
+        separate_stems(analyzed_song)
+
+    send_mock.assert_not_called()
