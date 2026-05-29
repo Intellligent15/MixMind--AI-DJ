@@ -9,7 +9,8 @@ from app.core.db import SessionLocal
 from app.models import Song, SongStatus
 from app.services.storage import get_storage
 from app.services.youtube import YouTubeService
-from app.workers import celery_app
+from app.workers import PRI_ANALYZE, celery_app
+from app.workers.analyze import analyze_song
 
 logger = logging.getLogger(__name__)
 
@@ -92,5 +93,13 @@ def download_song(song_id: str) -> str | None:
         song.audio_path = key
         song.status = SongStatus.downloaded
         db.commit()
+        wants_pipeline = bool(song.pipeline_requested)
+
+    # Auto-chain into analyze IFF the user signaled they want downstream
+    # processing — by locking a queue with this song or by hitting one
+    # of the manual /analyze /separate /transcribe endpoints. Library-
+    # added songs that nobody queued stop here.
+    if wants_pipeline:
+        analyze_song.apply_async(args=[song_id], priority=PRI_ANALYZE)
 
     return key

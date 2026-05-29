@@ -137,6 +137,71 @@ def test_download_song_skips_if_already_downloading(song_id: str):
         assert row.status == SongStatus.downloading
 
 
+def test_download_dispatches_analyze_when_pipeline_requested(
+    song_id: str, tmp_path: Path
+):
+    """Auto-chain: with pipeline_requested=True, a successful download
+    enqueues analyze_song at PRI_ANALYZE so it cuts ahead of other
+    songs' downloads on the priority queue."""
+    import uuid as _uuid
+
+    with SessionLocal() as db:
+        row = db.get(Song, _uuid.UUID(song_id))
+        assert row is not None
+        row.pipeline_requested = True
+        db.commit()
+
+    storage = AsyncMock()
+    storage.path.return_value = tmp_path / "audio" / "out.wav"
+    yt = MagicMock()
+
+    def fake_download(video_id, dest_path):
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
+        dest_path.write_bytes(b"RIFFwave")
+
+    yt.download.side_effect = fake_download
+
+    with (
+        patch("app.workers.download.get_storage", return_value=storage),
+        patch("app.workers.download.YouTubeService", return_value=yt),
+        patch("app.workers.download.analyze_song") as analyze_mock,
+    ):
+        from app.workers import PRI_ANALYZE
+        from app.workers.download import download_song
+
+        download_song(song_id)
+
+    analyze_mock.apply_async.assert_called_once_with(
+        args=[song_id], priority=PRI_ANALYZE
+    )
+
+
+def test_download_does_not_dispatch_analyze_when_pipeline_not_requested(
+    song_id: str, tmp_path: Path
+):
+    """Library-added song (pipeline_requested=False) stops at downloaded."""
+    storage = AsyncMock()
+    storage.path.return_value = tmp_path / "audio" / "out.wav"
+    yt = MagicMock()
+
+    def fake_download(video_id, dest_path):
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
+        dest_path.write_bytes(b"RIFFwave")
+
+    yt.download.side_effect = fake_download
+
+    with (
+        patch("app.workers.download.get_storage", return_value=storage),
+        patch("app.workers.download.YouTubeService", return_value=yt),
+        patch("app.workers.download.analyze_song") as analyze_mock,
+    ):
+        from app.workers.download import download_song
+
+        download_song(song_id)
+
+    analyze_mock.apply_async.assert_not_called()
+
+
 def test_download_song_skips_if_already_downloaded(song_id: str):
     """Re-dispatch after success is a no-op (no re-download)."""
     import uuid as _uuid
