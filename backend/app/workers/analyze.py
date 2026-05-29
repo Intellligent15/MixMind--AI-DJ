@@ -9,7 +9,8 @@ from app.core.db import SessionLocal
 from app.models import Analysis, Song, SongStatus
 from app.services.analysis.service import AnalysisService
 from app.services.storage import get_storage
-from app.workers import celery_app
+from app.workers import PRI_SEPARATE, celery_app
+from app.workers.separate import separate_stems
 
 logger = logging.getLogger(__name__)
 
@@ -107,5 +108,9 @@ def analyze_song(song_id: str) -> str | None:
         assert song is not None
         song.status = SongStatus.analyzed
         db.commit()
+        wants_pipeline = bool(song.pipeline_requested)
+
+    if wants_pipeline:
+        separate_stems.apply_async(args=[str(song_uuid)], priority=PRI_SEPARATE)
 
     return str(song_uuid)

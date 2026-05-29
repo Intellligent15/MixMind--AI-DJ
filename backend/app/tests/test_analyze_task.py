@@ -178,6 +178,55 @@ def test_analyze_song_skips_if_already_analyzing(downloaded_song: str):
         assert row.status == SongStatus.analyzing
 
 
+def test_analyze_dispatches_separate_when_pipeline_requested(
+    downloaded_song: str, tmp_path: Path
+):
+    sid = uuid.UUID(downloaded_song)
+    with SessionLocal() as db:
+        song = db.get(Song, sid)
+        song.pipeline_requested = True
+        db.commit()
+
+    storage = AsyncMock()
+    storage.path.return_value = tmp_path / "fake.wav"
+    service = MagicMock()
+    service.analyze.return_value = _fake_result()
+
+    with (
+        patch("app.workers.analyze.get_storage", return_value=storage),
+        patch("app.workers.analyze.AnalysisService", return_value=service),
+        patch("app.workers.analyze.separate_stems") as separate_mock,
+    ):
+        from app.workers import PRI_SEPARATE
+        from app.workers.analyze import analyze_song
+
+        analyze_song(downloaded_song)
+
+    separate_mock.apply_async.assert_called_once_with(
+        args=[downloaded_song], priority=PRI_SEPARATE
+    )
+
+
+def test_analyze_does_not_dispatch_separate_when_pipeline_not_requested(
+    downloaded_song: str, tmp_path: Path
+):
+    storage = AsyncMock()
+    storage.path.return_value = tmp_path / "fake.wav"
+    service = MagicMock()
+    service.analyze.return_value = _fake_result()
+
+    with (
+        patch("app.workers.analyze.get_storage", return_value=storage),
+        patch("app.workers.analyze.AnalysisService", return_value=service),
+        patch("app.workers.analyze.separate_stems") as separate_mock,
+    ):
+        from app.workers.analyze import analyze_song
+
+        analyze_song(downloaded_song)
+
+    separate_mock.apply_async.assert_not_called()
+
+
 def test_analyze_song_replaces_existing_analysis(downloaded_song: str, tmp_path: Path):
     sid = uuid.UUID(downloaded_song)
     with SessionLocal() as db:
