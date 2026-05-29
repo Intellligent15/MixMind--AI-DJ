@@ -33,6 +33,8 @@ export type Song = {
   status: SongStatus;
   created_at: string;
   updated_at: string;
+  has_stems: boolean;
+  has_transcription: boolean;
 };
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {

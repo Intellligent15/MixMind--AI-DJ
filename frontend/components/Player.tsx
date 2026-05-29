@@ -11,6 +11,7 @@ import {
   type Song,
   type SongStatus,
 } from "@/lib/api";
+import { displayStatus } from "@/lib/song-status";
 
 const PLAYABLE_STATUSES: ReadonlyArray<SongStatus> = [
   "downloaded",
@@ -155,27 +156,6 @@ export function Player() {
 
   const currentPlayable = current ? isPlayable(current) : false;
 
-  const safeRegionsQuery = useQuery({
-    queryKey: ["vocal_safe_regions", current?.id],
-    queryFn: () => current ? api.getVocalSafeRegions(current.id) : null,
-    // Only useful when we're actually rendering the per-song waveform.
-    enabled: !!current?.id && activeMode === "queue",
-    retry: false,
-  });
-
-  type RegionsPluginInstance = {
-    clearRegions: () => void;
-    addRegion: (opts: {
-      start: number;
-      end: number;
-      content?: string;
-      color?: string;
-      drag?: boolean;
-      resize?: boolean;
-    }) => void;
-  };
-  const regionsPluginRef = useRef<RegionsPluginInstance | null>(null);
-
   // WaveSurfer setup
   useEffect(() => {
     if (!waveContainerRef.current) return;
@@ -190,83 +170,41 @@ export function Player() {
       ? api.queueMixAudioUrl(queueQuery.data.id)
       : api.audioUrl(current!.id);
 
-    let isCancelled = false;
-    let localWs: WaveSurfer | null = null;
+    const ws = WaveSurfer.create({
+      container: waveContainerRef.current,
+      waveColor: "#94a3b8",
+      progressColor: "#0ea5e9",
+      cursorColor: "#0ea5e9",
+      height: 72,
+      barWidth: 1,
+      barGap: 1,
+      barHeight: 0.6,
+      url: audioUrl,
+    });
+    wsRef.current = ws;
 
-    import("wavesurfer.js/dist/plugins/regions.esm.js").then(({ default: RegionsPlugin }) => {
-      if (isCancelled || !waveContainerRef.current) return;
-      const regions = RegionsPlugin.create();
-      regionsPluginRef.current = regions;
-      
-      const ws = WaveSurfer.create({
-        container: waveContainerRef.current,
-        waveColor: "#94a3b8",
-        progressColor: "#0ea5e9",
-        cursorColor: "#0ea5e9",
-        height: 72,
-        barWidth: 1,
-        barGap: 1,
-        barHeight: 0.6,
-        url: audioUrl,
-        plugins: [regions],
-      });
-      localWs = ws;
-      wsRef.current = ws;
-
-      ws.on("ready", () => {
-        setDuration(ws.getDuration());
-        ws.play().then(
-          () => setAutoplayBlocked(false),
-          () => setAutoplayBlocked(true),
-        );
-      });
-      ws.on("play", () => {
-        setIsPlaying(true);
-        setAutoplayBlocked(false);
-      });
-      ws.on("pause", () => setIsPlaying(false));
-      ws.on("timeupdate", (t: number) => setPosition(t));
-      ws.on("finish", () => {
-        if (activeMode !== "mix") advanceRef.current();
-      });
+    ws.on("ready", () => {
+      setDuration(ws.getDuration());
+      ws.play().then(
+        () => setAutoplayBlocked(false),
+        () => setAutoplayBlocked(true),
+      );
+    });
+    ws.on("play", () => {
+      setIsPlaying(true);
+      setAutoplayBlocked(false);
+    });
+    ws.on("pause", () => setIsPlaying(false));
+    ws.on("timeupdate", (t: number) => setPosition(t));
+    ws.on("finish", () => {
+      if (activeMode !== "mix") advanceRef.current();
     });
 
     return () => {
-      isCancelled = true;
-      if (localWs) {
-        localWs.destroy();
-      } else if (wsRef.current) {
-        wsRef.current.destroy();
-      }
+      ws.destroy();
       wsRef.current = null;
-      regionsPluginRef.current = null;
     };
   }, [currentIdx, current?.id, currentPlayable, activeMode, queueQuery.data?.id]);
-
-  const plotRegions = useCallback(() => {
-    const regionsPlugin = regionsPluginRef.current;
-    if (!regionsPlugin) return;
-    // Always clear first — covers the "flipped to mix mode" case
-    // where stale per-song regions would otherwise persist.
-    regionsPlugin.clearRegions();
-    if (activeMode !== "queue") return;
-    if (!safeRegionsQuery.data) return;
-    safeRegionsQuery.data.regions.forEach((r) => {
-      regionsPlugin.addRegion({
-        start: r.start,
-        end: r.end,
-        // Drop the noisy "Safe" label — visual band is enough.
-        content: "",
-        color: "rgba(34, 197, 94, 0.2)",
-        drag: false,
-        resize: false,
-      });
-    });
-  }, [safeRegionsQuery.data, activeMode]);
-
-  useEffect(() => {
-    plotRegions();
-  }, [plotRegions]);
 
   const togglePlay = useCallback(() => {
     const ws = wsRef.current;
@@ -382,7 +320,7 @@ export function Player() {
             <p className="text-xs opacity-60">Now playing · {currentIdx + 1}/{songs.length}</p>
             <p className="font-semibold truncate text-lg">{current.title}</p>
             <p className="text-sm opacity-70 truncate">{current.artist ?? "—"}</p>
-            <p className="text-xs opacity-60 mt-1">status: {current.status}</p>
+            <p className="text-xs opacity-60 mt-1">status: {displayStatus(current)}</p>
           </div>
         </section>
       )}
@@ -436,7 +374,7 @@ export function Player() {
           <div className="flex-1 min-w-0">
             <p className="font-medium truncate">{upcoming.title}</p>
             <p className="text-xs opacity-70 truncate">
-              {upcoming.artist ?? "—"} · {upcoming.status}
+              {upcoming.artist ?? "—"} · {displayStatus(upcoming)}
             </p>
           </div>
         </section>
@@ -455,7 +393,7 @@ export function Player() {
             >
               <span className="w-6 tabular-nums">{i + 1}</span>
               <span className="flex-1 truncate">{s.title}</span>
-              <span className="text-xs opacity-60">{s.status}</span>
+              <span className="text-xs opacity-60">{displayStatus(s)}</span>
             </li>
           ))}
         </ul>

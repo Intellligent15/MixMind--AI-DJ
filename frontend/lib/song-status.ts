@@ -64,3 +64,35 @@ export function maySoonHaveTranscription(song: Song): boolean {
     song.status === "ready"
   );
 }
+
+export type DisplayStatus = SongStatus | "separated" | "transcribed";
+
+/**
+ * Status to *display* in the UI. The worker bounces `Song.status` back
+ * to `analyzed` after separate (and `ready` after transcribe) even
+ * though the Stems / Transcription rows have landed — so the raw enum
+ * understates progress. Promote it based on what rows actually exist.
+ *
+ * Library + Player share this so the same song shows the same badge in
+ * both places.
+ */
+export function displayStatus(
+  song: Song,
+  opts?: { pendingStems?: boolean; pendingTranscription?: boolean },
+): DisplayStatus {
+  if (opts?.pendingTranscription) return "transcribing";
+  if (opts?.pendingStems) return "separating";
+  if (
+    song.has_transcription &&
+    (song.status === "analyzed" || song.status === "ready")
+  ) {
+    return "transcribed";
+  }
+  if (
+    song.has_stems &&
+    (song.status === "analyzed" || song.status === "ready")
+  ) {
+    return "separated";
+  }
+  return song.status;
+}

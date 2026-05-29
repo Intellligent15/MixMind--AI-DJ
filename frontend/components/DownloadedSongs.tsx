@@ -16,9 +16,11 @@ import {
   type Transcription,
 } from "@/lib/api";
 import {
+  displayStatus,
   isFullyProcessed,
   maySoonHaveStems,
   maySoonHaveTranscription,
+  type DisplayStatus,
 } from "@/lib/song-status";
 
 const SEPARATABLE: ReadonlyArray<Song["status"]> = [
@@ -31,37 +33,6 @@ const TRANSCRIBABLE: ReadonlyArray<Song["status"]> = [
   "ready",
   "failed",
 ];
-
-// A song's "displayed" status is derived: once a Stems / Transcription row
-// exists, show `separated` / `transcribed` even though the worker bounces
-// the Song row back to `analyzed` or `ready`. Mirrors ProcessingView.
-type DisplayStatus = Song["status"] | "separated" | "transcribed";
-
-function displayStatus(
-  song: Song,
-  hasStems: boolean,
-  hasTranscription: boolean,
-  isPendingTranscription: boolean,
-  isPendingSeparation: boolean,
-): DisplayStatus {
-  // User just clicked Re-transcribe / Re-separate. Show the in-flight
-  // state immediately and keep showing it until the pending flag clears
-  // (when the new row lands). This wins over the cached status because
-  // a server refetch race can briefly return the pre-worker status
-  // (`analyzed`/`ready`) and we don't want the badge to flicker.
-  if (isPendingTranscription) return "transcribing";
-  if (isPendingSeparation) return "separating";
-  if (
-    hasTranscription &&
-    (song.status === "analyzed" || song.status === "ready")
-  ) {
-    return "transcribed";
-  }
-  if (hasStems && (song.status === "analyzed" || song.status === "ready")) {
-    return "separated";
-  }
-  return song.status;
-}
 
 function badgeClass(status: DisplayStatus): string {
   if (status === "failed") return "bg-red-500/20";
@@ -331,13 +302,10 @@ export function DownloadedSongs() {
             s.status === "separating" || pendingStems.has(s.id);
           const isMidTranscription =
             s.status === "transcribing" || pendingTranscription.has(s.id);
-          const display = displayStatus(
-            s,
-            hasStems,
-            hasTranscription,
-            pendingTranscription.has(s.id),
-            pendingStems.has(s.id),
-          );
+          const display = displayStatus(s, {
+            pendingTranscription: pendingTranscription.has(s.id),
+            pendingStems: pendingStems.has(s.id),
+          });
           // Transcription requires stems to exist first (the worker reads
           // vocals_path off the Stems row); gating the button avoids a 409
           // from the API.
