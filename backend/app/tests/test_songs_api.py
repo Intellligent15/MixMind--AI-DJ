@@ -119,6 +119,45 @@ def test_list_songs(db_session: Session):
     assert set(titles) >= {"A Song", "Two"}
 
 
+def test_list_songs_includes_has_stems_has_transcription(db_session: Session):
+    """The Library + Player both derive `displayStatus` from these flags
+    so they render the same badge for the same song. Avoiding an N+1 of
+    per-song stems / transcription queries on the frontend."""
+    bare = _downloaded_song(db_session, vid="bare-list")
+    bare.status = SongStatus.analyzed
+    with_stems = _downloaded_song(db_session, vid="with-stems-list")
+    with_stems.status = SongStatus.analyzed
+    db_session.flush()
+    db_session.add(
+        Stems(
+            song_id=with_stems.id,
+            model_name="htdemucs",
+            status=StemsStatus.separated,
+            vocals_path="x", drums_path="x", bass_path="x", other_path="x",
+            vocal_envelope_path=None, vocal_rms=0.1,
+        )
+    )
+    db_session.flush()
+    client = _client(db_session)
+    body = client.get("/api/songs").json()
+    by_id = {s["id"]: s for s in body}
+    assert by_id[str(bare.id)]["has_stems"] is False
+    assert by_id[str(bare.id)]["has_transcription"] is False
+    assert by_id[str(with_stems.id)]["has_stems"] is True
+    assert by_id[str(with_stems.id)]["has_transcription"] is False
+
+
+def test_get_song_includes_has_stems_has_transcription(db_session: Session):
+    song = _downloaded_song(db_session, vid="get-flags")
+    db_session.flush()
+    client = _client(db_session)
+    body = client.get(f"/api/songs/{song.id}").json()
+    assert "has_stems" in body
+    assert "has_transcription" in body
+    assert body["has_stems"] is False
+    assert body["has_transcription"] is False
+
+
 def test_audio_409_when_not_downloaded(db_session: Session):
     client = _client(db_session)
     with patch("app.api.songs.download_song.apply_async"):

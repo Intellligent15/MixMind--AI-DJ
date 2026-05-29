@@ -5,7 +5,7 @@ import uuid
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Response, status
 from fastapi.responses import StreamingResponse
-from sqlalchemy import or_, select
+from sqlalchemy import exists, or_, select
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_db
@@ -41,11 +41,27 @@ STEM_NAMES: tuple[str, ...] = ("vocals", "drums", "bass", "other")
 router = APIRouter(prefix="/api/songs", tags=["songs"])
 
 
+def _song_read_with_flags(
+    song: Song, has_stems: bool, has_transcription: bool
+) -> SongRead:
+    sr = SongRead.model_validate(song)
+    sr.has_stems = bool(has_stems)
+    sr.has_transcription = bool(has_transcription)
+    return sr
+
+
 @router.get("", response_model=list[SongRead])
-def list_songs(db: Session = Depends(get_db)) -> list[Song]:
-    return list(
-        db.scalars(select(Song).order_by(Song.created_at.desc())).all()
-    )
+def list_songs(db: Session = Depends(get_db)) -> list[SongRead]:
+    rows = db.execute(
+        select(
+            Song,
+            exists().where(Stems.song_id == Song.id).label("has_stems"),
+            exists()
+            .where(Transcription.song_id == Song.id)
+            .label("has_transcription"),
+        ).order_by(Song.created_at.desc())
+    ).all()
+    return [_song_read_with_flags(s, hs, ht) for (s, hs, ht) in rows]
 
 
 @router.post("", response_model=SongRead, status_code=status.HTTP_201_CREATED)
@@ -76,11 +92,20 @@ def create_song(payload: SongCreate, db: Session = Depends(get_db)) -> Song:
 
 
 @router.get("/{song_id}", response_model=SongRead)
-def get_song(song_id: uuid.UUID, db: Session = Depends(get_db)) -> Song:
-    song = db.get(Song, song_id)
-    if song is None:
+def get_song(song_id: uuid.UUID, db: Session = Depends(get_db)) -> SongRead:
+    row = db.execute(
+        select(
+            Song,
+            exists().where(Stems.song_id == Song.id).label("has_stems"),
+            exists()
+            .where(Transcription.song_id == Song.id)
+            .label("has_transcription"),
+        ).where(Song.id == song_id)
+    ).one_or_none()
+    if row is None:
         raise HTTPException(status_code=404, detail="song not found")
-    return song
+    song, hs, ht = row
+    return _song_read_with_flags(song, hs, ht)
 
 
 @router.delete(

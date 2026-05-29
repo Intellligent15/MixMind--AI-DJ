@@ -37,3 +37,9 @@ class SongRead(BaseModel):
     status: SongStatus
     created_at: datetime
     updated_at: datetime
+    # Derived from related rows so the Library + Player can render a
+    # consistent "separated" / "transcribed" badge without per-song N+1
+    # fetches. Default False for backwards compat — endpoints populate
+    # the real value with one exists() per row.
+    has_stems: bool = False
+    has_transcription: bool = False
