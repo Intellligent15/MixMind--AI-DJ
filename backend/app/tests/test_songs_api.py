@@ -46,23 +46,26 @@ def _payload(**overrides):
 
 
 def test_create_song_persists_and_enqueues(db_session: Session):
+    from app.workers import PRI_DOWNLOAD
     client = _client(db_session)
-    with patch("app.api.songs.download_song.delay") as delay:
+    with patch("app.api.songs.download_song.apply_async") as dispatch:
         r = client.post("/api/songs", json=_payload())
     assert r.status_code == 201
     body = r.json()
     assert body["youtube_video_id"] == "abc123"
     assert body["status"] == "pending"
-    delay.assert_called_once_with(body["id"])
+    dispatch.assert_called_once_with(args=[body["id"]], priority=PRI_DOWNLOAD)
 
     row = db_session.get(Song, body["id"])
     assert row is not None
     assert row.title == "A Song"
+    # Library-added song must not auto-pipeline.
+    assert row.pipeline_requested is False
 
 
 def test_create_song_dedupes_on_youtube_id(db_session: Session):
     client = _client(db_session)
-    with patch("app.api.songs.download_song.delay") as delay:
+    with patch("app.api.songs.download_song.apply_async") as dispatch:
         r1 = client.post("/api/songs", json=_payload())
         r2 = client.post("/api/songs", json=_payload(title="different title"))
     assert r1.status_code == 201
@@ -71,12 +74,12 @@ def test_create_song_dedupes_on_youtube_id(db_session: Session):
     # title stays as the original — dedupe returns existing row unchanged
     assert r2.json()["title"] == "A Song"
     # download enqueued only once
-    delay.assert_called_once()
+    dispatch.assert_called_once()
 
 
 def test_get_song_returns_row(db_session: Session):
     client = _client(db_session)
-    with patch("app.api.songs.download_song.delay"):
+    with patch("app.api.songs.download_song.apply_async"):
         created = client.post("/api/songs", json=_payload()).json()
     r = client.get(f"/api/songs/{created['id']}")
     assert r.status_code == 200
@@ -91,7 +94,7 @@ def test_get_song_404(db_session: Session):
 
 def test_delete_song_removes_row(db_session: Session):
     client = _client(db_session)
-    with patch("app.api.songs.download_song.delay"):
+    with patch("app.api.songs.download_song.apply_async"):
         created = client.post("/api/songs", json=_payload()).json()
     r = client.delete(f"/api/songs/{created['id']}")
     assert r.status_code == 204
@@ -107,7 +110,7 @@ def test_delete_song_idempotent_on_missing(db_session: Session):
 
 def test_list_songs(db_session: Session):
     client = _client(db_session)
-    with patch("app.api.songs.download_song.delay"):
+    with patch("app.api.songs.download_song.apply_async"):
         client.post("/api/songs", json=_payload())
         client.post("/api/songs", json=_payload(youtube_video_id="def", title="Two"))
     r = client.get("/api/songs")
@@ -118,7 +121,7 @@ def test_list_songs(db_session: Session):
 
 def test_audio_409_when_not_downloaded(db_session: Session):
     client = _client(db_session)
-    with patch("app.api.songs.download_song.delay"):
+    with patch("app.api.songs.download_song.apply_async"):
         created = client.post("/api/songs", json=_payload()).json()
     r = client.get(f"/api/songs/{created['id']}/audio")
     assert r.status_code == 409
@@ -201,12 +204,15 @@ def _downloaded_song(db: Session, vid: str = "downloaded") -> Song:
 
 
 def test_trigger_analyze_enqueues_when_downloaded(db_session: Session):
+    from app.workers import PRI_ANALYZE
     song = _downloaded_song(db_session)
     client = _client(db_session)
-    with patch("app.api.songs.analyze_song.delay") as delay:
+    with patch("app.api.songs.analyze_song.apply_async") as dispatch:
         r = client.post(f"/api/songs/{song.id}/analyze")
     assert r.status_code == 202
-    delay.assert_called_once_with(str(song.id))
+    dispatch.assert_called_once_with(args=[str(song.id)], priority=PRI_ANALYZE)
+    db_session.refresh(song)
+    assert song.pipeline_requested is True
 
 
 def test_trigger_analyze_404_unknown_song(db_session: Session):
@@ -227,10 +233,10 @@ def test_trigger_analyze_409_when_not_downloaded(db_session: Session):
     db_session.add(song)
     db_session.flush()
     client = _client(db_session)
-    with patch("app.api.songs.analyze_song.delay") as delay:
+    with patch("app.api.songs.analyze_song.apply_async") as dispatch:
         r = client.post(f"/api/songs/{song.id}/analyze")
     assert r.status_code == 409
-    delay.assert_not_called()
+    dispatch.assert_not_called()
 
 
 def test_get_analysis_returns_row(db_session: Session):
@@ -302,14 +308,19 @@ def _stems_row(db: Session, song: Song, **overrides) -> Stems:
 
 
 def test_trigger_separate_enqueues_when_analyzed(db_session: Session):
+    from app.workers import PRI_SEPARATE
     song = _analyzed_song(db_session, vid="sep-ok")
     client = _client(db_session)
     with patch("app.api.songs.celery_app.send_task") as send:
         r = client.post(f"/api/songs/{song.id}/separate")
     assert r.status_code == 202
     send.assert_called_once_with(
-        "app.workers.separate.separate_stems", args=[str(song.id)]
+        "app.workers.separate.separate_stems",
+        args=[str(song.id)],
+        priority=PRI_SEPARATE,
     )
+    db_session.refresh(song)
+    assert song.pipeline_requested is True
 
 
 def test_trigger_separate_404_unknown_song(db_session: Session):
@@ -427,6 +438,7 @@ def _transcription_row(
 
 
 def test_trigger_transcribe_enqueues_when_analyzed_with_stems(db_session: Session):
+    from app.workers import PRI_TRANSCRIBE
     song = _analyzed_song(db_session, vid="tr-ok")
     _stems_row(db_session, song)
     client = _client(db_session)
@@ -434,8 +446,12 @@ def test_trigger_transcribe_enqueues_when_analyzed_with_stems(db_session: Sessio
         r = client.post(f"/api/songs/{song.id}/transcribe")
     assert r.status_code == 202
     send.assert_called_once_with(
-        "app.workers.transcribe.transcribe_song", args=[str(song.id)]
+        "app.workers.transcribe.transcribe_song",
+        args=[str(song.id)],
+        priority=PRI_TRANSCRIBE,
     )
+    db_session.refresh(song)
+    assert song.pipeline_requested is True
 
 
 def test_trigger_transcribe_404_unknown_song(db_session: Session):

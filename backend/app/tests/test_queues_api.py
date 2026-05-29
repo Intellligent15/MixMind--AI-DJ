@@ -105,6 +105,44 @@ def test_create_queue_deletes_rendered_mix_file(db_session: Session):
     storage.delete.assert_awaited_once_with("queue_mixes/old.flac")
 
 
+def test_create_queue_deletes_per_pair_mix_renders(db_session: Session):
+    """create_queue must also delete each prior MixPlan's rendered WAV
+    (mixes/<id>.wav) before the cascade removes the rows — otherwise the
+    per-pair transition renders orphan in object storage."""
+    from unittest.mock import AsyncMock, patch
+
+    from app.models import MixPlan, MixPlanStatus, Queue, QueueRender, QueueRenderStatus
+
+    prior = Queue(locked=True)
+    db_session.add(prior)
+    db_session.flush()
+    s1 = _make_song(db_session, "mixclean1")
+    s2 = _make_song(db_session, "mixclean2")
+    db_session.add(QueueRender(
+        queue_id=prior.id,
+        status=QueueRenderStatus.ready,
+        rendered_audio_path="queue_mixes/old.flac",
+    ))
+    db_session.add(MixPlan(
+        queue_id=prior.id,
+        from_song_id=s1.id, to_song_id=s2.id,
+        status=MixPlanStatus.ready,
+        rendered_audio_path="mixes/pair.wav",
+        plan_json=[],
+    ))
+    db_session.flush()
+
+    client = _client(db_session)
+    storage = AsyncMock()
+    storage.delete = AsyncMock()
+    with patch("app.services.storage.get_storage", return_value=storage):
+        r = client.post("/api/queues")
+    assert r.status_code == 201
+    deleted = {c.args[0] for c in storage.delete.await_args_list}
+    assert "queue_mixes/old.flac" in deleted
+    assert "mixes/pair.wav" in deleted
+
+
 def test_get_current_prefers_unlocked(db_session: Session):
     locked = Queue(locked=True)
     unlocked = Queue(locked=False)
@@ -378,59 +416,46 @@ def test_lock_fans_out_pipeline_by_song_status(db_session: Session):
         db_session.add(QueueItem(queue_id=queue.id, song_id=s.id, position=i))
     db_session.flush()
 
+    from app.workers import (
+        PRI_ANALYZE, PRI_DOWNLOAD, PRI_SEPARATE, PRI_TRANSCRIBE,
+    )
     client = _client(db_session)
-    with patch("app.api.queues.chain") as chain_mock, patch(
-        "app.api.queues.analyze_song"
-    ) as analyze_mock, patch(
+    with patch("app.api.queues.analyze_song") as analyze_mock, patch(
         "app.api.queues.download_song"
     ) as download_mock, patch(
         "app.api.queues.separate_stems"
     ) as separate_mock, patch(
         "app.api.queues.transcribe_song"
     ) as transcribe_mock:
-        chain_mock.return_value.delay.return_value = None
-        analyze_mock.delay.return_value = None
-        separate_mock.delay.return_value = None
-        transcribe_mock.delay.return_value = None
-        download_mock.s.return_value = "d-sig"
-        analyze_mock.s.return_value = "a-sig"
-        analyze_mock.si.return_value = "a-isig"
-        separate_mock.s.return_value = "s-sig"
-        separate_mock.si.return_value = "s-isig"
-        transcribe_mock.si.return_value = "t-isig"
-
         r = client.post(f"/api/queues/{queue.id}/lock")
 
     assert r.status_code == 202
     assert r.json()["locked"] is True
     assert r.json()["locked_at"] is not None
 
-    # pending -> chain(download, analyze.si, separate.si, transcribe.si).delay()
-    # downloaded -> chain(analyze, separate.si, transcribe.si).delay()
-    # analyzed (no stems) -> chain(separate, transcribe.si).delay()
-    # analyzed (stems, no transcription) -> transcribe.delay()
-    # done (ready + stems + transcription) -> no dispatch
-    chain_mock.assert_any_call("d-sig", "a-isig", "s-isig", "t-isig")
-    chain_mock.assert_any_call("a-sig", "s-isig", "t-isig")
-    chain_mock.assert_any_call("s-sig", "t-isig")
-    assert chain_mock.call_count == 3
-    assert chain_mock.return_value.delay.call_count == 3
+    # New (post-Option-B) shape: lock kicks ONE stage per song; the worker
+    # auto-chain (gated by pipeline_requested) carries the song through
+    # the rest. pending → download; downloaded → analyze; analyzed (no
+    # stems) → separate; analyzed (stems, no transcription) → transcribe;
+    # ready+stems+transcription → nothing.
+    download_mock.apply_async.assert_called_once_with(
+        args=[str(pending.id)], priority=PRI_DOWNLOAD
+    )
+    analyze_mock.apply_async.assert_called_once_with(
+        args=[str(downloaded.id)], priority=PRI_ANALYZE
+    )
+    separate_mock.apply_async.assert_called_once_with(
+        args=[str(analyzed_no_stems.id)], priority=PRI_SEPARATE
+    )
+    transcribe_mock.apply_async.assert_called_once_with(
+        args=[str(analyzed_with_stems.id)], priority=PRI_TRANSCRIBE
+    )
 
-    download_mock.s.assert_called_once_with(str(pending.id))
-    analyze_mock.si.assert_called_once_with(str(pending.id))
-    analyze_mock.s.assert_called_once_with(str(downloaded.id))
-    # separate.si used in pending + downloaded chains; separate.s used in
-    # analyzed-no-stems chain. separate.delay is not used directly anymore
-    # (transcribe is always chained behind it).
-    assert separate_mock.si.call_count == 2
-    separate_mock.s.assert_called_once_with(str(analyzed_no_stems.id))
-    separate_mock.delay.assert_not_called()
-    # transcribe.si used in all three chains; transcribe.delay used directly
-    # for the stems-but-no-transcription branch.
-    assert transcribe_mock.si.call_count == 3
-    transcribe_mock.delay.assert_called_once_with(str(analyzed_with_stems.id))
-    # done is fully processed — nothing more
-    analyze_mock.delay.assert_not_called()
+    # All queued songs must have pipeline_requested=True after lock so
+    # the worker auto-chain carries them forward.
+    for s in [pending, downloaded, analyzed_no_stems, analyzed_with_stems, done]:
+        db_session.refresh(s)
+        assert s.pipeline_requested is True
 
     # Phase 7: lock also seeds N-1 MixPlan rows for adjacent pairs in the
     # queue. plan_json is null at seed time (lazy generation at render).
@@ -459,6 +484,43 @@ def test_lock_409_if_empty(db_session: Session):
     client = _client(db_session)
     r = client.post(f"/api/queues/{queue.id}/lock")
     assert r.status_code == 409
+
+
+def test_lock_with_in_flight_song_sets_flag_without_dispatching(
+    db_session: Session,
+):
+    """Bug B regression: previously _enqueue_pipeline_for_song had no
+    branch for `downloading`/`analyzing`/etc., so locking a queue while
+    a song was mid-download silently dropped the chain. The fix relies
+    on workers' auto-chain (gated by pipeline_requested) to carry the
+    song forward when the in-flight task completes — so at lock time we
+    must NOT redundantly re-dispatch the running stage, but we MUST set
+    pipeline_requested=True so the running worker auto-dispatches the
+    next stage on success."""
+    queue = Queue()
+    db_session.add(queue)
+    in_flight = _make_song(db_session, "if1", SongStatus.downloading)
+    db_session.flush()
+    db_session.add(QueueItem(queue_id=queue.id, song_id=in_flight.id, position=0))
+    db_session.flush()
+
+    client = _client(db_session)
+    with patch("app.api.queues.download_song") as dl, patch(
+        "app.api.queues.analyze_song"
+    ) as an, patch("app.api.queues.separate_stems") as sp, patch(
+        "app.api.queues.transcribe_song"
+    ) as tr:
+        r = client.post(f"/api/queues/{queue.id}/lock")
+
+    assert r.status_code == 202
+    # No redundant dispatches — the running download will auto-chain on
+    # success because pipeline_requested is now True.
+    dl.apply_async.assert_not_called()
+    an.apply_async.assert_not_called()
+    sp.apply_async.assert_not_called()
+    tr.apply_async.assert_not_called()
+    db_session.refresh(in_flight)
+    assert in_flight.pipeline_requested is True
 
 
 def test_lock_409_if_already_locked(db_session: Session):

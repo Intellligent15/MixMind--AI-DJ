@@ -19,7 +19,13 @@ from app.schemas import (
     LyricsRead,
 )
 from app.services.storage import get_storage
-from app.workers import celery_app
+from app.workers import (
+    PRI_ANALYZE,
+    PRI_DOWNLOAD,
+    PRI_SEPARATE,
+    PRI_TRANSCRIBE,
+    celery_app,
+)
 from app.workers.analyze import analyze_song
 from app.workers.download import download_song
 
@@ -61,7 +67,10 @@ def create_song(payload: SongCreate, db: Session = Depends(get_db)) -> Song:
     db.add(song)
     db.commit()
     db.refresh(song)
-    download_song.delay(str(song.id))
+    # Library add: download only. pipeline_requested defaults to False
+    # so the song stops at `downloaded` until the user queues it or
+    # manually triggers a downstream stage.
+    download_song.apply_async(args=[str(song.id)], priority=PRI_DOWNLOAD)
     celery_app.send_task("app.workers.fetch_lyrics.fetch_lyrics", args=[str(song.id)])
     return song
 
@@ -246,7 +255,11 @@ def trigger_analyze_song(song_id: uuid.UUID, db: Session = Depends(get_db)) -> S
             status_code=409,
             detail=f"song not ready for analysis (status={song.status.value})",
         )
-    analyze_song.delay(str(song.id))
+    # User opted into downstream processing — flag carries forward so
+    # the worker auto-chain continues into separate + transcribe.
+    song.pipeline_requested = True
+    db.commit()
+    analyze_song.apply_async(args=[str(song.id)], priority=PRI_ANALYZE)
     return song
 
 
@@ -281,7 +294,9 @@ def trigger_separate_song(song_id: uuid.UUID, db: Session = Depends(get_db)) -> 
             status_code=409,
             detail=f"song not ready for separation (status={song.status.value})",
         )
-    celery_app.send_task(SEPARATE_TASK, args=[str(song.id)])
+    song.pipeline_requested = True
+    db.commit()
+    celery_app.send_task(SEPARATE_TASK, args=[str(song.id)], priority=PRI_SEPARATE)
     return song
 
 
@@ -357,7 +372,9 @@ def trigger_transcribe_song(
             status_code=409,
             detail="song has no separated vocal stem yet",
         )
-    celery_app.send_task(TRANSCRIBE_TASK, args=[str(song.id)])
+    song.pipeline_requested = True
+    db.commit()
+    celery_app.send_task(TRANSCRIBE_TASK, args=[str(song.id)], priority=PRI_TRANSCRIBE)
     return song
 
 
@@ -399,7 +416,7 @@ async def get_song_vocal_safe_regions(
     segment_logprob_min: float = -1.2,
     stem_rms_presence: float = 0.02,
     stem_rms_quiet: float = 0.01,
-    min_safe_region_seconds: float = 1.5,
+    min_safe_region_seconds: float = 6.0,
 ):
     import json
     from app.models.lyrics import Lyrics

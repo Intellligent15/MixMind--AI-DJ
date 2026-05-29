@@ -3,13 +3,13 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timezone
 
-from celery import chain
 from fastapi import APIRouter, Depends, Header, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_db
 from app.models import (
+    MixPlan,
     Queue,
     QueueItem,
     Song,
@@ -18,7 +18,13 @@ from app.models import (
     Transcription,
 )
 from app.schemas import QueueItemAdd, QueueRead, QueueReorder, QueueRenderRead
-from app.workers import celery_app
+from app.workers import (
+    PRI_ANALYZE,
+    PRI_DOWNLOAD,
+    PRI_SEPARATE,
+    PRI_TRANSCRIBE,
+    celery_app,
+)
 from app.workers.analyze import analyze_song
 from app.workers.download import download_song
 
@@ -44,6 +50,12 @@ class _TaskShim:
 
     def delay(self, *args):
         return celery_app.send_task(self._task_name, args=list(args))
+
+    def apply_async(self, args=None, priority=None, **kwargs):
+        send_kwargs = {"args": list(args or []), **kwargs}
+        if priority is not None:
+            send_kwargs["priority"] = priority
+        return celery_app.send_task(self._task_name, **send_kwargs)
 
 
 separate_stems = _TaskShim(SEPARATE_TASK)
@@ -81,16 +93,29 @@ async def create_queue(db: Session = Depends(get_db)) -> Queue:
     import logging
     
     storage = get_storage()
+    logger = logging.getLogger(__name__)
     old_queues = list(db.scalars(select(Queue)).all())
     for old_q in old_queues:
+        # Collect every storage blob the queue owns before the cascade
+        # delete removes the rows that point to them. Both the stitched
+        # queue mix AND each per-pair transition render (mixes/<id>.wav)
+        # must go — otherwise the per-pair WAVs orphan in object storage.
+        keys: list[str] = []
         render_row = db.scalar(select(QueueRender).where(QueueRender.queue_id == old_q.id))
         if render_row and render_row.rendered_audio_path:
+            keys.append(render_row.rendered_audio_path)
+        plans = db.scalars(select(MixPlan).where(MixPlan.queue_id == old_q.id)).all()
+        for plan in plans:
+            if plan.rendered_audio_path:
+                keys.append(plan.rendered_audio_path)
+
+        for key in keys:
             try:
-                await storage.delete(render_row.rendered_audio_path)
+                await storage.delete(key)
             except FileNotFoundError:
                 pass
             except Exception as e:
-                logging.getLogger(__name__).warning(f"Failed to delete old mix: {e}")
+                logger.warning(f"create_queue: failed to delete old blob {key!r}: {e}")
         db.delete(old_q)
     db.commit()
 
@@ -223,20 +248,25 @@ def reorder_queue_items(
 
 
 def _enqueue_pipeline_for_song(song: Song, db: Session) -> None:
-    """Kick off whatever pipeline stages a song still needs.
+    """Kick the appropriate next pipeline stage for one song.
 
-    Phase 6 extends Phase 5 with Whisper transcription. The full chain is:
-        download -> analyze -> separate -> transcribe
-    We trim from the front depending on what the song already has:
-        pending/failed-no-audio   -> full 4-step chain
-        downloaded/failed-w-audio -> analyze -> separate -> transcribe
-        analyzed/ready, no stems  -> separate -> transcribe
-        analyzed/ready, has stems, no transcription -> transcribe
-        ready, has stems + transcription -> nothing (fully processed)
+    Workers auto-chain on success (download→analyze→separate→transcribe)
+    when `song.pipeline_requested` is True, so this only needs to dispatch
+    the SINGLE current-needed stage. Songs already in flight
+    (`downloading`/`analyzing`/etc.) are no-ops — the in-flight worker
+    will auto-dispatch its successor on completion. That auto-chain is
+    what fixes the "lock-during-download stalls the pipeline" bug.
 
-    .si() ignores upstream returns so each task only sees its own song_id.
+    Lyrics fetch is fire-and-forget, independent of the audio pipeline.
     """
     sid = str(song.id)
+    # Signal that the user wants the full pipeline for this song. Workers
+    # gate their auto-dispatch on this flag, so flipping it true here is
+    # what makes a currently-running download or analyze auto-progress
+    # all the way through transcribe.
+    song.pipeline_requested = True
+    db.commit()
+
     has_stems = (
         db.scalar(select(Stems.id).where(Stems.song_id == song.id)) is not None
     )
@@ -244,39 +274,41 @@ def _enqueue_pipeline_for_song(song: Song, db: Session) -> None:
         db.scalar(select(Transcription.id).where(Transcription.song_id == song.id))
         is not None
     )
-    
+
     from app.models.lyrics import Lyrics, LyricsFetchStatus
     has_lyrics = (
         db.scalar(select(Lyrics.id).where(
-            (Lyrics.song_id == song.id) & 
-            (Lyrics.fetch_status.in_([LyricsFetchStatus.success, LyricsFetchStatus.not_found, LyricsFetchStatus.error]))
+            (Lyrics.song_id == song.id) &
+            (Lyrics.fetch_status.in_([
+                LyricsFetchStatus.success,
+                LyricsFetchStatus.not_found,
+                LyricsFetchStatus.error,
+            ]))
         )) is not None
     )
-    
     if not has_lyrics:
         _TaskShim("app.workers.fetch_lyrics.fetch_lyrics").delay(sid)
 
+    # In-flight states: a running worker will carry the pipeline forward
+    # on its own via auto-chain (which now sees pipeline_requested=True).
+    if song.status in (
+        SongStatus.downloading,
+        SongStatus.analyzing,
+        SongStatus.separating,
+        SongStatus.transcribing,
+    ):
+        return
+
+    # Idle states: kick the next-needed stage. Auto-chain handles the rest.
     if song.status in (SongStatus.pending, SongStatus.failed) and not song.audio_path:
-        # Full chain. We don't try to skip the tail when has_stems/
-        # has_transcription is already true here because those situations
-        # don't occur for a song that's never been downloaded.
-        chain(
-            download_song.s(sid),
-            analyze_song.si(sid),
-            separate_stems.si(sid),
-            transcribe_song.si(sid),
-        ).delay()
+        download_song.apply_async(args=[sid], priority=PRI_DOWNLOAD)
     elif song.status in (SongStatus.downloaded, SongStatus.failed):
-        chain(
-            analyze_song.s(sid),
-            separate_stems.si(sid),
-            transcribe_song.si(sid),
-        ).delay()
+        analyze_song.apply_async(args=[sid], priority=PRI_ANALYZE)
     elif song.status in (SongStatus.analyzed, SongStatus.ready):
         if not has_stems:
-            chain(separate_stems.s(sid), transcribe_song.si(sid)).delay()
+            separate_stems.apply_async(args=[sid], priority=PRI_SEPARATE)
         elif not has_transcription:
-            transcribe_song.delay(sid)
+            transcribe_song.apply_async(args=[sid], priority=PRI_TRANSCRIBE)
         # else: fully processed — nothing to do.
 
 
