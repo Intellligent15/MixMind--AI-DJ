@@ -2,7 +2,7 @@ import enum
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, Enum, Float, String, func
+from sqlalchemy import Boolean, DateTime, Enum, Float, String, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -38,6 +38,15 @@ class Song(Base):
         Enum(SongStatus, name="song_status"),
         nullable=False,
         default=SongStatus.pending,
+    )
+
+    # Set to True when the user signals they want full pipeline processing
+    # (queue lock, or manual /analyze /separate /transcribe API call). Each
+    # worker checks this on success and only auto-dispatches the next stage
+    # if True. Library-added songs default to False so they stop at
+    # `downloaded` until queued.
+    pipeline_requested: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default="false", default=False
     )
 
     created_at: Mapped[datetime] = mapped_column(
