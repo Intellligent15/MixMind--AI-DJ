@@ -137,6 +137,27 @@ def test_build_pair_plan_short_a_outro_clamps_to_end_window():
     assert window["duration_bars"] == 4
 
 
+def test_build_pair_plan_caps_permanent_shift_at_two():
+    # B is too short to fit the 8-bar post-crossfade ramp, so the generator
+    # emits a *permanent* pitch_shift. A C→F# pairing wants ±6 semitones, but
+    # a permanent shift detunes B for its whole body — so it's capped at ±2.
+    a = _bundle(key="C")
+    b = _bundle(
+        key="F#",
+        duration=10.0,
+        sections=[{"start": 0.0, "end": 10.0, "label": "body"}],
+        downbeats=[0.0, 2.0, 4.0, 6.0, 8.0],
+        beat_grid=[i * 0.5 for i in range(20)],
+    )
+    plan = build_pair_plan(a, b)
+    perm = [c for c in plan if c["tool"] == "pitch_shift"]
+    temp = [c for c in plan if c["tool"] == "temporary_pitch_shift"]
+    assert perm and not temp, "short B should take the permanent-shift path"
+    assert abs(perm[0]["semitones"]) == 2, perm
+    # The cap lives in build_pair_plan, not compute_pitch_shift.
+    assert abs(compute_pitch_shift("C", "F#")) == 6
+
+
 def test_build_pair_plan_b_intro_skipped():
     # B's first section is 0-10s of intro; seam_b should land at first
     # downbeat ≥ 10. With 128 BPM/4, sec_per_bar = 60/128*4 = 1.875s.

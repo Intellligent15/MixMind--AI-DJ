@@ -39,6 +39,10 @@ _FLAT_TO_SHARP = {"Db": "C#", "Eb": "D#", "Gb": "F#", "Ab": "G#", "Bb": "A#"}
 DEFAULT_DURATION_BARS = 16
 MIN_DURATION_BARS = 4
 LARGE_SHIFT_THRESHOLD = 2  # |δ| > 2 → WARN (locked: apply anyway)
+# Bars over which B's pitch crossfades back to native. Kept short and
+# decoupled from the (longer, 8-bar) tempo ramp so B doesn't linger in an
+# audible dual-pitch blend.
+PITCH_RETURN_BARS = 4
 
 
 def _parse_key(key: str) -> tuple[int, bool]:
@@ -132,7 +136,9 @@ def build_pair_plan(a: AnalysisBundle, b: AnalysisBundle) -> MixPlanJSON:
     # Calculate post-crossfade space for B
     sec_per_bar_b = (60.0 / b.bpm) * b.time_signature
     crossfade_end_b = seam_b + (duration_bars * sec_per_bar_b)
-    ramp_duration_bars = 8
+    # Tempo ramp length, kept equal to the pitch-return window so tempo and
+    # pitch both settle to B's native values at the same moment.
+    ramp_duration_bars = PITCH_RETURN_BARS
     ramp_end_b = crossfade_end_b + (ramp_duration_bars * sec_per_bar_b)
 
     can_ramp = b.duration >= ramp_end_b
@@ -144,10 +150,20 @@ def build_pair_plan(a: AnalysisBundle, b: AnalysisBundle) -> MixPlanJSON:
             b.duration, ramp_end_b
         )
         if n_steps != 0:
+            # A permanent shift can't ramp back, so a big shift would detune B
+            # for its entire body. Cap magnitude at ±2 semitones — past that
+            # the artifacts/detune cost outweighs the key match.
+            capped = max(-2, min(2, n_steps))
+            if capped != n_steps:
+                logger.warning(
+                    "build_pair_plan: capping permanent pitch shift %d -> %d "
+                    "(B too short to ramp back to its native key)",
+                    n_steps, capped,
+                )
             plan.append({
                 "tool": "pitch_shift",
                 "song": "B",
-                "semitones": n_steps,
+                "semitones": capped,
             })
     else:
         # Emit tempo ramp
@@ -168,7 +184,7 @@ def build_pair_plan(a: AnalysisBundle, b: AnalysisBundle) -> MixPlanJSON:
                 "semitones": n_steps,
                 "fade_in_bars": 0,
                 "hold_bars": 0,
-                "fade_out_bars": ramp_duration_bars,
+                "fade_out_bars": PITCH_RETURN_BARS,
             })
 
     for stem in ("vocals", "drums", "bass", "other"):
