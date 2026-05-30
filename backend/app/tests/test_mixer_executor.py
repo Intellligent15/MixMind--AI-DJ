@@ -244,6 +244,226 @@ def test_render_pitch_shift_warning_flag_when_large():
     assert result.pitch_shift_warning
 
 
+def test_render_temporary_pitch_mutes_vocal_then_fades_it_in():
+    """Temporary-pitch path: B's vocal is silent through the ENTIRE pitch
+    return (including the crossfade-back window) and only fades in once the
+    key has fully settled. We make only the vocal stem non-zero so we can
+    read its presence directly out of the rendered B body."""
+    long_dur = 16.0
+    long_n = int(SR * long_dur)
+    sec_per_bar = 2.0  # 120 bpm, 4/4
+
+    def _bundle_long(prefix_bpm: float = 120.0) -> AnalysisBundle:
+        return AnalysisBundle(
+            bpm=prefix_bpm, key="C", camelot_key="8B", time_signature=4,
+            beat_grid=[i * 0.5 for i in range(int(long_dur / 0.5))],
+            downbeats=[i * sec_per_bar for i in range(int(long_dur / sec_per_bar))],
+            sections=[{"start": 0.0, "end": long_dur, "label": "body"}],
+            duration=long_dur,
+        )
+
+    a = SongRenderInputs(stem_paths=_stems_dict("A"), analysis=_bundle_long())
+    b = SongRenderInputs(stem_paths=_stems_dict("B"), analysis=_bundle_long())
+
+    def _read_vocal_only(path, always_2d=True, dtype="float32"):
+        amp = 0.5 if "vocals" in path else 0.0
+        return amp * np.ones((long_n, 2), dtype=np.float32), SR
+
+    # Pitch shift starts at 4 s and returns over a 2-bar (4 s) window → native
+    # by 8 s. The vocal stays silent through that whole return and only fades
+    # in afterwards, over [8 s, 12 s], full from 12 s on. The tempo ramp is
+    # longer (4–10 s) and intentionally decoupled.
+    plan = [
+        {"tool": "set_transition_window",
+         "from_song_time_start": 0.0, "to_song_time_start": 0.0,
+         "duration_bars": 1},
+        {"tool": "set_tempo_ramp", "song": "B",
+         "start_time": 4.0, "end_time": 10.0, "start_bpm": 120.0, "end_bpm": 120.0},
+        {"tool": "temporary_pitch_shift", "song": "B", "start_time": 4.0,
+         "semitones": -4, "fade_in_bars": 0, "hold_bars": 0, "fade_out_bars": 2},
+        *[
+            {"tool": "crossfade_stem", "stem": s,
+             "from_song": "A", "to_song": "B",
+             "start_bar": 0, "duration_bars": 1, "curve": "equal_power"}
+            for s in ("vocals", "drums", "bass", "other")
+        ],
+    ]
+
+    with (
+        patch("soundfile.read", side_effect=_read_vocal_only),
+        patch("pyrubberband.pyrb.pitch_shift", side_effect=lambda y, sr, n: y),
+        patch("pyrubberband.pyrb.timemap_stretch", side_effect=lambda y, sr, tm: y),
+    ):
+        result = render(plan, a, b)
+
+    out, _ = sf.read(io.BytesIO(result.wav_bytes), always_2d=True, dtype="float32")
+    # Before the pitch return (~3 s): vocal silent.
+    pre = np.max(np.abs(out[int(3.0 * SR): int(3.1 * SR)]))
+    assert pre < 0.05, f"vocal should be muted before pitch return, got {pre}"
+    # DURING the pitch return (~6 s, inside [4 s, 8 s]): still silent — this is
+    # the behavior we want (no vocal over the detuned/blended instrumental).
+    during = np.max(np.abs(out[int(6.0 * SR): int(6.1 * SR)]))
+    assert during < 0.05, f"vocal should be muted during pitch return, got {during}"
+    # After the key has fully settled (~14 s): vocal at full level.
+    present = np.mean(np.abs(out[int(14.0 * SR): int(14.1 * SR)]))
+    assert present > 0.4, f"vocal should be present once key settles, got {present}"
+    assert result.pitch_shift_warning  # |-4| > 2
+
+
+def test_render_tempo_ramp_alone_mutes_vocal_then_fades_it_in():
+    """Tempo-only path (no temp pitch shift): B's vocal must be silent
+    while the tempo ramp is active and fade in only once B has settled at
+    native tempo. Same fade window as the temp-pitch path so the two
+    behave consistently."""
+    long_dur = 16.0
+    long_n = int(SR * long_dur)
+    sec_per_bar = 2.0  # 120 bpm, 4/4
+
+    def _bundle_long() -> AnalysisBundle:
+        return AnalysisBundle(
+            bpm=120.0, key="C", camelot_key="8B", time_signature=4,
+            beat_grid=[i * 0.5 for i in range(int(long_dur / 0.5))],
+            downbeats=[i * sec_per_bar for i in range(int(long_dur / sec_per_bar))],
+            sections=[{"start": 0.0, "end": long_dur, "label": "body"}],
+            duration=long_dur,
+        )
+
+    a = SongRenderInputs(stem_paths=_stems_dict("A"), analysis=_bundle_long())
+    b = SongRenderInputs(stem_paths=_stems_dict("B"), analysis=_bundle_long())
+
+    def _read_vocal_only(path, always_2d=True, dtype="float32"):
+        amp = 0.5 if "vocals" in path else 0.0
+        return amp * np.ones((long_n, 2), dtype=np.float32), SR
+
+    # Tempo ramp 4 s → 10 s, no temp pitch. Same BPM end-to-end so the
+    # mocked timemap_stretch is a passthrough. Vocal stays silent through
+    # the entire ramp, then fades in over [10 s, 14 s], full from 14 s on.
+    plan = [
+        {"tool": "set_transition_window",
+         "from_song_time_start": 0.0, "to_song_time_start": 0.0,
+         "duration_bars": 1},
+        {"tool": "set_tempo_ramp", "song": "B",
+         "start_time": 4.0, "end_time": 10.0, "start_bpm": 120.0, "end_bpm": 120.0},
+        *[
+            {"tool": "crossfade_stem", "stem": s,
+             "from_song": "A", "to_song": "B",
+             "start_bar": 0, "duration_bars": 1, "curve": "equal_power"}
+            for s in ("vocals", "drums", "bass", "other")
+        ],
+    ]
+
+    with (
+        patch("soundfile.read", side_effect=_read_vocal_only),
+        patch("pyrubberband.pyrb.timemap_stretch", side_effect=lambda y, sr, tm: y),
+    ):
+        result = render(plan, a, b)
+
+    out, _ = sf.read(io.BytesIO(result.wav_bytes), always_2d=True, dtype="float32")
+    # Mid-ramp (~7 s): vocal must be muted.
+    during = np.max(np.abs(out[int(7.0 * SR): int(7.1 * SR)]))
+    assert during < 0.05, f"vocal should be muted during tempo ramp, got {during}"
+    # Just before settle (~9 s): still muted.
+    just_before = np.max(np.abs(out[int(9.0 * SR): int(9.1 * SR)]))
+    assert just_before < 0.05, f"vocal should still be muted at 9s, got {just_before}"
+    # After the vocal fade-in completes (~15 s): vocal at full level.
+    present = np.mean(np.abs(out[int(15.0 * SR): int(15.1 * SR)]))
+    assert present > 0.4, f"vocal should be present once tempo settles, got {present}"
+
+
+def test_render_uses_original_master_for_a_head():
+    """A's body before the seam comes from the untouched master, not the
+    stem sum. A master reads 0.3; the 4-stem sum reads 0.4."""
+    a = SongRenderInputs(
+        stem_paths=_stems_dict("A"), analysis=_bundle(),
+        original_audio_path="orig/A_master.wav",
+    )
+    b = _inputs(prefix="B")  # no original → B stays stem-based
+
+    def _read(path, always_2d=True, dtype="float32"):
+        if "master" in path:
+            return 0.3 * np.ones((N, 2), dtype=np.float32), SR
+        sig = 0.2 * np.ones((N, 2), dtype=np.float32)
+        if "drums" in path:
+            sig = -sig
+        return sig, SR  # 4-stem sum = 0.2-0.2+0.2+0.2 = 0.4
+
+    plan = [
+        {"tool": "set_transition_window",
+         "from_song_time_start": 2.0, "to_song_time_start": 0.0,
+         "duration_bars": 1},
+        *[
+            {"tool": "crossfade_stem", "stem": s, "from_song": "A", "to_song": "B",
+             "start_bar": 0, "duration_bars": 1, "curve": "equal_power"}
+            for s in ("vocals", "drums", "bass", "other")
+        ],
+    ]
+    with patch("soundfile.read", side_effect=_read):
+        result = render(plan, a, b)
+    out, _ = sf.read(io.BytesIO(result.wav_bytes), always_2d=True, dtype="float32")
+    # Pre-seam (~0.5 s, before the 2 s seam): the untouched master (0.3),
+    # not the stem sum (0.4).
+    head = np.mean(np.abs(out[int(0.5 * SR): int(0.6 * SR)]))
+    assert abs(head - 0.3) < 0.02, f"A head should be master 0.3, got {head}"
+
+
+def test_render_splices_original_master_into_settled_b_tail():
+    """Once B has fully settled (tempo+pitch+vocal native), its tail is the
+    untouched master, not the stem reconstruction. Same 16 s temp-pitch
+    setup as the mute test, but B carries an original master reading 0.9."""
+    long_dur = 16.0
+    long_n = int(SR * long_dur)
+    sec_per_bar = 2.0
+
+    def _bundle_long() -> AnalysisBundle:
+        return AnalysisBundle(
+            bpm=120.0, key="C", camelot_key="8B", time_signature=4,
+            beat_grid=[i * 0.5 for i in range(int(long_dur / 0.5))],
+            downbeats=[i * sec_per_bar for i in range(int(long_dur / sec_per_bar))],
+            sections=[{"start": 0.0, "end": long_dur, "label": "body"}],
+            duration=long_dur,
+        )
+
+    a = SongRenderInputs(stem_paths=_stems_dict("A"), analysis=_bundle_long())
+    b = SongRenderInputs(
+        stem_paths=_stems_dict("B"), analysis=_bundle_long(),
+        original_audio_path="orig/B_master.wav",
+    )
+
+    def _read(path, always_2d=True, dtype="float32"):
+        if "master" in path:
+            return 0.9 * np.ones((long_n, 2), dtype=np.float32), SR
+        amp = 0.5 if "vocals" in path else 0.0
+        return amp * np.ones((long_n, 2), dtype=np.float32), SR
+
+    plan = [
+        {"tool": "set_transition_window",
+         "from_song_time_start": 0.0, "to_song_time_start": 0.0, "duration_bars": 1},
+        {"tool": "set_tempo_ramp", "song": "B",
+         "start_time": 4.0, "end_time": 8.0, "start_bpm": 120.0, "end_bpm": 120.0},
+        {"tool": "temporary_pitch_shift", "song": "B", "start_time": 4.0,
+         "semitones": -4, "fade_in_bars": 0, "hold_bars": 0, "fade_out_bars": 2},
+        *[
+            {"tool": "crossfade_stem", "stem": s, "from_song": "A", "to_song": "B",
+             "start_bar": 0, "duration_bars": 1, "curve": "equal_power"}
+            for s in ("vocals", "drums", "bass", "other")
+        ],
+    ]
+    with (
+        patch("soundfile.read", side_effect=_read),
+        patch("pyrubberband.pyrb.pitch_shift", side_effect=lambda y, sr, n: y),
+        patch("pyrubberband.pyrb.timemap_stretch", side_effect=lambda y, sr, tm: y),
+    ):
+        result = render(plan, a, b)
+    out, _ = sf.read(io.BytesIO(result.wav_bytes), always_2d=True, dtype="float32")
+    # Settled tail (~14 s): the master (0.9), not the stem vocal level (0.5).
+    tail = np.mean(np.abs(out[int(14.0 * SR): int(14.1 * SR)]))
+    assert abs(tail - 0.9) < 0.05, f"settled tail should be master 0.9, got {tail}"
+    # During the pitch return (~6 s): still the stem path, master NOT yet
+    # spliced (vocal muted → ~0).
+    during = np.max(np.abs(out[int(6.0 * SR): int(6.1 * SR)]))
+    assert during < 0.05, f"master must not appear during transition, got {during}"
+
+
 def test_render_precondition_rejects_wrong_sample_rate():
     a = _inputs(prefix="A")
     b = _inputs(prefix="B")

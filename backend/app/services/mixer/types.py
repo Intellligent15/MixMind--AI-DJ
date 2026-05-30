@@ -136,10 +136,16 @@ class SongRenderInputs:
 
     `stem_paths` map canonical stem names to StorageBackend keys. Keys
     are resolved to filesystem paths via `storage.path(...)`.
+
+    `original_audio_path` is the untouched master WAV. When present, the
+    executor uses it (instead of the stem sum) for the parts of the output
+    that aren't being actively transitioned — A's body up to the seam, and
+    B's body once its tempo/pitch/vocal have all settled back to native.
     """
 
     stem_paths: dict[str, str]
     analysis: AnalysisBundle
+    original_audio_path: str | None = None
 
 
 @dataclass(frozen=True)

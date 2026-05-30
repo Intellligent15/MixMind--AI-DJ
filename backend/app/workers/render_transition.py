@@ -119,6 +119,8 @@ def render_transition(mix_plan_id: str) -> str | None:
         a_bundle = _to_bundle(a_analysis, a.duration_seconds)
         b_bundle = _to_bundle(b_analysis, b.duration_seconds)
         existing_plan_json = row.plan_json
+        a_audio_key = a.audio_path
+        b_audio_key = b.audio_path
 
     plan_json = existing_plan_json or build_pair_plan(a_bundle, b_bundle)
 
@@ -136,11 +138,24 @@ def render_transition(mix_plan_id: str) -> str | None:
                 paths[k] = str(dest)
             return paths
 
+        async def _download_original(key: str | None, prefix: str) -> str | None:
+            if not key:
+                return None
+            dest = tmp / f"{prefix}_original.wav"
+            await storage.download_file(key, dest)
+            return str(dest)
+
         a_paths = asyncio.run(_download_stems(a_stems, "a"))
         b_paths = asyncio.run(_download_stems(b_stems, "b"))
-        
-        a_inputs = SongRenderInputs(stem_paths=a_paths, analysis=a_bundle)
-        b_inputs = SongRenderInputs(stem_paths=b_paths, analysis=b_bundle)
+        a_orig = asyncio.run(_download_original(a_audio_key, "a"))
+        b_orig = asyncio.run(_download_original(b_audio_key, "b"))
+
+        a_inputs = SongRenderInputs(
+            stem_paths=a_paths, analysis=a_bundle, original_audio_path=a_orig
+        )
+        b_inputs = SongRenderInputs(
+            stem_paths=b_paths, analysis=b_bundle, original_audio_path=b_orig
+        )
 
         try:
             result = render(plan_json, a_inputs, b_inputs)
