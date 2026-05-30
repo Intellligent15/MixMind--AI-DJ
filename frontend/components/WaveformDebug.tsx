@@ -41,6 +41,11 @@ export function WaveformDebug({
     queryKey: ["vocal_safe_regions", song.id],
     queryFn: () => api.getVocalSafeRegions(song.id),
     retry: false,
+    // Before transcription + alignment finish, the endpoint 409s ("not
+    // fully processed yet"). Poll until it succeeds so the bands appear
+    // on their own — no manual reload.
+    refetchInterval: (query) =>
+      query.state.status === "success" ? false : 5000,
   });
 
   useEffect(() => {
@@ -90,20 +95,6 @@ export function WaveformDebug({
           ref={overlayRef}
           className="absolute inset-0 pointer-events-none"
         >
-          {(safeRegionsQuery.data?.regions ?? []).map((r, i) => (
-            <div
-              key={`safe-${i}`}
-              className="absolute top-0 bottom-0"
-              style={{
-                left: `${(r.start / duration) * 100}%`,
-                width: `${((r.end - r.start) / duration) * 100}%`,
-                background: "rgba(34, 197, 94, 0.18)",
-                borderLeft: "1px dashed rgba(22, 163, 74, 0.5)",
-                borderRight: "1px dashed rgba(22, 163, 74, 0.5)",
-              }}
-              title={`Safe: ${r.start.toFixed(1)}s–${r.end.toFixed(1)}s`}
-            />
-          ))}
           {analysis.sections.map((sec, i) => (
             <div
               key={`sec-${i}`}
@@ -132,8 +123,36 @@ export function WaveformDebug({
               />
             );
           })}
+          {/* Safe regions drawn LAST so they sit on top of the section
+              bands and beat ticks — otherwise the section fills bury them
+              and only the borders show through. */}
+          {(safeRegionsQuery.data?.regions ?? []).map((r, i) => (
+            <div
+              key={`safe-${i}`}
+              className="absolute top-0 bottom-0"
+              style={{
+                left: `${(r.start / duration) * 100}%`,
+                width: `${((r.end - r.start) / duration) * 100}%`,
+                background: "rgba(34, 197, 94, 0.30)",
+                borderLeft: "2px solid rgba(22, 163, 74, 0.95)",
+                borderRight: "2px solid rgba(22, 163, 74, 0.95)",
+                boxShadow: "inset 0 -5px 0 rgba(22, 163, 74, 0.95)",
+              }}
+              title={`Safe: ${r.start.toFixed(1)}s–${r.end.toFixed(1)}s`}
+            />
+          ))}
         </div>
       </div>
+      {safeRegionsQuery.data && (
+        <p className="text-xs text-slate-500 dark:text-slate-400">
+          <span className="inline-block w-3 h-3 align-middle mr-1 rounded-sm"
+            style={{ background: "rgba(34,197,94,0.30)", border: "2px solid rgba(22,163,74,0.95)" }}
+          />
+          {safeRegionsQuery.data.regions.length} vocal-safe region
+          {safeRegionsQuery.data.regions.length === 1 ? "" : "s"} (green) ·
+          colored bands = sections · ticks = beats/downbeats
+        </p>
+      )}
       <div className="flex gap-2 text-xs">
         <button
           type="button"
