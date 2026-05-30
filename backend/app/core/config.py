@@ -22,6 +22,9 @@ class Settings(BaseSettings):
     modal_token_secret: str = ""
     
     genius_access_token: str = ""
+    gemini_api_key: str = ""
+    llm_provider: str = "gemini"
+    use_llm_planner: bool = True
 
     # Path to a Netscape-format cookies.txt that yt-dlp passes to YouTube.
     # Required on cloud hosts (the droplet) — YouTube's anti-bot system

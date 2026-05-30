@@ -26,7 +26,11 @@ from app.models import (
     Song,
     SongStatus,
     Stems,
+    Transcription,
 )
+from app.models.lyrics import Lyrics, LyricsAlignmentStatus
+from app.services.llm import get_llm_provider
+from app.core.config import settings
 from app.services.mixer.executor import render
 from app.services.mixer.plan import build_pair_plan
 from app.services.mixer.types import (
@@ -43,6 +47,60 @@ CLAIMABLE_STATUSES = (
     MixPlanStatus.failed,
     MixPlanStatus.ready,  # allows re-render of an already-rendered pair
 )
+
+# Permanent pitch shifts beyond ±2 semitones produce pyrubberband artifacts
+# that outweigh the harmonic benefit (see build_pair_plan's matching cap).
+# Enforced post-LLM since the model can still emit larger values despite
+# being told the limit in the system prompt.
+PERMANENT_PITCH_SHIFT_CAP = 2
+
+_LEGAL_TOOLS = {
+    "set_transition_window",
+    "set_tempo_ramp",
+    "temporary_pitch_shift",
+    "pitch_shift",
+    "crossfade_stem",
+}
+_CANONICAL_STEMS = {"vocals", "drums", "bass", "other"}
+
+
+def _validate_llm_plan(plan: list[dict]) -> None:
+    """Raise ValueError if the LLM's plan won't survive the executor.
+
+    Checks the same invariants the executor enforces, up-front, so a
+    malformed plan triggers the deterministic fallback instead of
+    failing the render and stranding the row in `failed`.
+    """
+    if not isinstance(plan, list) or not plan:
+        raise ValueError("LLM plan is not a non-empty list")
+    windows = [c for c in plan if c.get("tool") == "set_transition_window"]
+    if len(windows) != 1:
+        raise ValueError(f"expected 1 set_transition_window, got {len(windows)}")
+    stem_calls = [c for c in plan if c.get("tool") == "crossfade_stem"]
+    if len(stem_calls) != 4:
+        raise ValueError(f"expected 4 crossfade_stem calls, got {len(stem_calls)}")
+    if {c.get("stem") for c in stem_calls} != _CANONICAL_STEMS:
+        raise ValueError("crossfade_stem calls must cover vocals/drums/bass/other")
+    illegal = {c.get("tool") for c in plan} - _LEGAL_TOOLS
+    if illegal:
+        raise ValueError(f"illegal tools in plan: {sorted(illegal)}")
+
+
+def _clamp_pitch_shifts(plan: list[dict]) -> list[dict]:
+    """Clamp permanent `pitch_shift.semitones` to ±PERMANENT_PITCH_SHIFT_CAP."""
+    clamped = []
+    for call in plan:
+        if call.get("tool") == "pitch_shift":
+            n = call.get("semitones", 0)
+            capped = max(-PERMANENT_PITCH_SHIFT_CAP, min(PERMANENT_PITCH_SHIFT_CAP, n))
+            if capped != n:
+                logger.warning(
+                    "render_transition: clamping LLM permanent pitch_shift %s -> %s",
+                    n, capped,
+                )
+                call = {**call, "semitones": capped}
+        clamped.append(call)
+    return clamped
 
 
 def _to_bundle(analysis: Analysis, duration: float) -> AnalysisBundle:
@@ -116,13 +174,120 @@ def render_transition(mix_plan_id: str) -> str | None:
             _mark_failed(plan_uuid, "missing analysis or stems")
             return None
 
+        # Fetch optional inputs for LLM planning
+        a_transcription = db.scalar(select(Transcription).where(Transcription.song_id == a.id))
+        b_transcription = db.scalar(select(Transcription).where(Transcription.song_id == b.id))
+        a_lyrics = db.scalar(select(Lyrics).where(Lyrics.song_id == a.id))
+        b_lyrics = db.scalar(select(Lyrics).where(Lyrics.song_id == b.id))
+
         a_bundle = _to_bundle(a_analysis, a.duration_seconds)
         b_bundle = _to_bundle(b_analysis, b.duration_seconds)
         existing_plan_json = row.plan_json
         a_audio_key = a.audio_path
         b_audio_key = b.audio_path
 
-    plan_json = existing_plan_json or build_pair_plan(a_bundle, b_bundle)
+        # Capture vocal envelope paths to load via storage
+        a_envelope_path = a_stems.vocal_envelope_path
+        b_envelope_path = b_stems.vocal_envelope_path
+
+        # LLM-only inputs that don't ride through AnalysisBundle (which
+        # the executor consumes and intentionally stays narrow). Snapshot
+        # them here so the rest of the worker can stay session-free.
+        a_energy_curve = list(a_analysis.energy_curve or [])
+        b_energy_curve = list(b_analysis.energy_curve or [])
+        a_vocal_segments = list(a_analysis.vocal_segments or [])
+        b_vocal_segments = list(b_analysis.vocal_segments or [])
+        a_raw_segments = list(a_transcription.segments) if a_transcription else None
+        b_raw_segments = list(b_transcription.segments) if b_transcription else None
+        a_alignment_ok = (
+            a_lyrics is not None
+            and a_lyrics.alignment_status == LyricsAlignmentStatus.success
+        )
+        b_alignment_ok = (
+            b_lyrics is not None
+            and b_lyrics.alignment_status == LyricsAlignmentStatus.success
+        )
+        a_aligned_words = a_lyrics.aligned_words if a_alignment_ok else None
+        b_aligned_words = b_lyrics.aligned_words if b_alignment_ok else None
+
+    import json
+    from app.services.vocal_safety.safety import vocal_safe_regions
+
+    async def _fetch_safe_regions(transcription, lyrics, envelope_path, duration):
+        if not transcription or not envelope_path:
+            return []
+        try:
+            envelope_data = await storage.read(envelope_path)
+            envelope = json.loads(envelope_data.decode("utf-8"))
+        except Exception:
+            return []
+        
+        aligned_words = None
+        if lyrics and lyrics.alignment_status == LyricsAlignmentStatus.success:
+            aligned_words = lyrics.aligned_words
+            
+        return vocal_safe_regions(
+            transcription_segments=transcription.segments,
+            envelope=envelope,
+            aligned_words=aligned_words,
+            duration_seconds=duration or 0.0,
+        )
+
+    def _bundle_to_llm_dict(bundle: AnalysisBundle, energy_curve, vocal_segments) -> dict:
+        return {
+            "bpm": bundle.bpm,
+            "key": bundle.key,
+            "camelot_key": bundle.camelot_key,
+            "time_signature": bundle.time_signature,
+            "downbeats": bundle.downbeats,
+            "sections": bundle.sections,
+            "duration": bundle.duration,
+            "energy_curve": energy_curve,
+            "vocal_segments": vocal_segments,
+        }
+
+    async def _build_plan() -> list[dict]:
+        if not settings.use_llm_planner:
+            return build_pair_plan(a_bundle, b_bundle)
+
+        a_regions = await _fetch_safe_regions(a_transcription, a_lyrics, a_envelope_path, a.duration_seconds)
+        b_regions = await _fetch_safe_regions(b_transcription, b_lyrics, b_envelope_path, b.duration_seconds)
+
+        a_llm_input = {
+            "analysis": _bundle_to_llm_dict(a_bundle, a_energy_curve, a_vocal_segments),
+            "aligned_lyrics": a_aligned_words,
+            "raw_transcription": None if a_alignment_ok else a_raw_segments,
+            "vocal_safe_regions": a_regions,
+        }
+        b_llm_input = {
+            "analysis": _bundle_to_llm_dict(b_bundle, b_energy_curve, b_vocal_segments),
+            "aligned_lyrics": b_aligned_words,
+            "raw_transcription": None if b_alignment_ok else b_raw_segments,
+            "vocal_safe_regions": b_regions,
+        }
+
+        # Provide tools schema definition to the LLM. `beat_grid` is
+        # intentionally omitted from per-song inputs — `downbeats` is
+        # enough for the LLM to reason about bars and avoids hundreds
+        # of redundant floats per prompt.
+        tools_schema = json.dumps([
+            {"tool": "set_transition_window", "from_song_time_start": "float", "to_song_time_start": "float", "duration_bars": "int"},
+            {"tool": "crossfade_stem", "stem": "str", "from_song": "str", "to_song": "str", "start_bar": "int", "duration_bars": "int", "curve": "str"},
+            {"tool": "pitch_shift", "song": "str", "semitones": "float"},
+            {"tool": "temporary_pitch_shift", "song": "str", "start_time": "float", "semitones": "float", "fade_in_bars": "int", "hold_bars": "int", "fade_out_bars": "int"},
+            {"tool": "set_tempo_ramp", "song": "str", "start_time": "float", "end_time": "float", "start_bpm": "float", "end_bpm": "float"},
+        ], indent=2)
+
+        provider = get_llm_provider()
+        try:
+            plan = await provider.plan_transition(a_llm_input, b_llm_input, tools_schema)
+            _validate_llm_plan(plan)
+            return _clamp_pitch_shifts(plan)
+        except Exception as exc:
+            logger.error("render_transition: LLM planner failed, falling back to deterministic: %s", exc)
+            return build_pair_plan(a_bundle, b_bundle)
+            
+    plan_json = existing_plan_json or asyncio.run(_build_plan())
 
     import tempfile
     from pathlib import Path
