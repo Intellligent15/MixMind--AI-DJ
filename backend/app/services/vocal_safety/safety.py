@@ -67,14 +67,17 @@ def _word_has_audio_support(
     timestamp. Uses MAX over the word window (not midpoint) so
     inter-syllable consonant gaps don't false-reject real words.
     Requires BOTH RMS AND peak to clear their thresholds — spec's
-    usable_vocal_word condition."""
+    usable_vocal_word condition. When the envelope predates the peak
+    sidecar (legacy stems), peak is absent and only RMS is required."""
     if word_end <= word_start:
         return False
     start_idx = int(word_start / hop)
     # +1 so a sub-frame word still inspects at least one frame.
     end_idx = max(start_idx + 1, int(word_end / hop) + 1)
     rms_max = _max_over_range(rms_list, start_idx, end_idx)
-    peak_max = _max_over_range(peak_list, start_idx, end_idx) if peak_list else 0.0
+    if not peak_list:
+        return rms_max >= rms_presence
+    peak_max = _max_over_range(peak_list, start_idx, end_idx)
     return rms_max >= rms_presence and peak_max >= peak_presence
 
 
@@ -177,6 +180,62 @@ def _merge_intervals(
     return merged
 
 
+def _quiet_subregions(
+    rms_list: list[float],
+    peak_list: list[float],
+    gap_start: float,
+    gap_end: float,
+    hop: float,
+    rms_quiet: float,
+    peak_quiet: float,
+    min_seconds: float,
+    bridge_seconds: float = 0.3,
+) -> list[tuple[float, float]]:
+    """Find the contiguous *actually-quiet* sub-spans inside an inter-vocal
+    gap. A long gap can mix a loud outro/instrumental break with a genuinely
+    silent pocket; judging the whole gap at once (as a single noisy-fraction
+    test) throws the silent pocket out with the loud parts. Instead we walk
+    the frames, growing a quiet run and tolerating noisy blips up to
+    ``bridge_seconds`` (longer noisy stretches split the run). Each surviving
+    run must still clear the overall noisy-fraction tolerance and the
+    minimum-length floor."""
+    start_idx = max(0, int(gap_start / hop))
+    end_idx = min(len(rms_list), int(gap_end / hop))
+    if end_idx <= start_idx:
+        return []
+
+    bridge = max(1, int(bridge_seconds / hop))
+    runs: list[tuple[int, int]] = []
+    run_start: int | None = None
+    noisy_streak = 0
+    for i in range(start_idx, end_idx):
+        peak_val = peak_list[i] if (peak_list and i < len(peak_list)) else 0.0
+        quiet = rms_list[i] < rms_quiet and peak_val < peak_quiet
+        if quiet:
+            if run_start is None:
+                run_start = i
+            noisy_streak = 0
+        elif run_start is not None:
+            noisy_streak += 1
+            if noisy_streak > bridge:
+                # Close the run at the first noisy frame of this streak so
+                # trailing bleed isn't folded into the safe span.
+                runs.append((run_start, i - noisy_streak + 1))
+                run_start = None
+                noisy_streak = 0
+    if run_start is not None:
+        runs.append((run_start, end_idx))
+
+    min_frames = min_seconds / hop
+    out: list[tuple[float, float]] = []
+    for a, b in runs:
+        if (b - a) >= min_frames and _quiet_fraction_ok(
+            rms_list, peak_list, a, b, rms_quiet, peak_quiet
+        ):
+            out.append((a * hop, b * hop))
+    return out
+
+
 def vocal_safe_regions(
     transcription_segments: list[dict[str, Any]],
     envelope: dict[str, Any],
@@ -225,19 +284,21 @@ def vocal_safe_regions(
     for word_start, word_end in bounds:
         gap_start = cursor
         gap_end = word_start
-        if gap_end - gap_start >= min_safe_region_seconds:
-            start_idx = max(0, int(gap_start / hop))
-            end_idx = min(len(rms_list), int(gap_end / hop))
-            if _quiet_fraction_ok(
-                rms_list, peak_list, start_idx, end_idx,
-                stem_rms_quiet, stem_peak_quiet,
-            ):
-                safe_regions.append({
-                    "start": gap_start,
-                    "end": gap_end,
-                    "safe": True,
-                    "reason": "quiet_gap",
-                })
         cursor = word_end
+        if gap_end - gap_start < min_safe_region_seconds:
+            continue
+        # Don't accept/reject the whole gap wholesale — a long inter-vocal
+        # gap can hold a loud break and a silent pocket. Emit each quiet
+        # sub-span inside it.
+        for q_start, q_end in _quiet_subregions(
+            rms_list, peak_list, gap_start, gap_end, hop,
+            stem_rms_quiet, stem_peak_quiet, min_safe_region_seconds,
+        ):
+            safe_regions.append({
+                "start": q_start,
+                "end": q_end,
+                "safe": True,
+                "reason": "quiet_gap",
+            })
 
     return safe_regions

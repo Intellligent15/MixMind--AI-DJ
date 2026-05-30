@@ -165,7 +165,11 @@ def test_safe_regions_uses_aligned_words_when_alignment_success(db_session: Sess
         }],
     ))
     db_session.flush()
-    r = _client(db_session).get(f"/api/songs/{s.id}/vocal_safe_regions")
+    # Pin a small minimum so this 10s fixture exercises the aligned-words
+    # split itself, not the (larger) default min-region threshold.
+    r = _client(db_session).get(
+        f"/api/songs/{s.id}/vocal_safe_regions?min_safe_region_seconds=1.5"
+    )
     assert r.status_code == 200
     # The word at 5.0-5.5 splits the song into two safe regions.
     assert len(r.json()["regions"]) == 2

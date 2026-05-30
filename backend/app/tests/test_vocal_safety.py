@@ -150,3 +150,36 @@ def test_empty_envelope_returns_no_envelope_marker():
         duration_seconds=180.0,
     )
     assert out == [{"start": 0.0, "end": 180.0, "safe": True, "reason": "no_envelope"}]
+
+
+def test_quiet_pocket_inside_noisy_gap_is_surfaced():
+    """A long inter-vocal gap that mixes a loud break with a genuinely
+    silent pocket must surface the pocket — not reject the whole gap
+    because its overall noisy fraction exceeds tolerance. Regression for
+    the "Drake - Massive" 4:00–4:40 case."""
+    # 10 Hz, 60 s = 600 frames. Vocals stop at 6 s; the 6–60 s tail mixes
+    # noisy 6–30 s + quiet 30–50 s + noisy 50–60 s.
+    rms = (
+        [0.0] * 50          # 0–5 s   quiet intro
+        + [0.0] * 10        # 5–6 s   (word coverage)
+        + [0.05] * 240      # 6–30 s  loud break
+        + [0.0] * 200       # 30–50 s SILENT POCKET
+        + [0.05] * 100      # 50–60 s loud outro
+    )
+    env = _envelope(10, rms)
+    aligned = [
+        {"word": "hey", "start": 5.0, "end": 6.0,
+         "confidence": 0.9, "source": "whisper_match"},
+    ]
+    out = vocal_safe_regions(
+        transcription_segments=[],
+        envelope=env,
+        aligned_words=aligned,
+        duration_seconds=60.0,
+    )
+    # The silent pocket surfaces as its own region.
+    pocket = [r for r in out if abs(r["start"] - 30.0) < 1.0 and abs(r["end"] - 50.0) < 1.0]
+    assert len(pocket) == 1, out
+    # No region bleeds into the loud 6–30 s break, and none spans the whole tail.
+    assert not any(r["start"] < 28.0 and r["end"] > 8.0 for r in out), out
+    assert all((r["end"] - r["start"]) < 54.0 for r in out), out
