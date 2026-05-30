@@ -217,3 +217,157 @@ def test_render_transition_missing_row_returns_none():
     from app.workers.render_transition import render_transition
     result = render_transition(str(uuid.uuid4()))
     assert result is None
+
+
+def _valid_plan(extra: list[dict] | None = None) -> list[dict]:
+    """A minimally-valid LLM plan: one window + 4 stems (+ optional extras)."""
+    plan = [
+        {"tool": "set_transition_window",
+         "from_song_time_start": 0.0, "to_song_time_start": 0.0, "duration_bars": 4},
+    ]
+    if extra:
+        plan.extend(extra)
+    for stem in ("vocals", "drums", "bass", "other"):
+        plan.append({
+            "tool": "crossfade_stem", "stem": stem,
+            "from_song": "A", "to_song": "B",
+            "start_bar": 0, "duration_bars": 4, "curve": "equal_power",
+        })
+    return plan
+
+
+def test_render_transition_llm_planner(pair_with_plan):
+    storage = AsyncMock()
+    async def _write(key, data):
+        return f"/abs/{key}"
+    storage.write = _write
+    storage.read.return_value = b'{"rms": [0.1], "peak": [0.2], "frame_hz": 10}'
+
+    mock_llm_provider = AsyncMock()
+    mock_plan = _valid_plan()
+    mock_llm_provider.plan_transition.return_value = mock_plan
+
+    with (
+        patch("app.workers.render_transition.render", return_value=_patched_render()),
+        patch("app.workers.render_transition.get_storage", return_value=storage),
+        patch("app.workers.render_transition.get_llm_provider", return_value=mock_llm_provider),
+        patch("app.workers.render_transition.settings.use_llm_planner", True),
+    ):
+        from app.workers.render_transition import render_transition
+        result = render_transition(pair_with_plan["plan_id"])
+
+    assert result == pair_with_plan["plan_id"]
+    with SessionLocal() as db:
+        row = db.get(MixPlan, uuid.UUID(pair_with_plan["plan_id"]))
+        assert row.plan_json == mock_plan
+    mock_llm_provider.plan_transition.assert_called_once()
+
+    # Verify the LLM saw the richer signals (energy_curve + sections + downbeats).
+    call_args = mock_llm_provider.plan_transition.call_args.args
+    from_song_input, to_song_input = call_args[0], call_args[1]
+    assert "energy_curve" in from_song_input["analysis"]
+    assert "downbeats" in from_song_input["analysis"]
+    assert "sections" in from_song_input["analysis"]
+    assert "vocal_segments" in to_song_input["analysis"]
+
+
+def test_render_transition_llm_planner_fallback(pair_with_plan):
+    storage = AsyncMock()
+    async def _write(key, data):
+        return f"/abs/{key}"
+    storage.write = _write
+    storage.read.return_value = b'{"rms": [0.1], "peak": [0.2], "frame_hz": 10}'
+
+    mock_llm_provider = AsyncMock()
+    mock_llm_provider.plan_transition.side_effect = Exception("LLM timed out")
+
+    with (
+        patch("app.workers.render_transition.render", return_value=_patched_render()),
+        patch("app.workers.render_transition.get_storage", return_value=storage),
+        patch("app.workers.render_transition.get_llm_provider", return_value=mock_llm_provider),
+        patch("app.workers.render_transition.settings.use_llm_planner", True),
+        patch("app.workers.render_transition.build_pair_plan") as mock_fallback,
+    ):
+        fallback_plan = _valid_plan()
+        mock_fallback.return_value = fallback_plan
+        from app.workers.render_transition import render_transition
+        result = render_transition(pair_with_plan["plan_id"])
+
+    assert result == pair_with_plan["plan_id"]
+    with SessionLocal() as db:
+        row = db.get(MixPlan, uuid.UUID(pair_with_plan["plan_id"]))
+        assert row.plan_json == fallback_plan
+    mock_llm_provider.plan_transition.assert_called_once()
+    mock_fallback.assert_called_once()
+
+
+def test_render_transition_llm_invalid_plan_falls_back(pair_with_plan):
+    """LLM returns a plan that won't pass shape validation (missing stem
+    calls). The worker must fall back to the deterministic planner
+    instead of letting the executor blow up mid-render."""
+    storage = AsyncMock()
+    async def _write(key, data):
+        return f"/abs/{key}"
+    storage.write = _write
+    storage.read.return_value = b'{"rms": [0.1], "peak": [0.2], "frame_hz": 10}'
+
+    mock_llm_provider = AsyncMock()
+    mock_llm_provider.plan_transition.return_value = [
+        {"tool": "set_transition_window", "from_song_time_start": 0.0,
+         "to_song_time_start": 0.0, "duration_bars": 4},
+        # only 2 of 4 required stems
+        {"tool": "crossfade_stem", "stem": "vocals",
+         "from_song": "A", "to_song": "B",
+         "start_bar": 0, "duration_bars": 4, "curve": "equal_power"},
+        {"tool": "crossfade_stem", "stem": "drums",
+         "from_song": "A", "to_song": "B",
+         "start_bar": 0, "duration_bars": 4, "curve": "equal_power"},
+    ]
+
+    with (
+        patch("app.workers.render_transition.render", return_value=_patched_render()),
+        patch("app.workers.render_transition.get_storage", return_value=storage),
+        patch("app.workers.render_transition.get_llm_provider", return_value=mock_llm_provider),
+        patch("app.workers.render_transition.settings.use_llm_planner", True),
+        patch("app.workers.render_transition.build_pair_plan") as mock_fallback,
+    ):
+        fallback_plan = _valid_plan()
+        mock_fallback.return_value = fallback_plan
+        from app.workers.render_transition import render_transition
+        result = render_transition(pair_with_plan["plan_id"])
+
+    assert result == pair_with_plan["plan_id"]
+    mock_fallback.assert_called_once()
+    with SessionLocal() as db:
+        row = db.get(MixPlan, uuid.UUID(pair_with_plan["plan_id"]))
+        assert row.plan_json == fallback_plan
+
+
+def test_render_transition_clamps_llm_permanent_pitch_shift(pair_with_plan):
+    """LLM emits pitch_shift=+5; worker must clamp to +2 before persist."""
+    storage = AsyncMock()
+    async def _write(key, data):
+        return f"/abs/{key}"
+    storage.write = _write
+    storage.read.return_value = b'{"rms": [0.1], "peak": [0.2], "frame_hz": 10}'
+
+    mock_llm_provider = AsyncMock()
+    mock_llm_provider.plan_transition.return_value = _valid_plan(extra=[
+        {"tool": "pitch_shift", "song": "B", "semitones": 5},
+    ])
+
+    with (
+        patch("app.workers.render_transition.render", return_value=_patched_render()),
+        patch("app.workers.render_transition.get_storage", return_value=storage),
+        patch("app.workers.render_transition.get_llm_provider", return_value=mock_llm_provider),
+        patch("app.workers.render_transition.settings.use_llm_planner", True),
+    ):
+        from app.workers.render_transition import render_transition
+        result = render_transition(pair_with_plan["plan_id"])
+
+    assert result == pair_with_plan["plan_id"]
+    with SessionLocal() as db:
+        row = db.get(MixPlan, uuid.UUID(pair_with_plan["plan_id"]))
+        pitch_calls = [c for c in row.plan_json if c["tool"] == "pitch_shift"]
+        assert len(pitch_calls) == 1
+        assert pitch_calls[0]["semitones"] == 2  # clamped from +5
