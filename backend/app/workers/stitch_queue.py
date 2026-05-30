@@ -154,7 +154,14 @@ def stitch_queue(queue_id: str) -> str | None:
             audios.append(y)
 
         stitched = [audios[0]]
-        
+        # How many samples of the current `stitched[-1]` were trimmed off the
+        # front of its source `audios[i]` in the previous iteration's xfade.
+        # _get_mix0_sample returns an index into the full audios[i], so we
+        # must subtract this offset when slicing the (already head-trimmed)
+        # buffer. Without this, each iter past the first re-plays a chunk of
+        # the middle song before the next junction.
+        head_offset = 0
+
         for i in range(len(mix_plans) - 1):
             mix0 = stitched[-1] # The accumulated mix so far (or we just accumulate chunks)
             mix1 = audios[i+1]
@@ -197,7 +204,7 @@ def stitch_queue(queue_id: str) -> str | None:
             S1 = _get_mix1_sample(T_orig, sr)
             
             # To accumulate cleanly, we replace stitched[-1] with its sliced version
-            mix0_sliced = mix0[:S0]
+            mix0_sliced = mix0[: S0 - head_offset]
             mix1_sliced = mix1[S1:]
             
             # 50ms crossfade
@@ -209,9 +216,9 @@ def stitch_queue(queue_id: str) -> str | None:
                 t = np.linspace(0.0, 1.0, xfade_samples, endpoint=False, dtype=np.float32)
                 gain0 = np.cos(t * (np.pi / 2.0))
                 gain1 = np.sin(t * (np.pi / 2.0))
-                
+
                 xfade_region = (
-                    gain0[:, None] * mix0_sliced[-xfade_samples:] + 
+                    gain0[:, None] * mix0_sliced[-xfade_samples:] +
                     gain1[:, None] * mix1_sliced[:xfade_samples]
                 )
                 mix0_sliced = mix0_sliced[:-xfade_samples]
@@ -219,9 +226,11 @@ def stitch_queue(queue_id: str) -> str | None:
                 stitched[-1] = mix0_sliced
                 stitched.append(xfade_region)
                 stitched.append(mix1_sliced)
+                head_offset = S1 + xfade_samples
             else:
                 stitched[-1] = mix0_sliced
                 stitched.append(mix1_sliced)
+                head_offset = S1
 
         final_audio = np.concatenate(stitched)
         
