@@ -280,6 +280,8 @@ def test_render_transition_llm_planner(pair_with_plan):
     assert "energy_curve" in from_song_input["analysis"]
     assert "downbeats" in from_song_input["analysis"]
     assert "sections" in from_song_input["analysis"]
+    assert "max_seam_time" in from_song_input["analysis"]
+    assert "max_seam_time" in to_song_input["analysis"]
     assert "vocal_safe_regions" in to_song_input
     # Lyrics, raw transcription, and vocal_segments are intentionally
     # absent — vocal_safe_regions already distills what the LLM needs,
@@ -341,6 +343,61 @@ def test_render_transition_llm_invalid_plan_falls_back(pair_with_plan):
          "from_song": "A", "to_song": "B",
          "start_bar": 0, "duration_bars": 4, "curve": "equal_power"},
     ]
+
+    with (
+        patch("app.workers.render_transition.render", return_value=_patched_render()),
+        patch("app.workers.render_transition.get_storage", return_value=storage),
+        patch("app.workers.render_transition.get_llm_provider", return_value=mock_llm_provider),
+        patch("app.workers.render_transition.settings.use_llm_planner", True),
+        patch("app.workers.render_transition.build_pair_plan") as mock_fallback,
+    ):
+        fallback_plan = _valid_plan()
+        mock_fallback.return_value = fallback_plan
+        from app.workers.render_transition import render_transition
+        result = render_transition(pair_with_plan["plan_id"])
+
+    assert result == pair_with_plan["plan_id"]
+    mock_fallback.assert_called_once()
+    with SessionLocal() as db:
+        row = db.get(MixPlan, uuid.UUID(pair_with_plan["plan_id"]))
+        assert row.plan_json == fallback_plan
+
+
+def test_max_seam_time_helper():
+    """Latest seam = duration - 16 bars - 5s safety, clamped to 0."""
+    from app.workers.render_transition import _max_seam_time
+    # 240s @ 120 BPM, 4/4: sec_per_bar = 2.0, 16 bars = 32s. Latest = 240 - 32 - 5 = 203.
+    assert _max_seam_time(240.0, 120.0, 4) == 203.0
+    # Short song: should clamp to 0, not go negative.
+    assert _max_seam_time(10.0, 60.0, 4) == 0.0
+    # No BPM / no duration → 0 (don't crash).
+    assert _max_seam_time(0.0, 120.0, 4) == 0.0
+    assert _max_seam_time(240.0, 0.0, 4) == 0.0
+
+
+def test_render_transition_rejects_seam_without_headroom(pair_with_plan):
+    """LLM picks a seam too close to A's end so the executor would clamp
+    the crossfade to ~nothing. Validator rejects → deterministic
+    fallback gets persisted instead."""
+    storage = AsyncMock()
+    async def _write(key, data):
+        return f"/abs/{key}"
+    storage.write = _write
+    storage.read.return_value = b'{"rms": [0.1], "peak": [0.2], "frame_hz": 10}'
+
+    # _make_analysis sets bpm=120, time_signature=4; pair_with_plan
+    # sets duration_seconds=180. So max_seam_time = 180 - 16*2 - 5 = 143s.
+    # Picking from_song_time_start=170s + 16-bar crossfade (32s) puts
+    # the seam end at 202s, well past the 180s song.
+    bad_plan = _valid_plan()
+    bad_plan[0]["from_song_time_start"] = 170.0
+    bad_plan[0]["duration_bars"] = 16
+    for c in bad_plan:
+        if c["tool"] == "crossfade_stem":
+            c["duration_bars"] = 16
+
+    mock_llm_provider = AsyncMock()
+    mock_llm_provider.plan_transition.return_value = bad_plan
 
     with (
         patch("app.workers.render_transition.render", return_value=_patched_render()),

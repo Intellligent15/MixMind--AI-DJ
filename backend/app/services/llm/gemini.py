@@ -19,11 +19,12 @@ Your goal is to plan a seamless, professional transition from A to B. You must r
 
 Rules:
 1. Always start with exactly one `set_transition_window` call to define the alignment and crossfade duration.
-2. Hard cuts, stem swaps, and drop swaps should land inside the provided `vocal_safe_regions`. Outside them, prefer crossfades.
-3. You must emit exactly 4 `crossfade_stem` calls, one for each stem: "vocals", "drums", "bass", "other". All 4 MUST share the exact same `start_bar`, `duration_bars`, and `curve` ("equal_power" or "linear"). Every call uses `"from_song": "A"` and `"to_song": "B"`.
-4. If keys clash, you may use `pitch_shift` (permanent) or `temporary_pitch_shift` (returns to native key) on song B (i.e. `"song": "B"`). Permanent `pitch_shift` is capped at ±2 semitones — beyond that, pyrubberband artifacts outweigh the harmonic benefit, and the executor will clamp. Prefer `temporary_pitch_shift` for larger excursions.
-5. If tempos clash significantly, you may use `set_tempo_ramp` on song B (`"song": "B"`) to ramp from A's BPM to B's BPM over a specified window.
-6. The output must be a valid JSON list containing only tool call objects.
+2. SEAM HEADROOM (critical): `from_song_time_start` MUST be <= A's `analysis.max_seam_time`, and `to_song_time_start` MUST be <= B's `analysis.max_seam_time`. These values are pre-computed to leave room for the full crossfade plus a safety buffer. If you violate this, the executor will shrink your crossfade to whatever audio remains — typically producing an abrupt cut rather than a smooth blend. For the most musical result in A, place `from_song_time_start` at the start of A's last section (the outro) as long as that start is <= A's `max_seam_time`.
+3. Hard cuts, stem swaps, and drop swaps should land inside the provided `vocal_safe_regions`. Outside them, prefer crossfades.
+4. You must emit exactly 4 `crossfade_stem` calls, one for each stem: "vocals", "drums", "bass", "other". All 4 MUST share the exact same `start_bar`, `duration_bars`, and `curve` ("equal_power" or "linear"). Every call uses `"from_song": "A"` and `"to_song": "B"`.
+5. If keys clash, you may use `pitch_shift` (permanent) or `temporary_pitch_shift` (returns to native key) on song B (i.e. `"song": "B"`). Permanent `pitch_shift` is capped at ±2 semitones — beyond that, pyrubberband artifacts outweigh the harmonic benefit, and the executor will clamp. Prefer `temporary_pitch_shift` for larger excursions.
+6. If tempos clash significantly, you may use `set_tempo_ramp` on song B (`"song": "B"`) to ramp from A's BPM to B's BPM over a specified window.
+7. The output must be a valid JSON list containing only tool call objects.
 """
 
 # Timeout for a single Gemini generate_content call. 30s is a healthy

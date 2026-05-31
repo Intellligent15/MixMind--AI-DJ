@@ -106,6 +106,29 @@ def _validate_llm_plan(plan: list[dict]) -> None:
                 )
 
 
+# Maximum crossfade length the deterministic planner uses; we treat
+# it as the worst case the LLM might ask for and reserve room for it.
+_MAX_CROSSFADE_BARS = 16
+# Safety buffer (seconds) past the crossfade end. Absorbs stem-WAV
+# drift vs `Song.duration_seconds` metadata (Demucs trims/pads, yt-dlp
+# rounds), which we've seen reach ~25s in pathological cases.
+_SEAM_SAFETY_SECONDS = 5.0
+
+
+def _max_seam_time(duration: float, bpm: float, time_signature: int) -> float:
+    """Latest seam time that leaves room for a full-length crossfade.
+
+    Returned in original-song seconds. Clamped to 0 if the song is
+    shorter than the reserved tail — in that case the validator will
+    reject any LLM plan and trigger the deterministic fallback (which
+    handles short songs via its own duration-bars clamp).
+    """
+    if not bpm or not duration:
+        return 0.0
+    sec_per_bar = (60.0 / bpm) * time_signature
+    return max(0.0, duration - _MAX_CROSSFADE_BARS * sec_per_bar - _SEAM_SAFETY_SECONDS)
+
+
 def _downsample(values: list[float], target: int = 30) -> list[float]:
     """Return at most `target` evenly-spaced samples from `values`.
 
@@ -118,6 +141,41 @@ def _downsample(values: list[float], target: int = 30) -> list[float]:
         return values
     step = n / target
     return [values[int(i * step)] for i in range(target)]
+
+
+def _validate_seam_headroom(
+    plan: list[dict], a: AnalysisBundle, b: AnalysisBundle
+) -> None:
+    """Reject plans whose seam + crossfade extends past either song.
+
+    The executor will gracefully clamp short overlaps, but a clamp from
+    ~30s down to ~4s produces a perceptually abrupt cut — defeats the
+    point of a DJ-style transition. Reject so we fall back to the
+    deterministic planner, which picks seams in A's outro section
+    (where there's room by construction).
+    """
+    window = next((c for c in plan if c.get("tool") == "set_transition_window"), None)
+    if window is None:
+        return  # _validate_llm_plan already rejected
+    duration_bars = window.get("duration_bars", 0)
+    from_t = window.get("from_song_time_start", 0.0)
+    to_t = window.get("to_song_time_start", 0.0)
+    sec_per_bar_a = (60.0 / a.bpm) * a.time_signature if a.bpm else 0.0
+    sec_per_bar_b = (60.0 / b.bpm) * b.time_signature if b.bpm else 0.0
+    crossfade_a = duration_bars * sec_per_bar_a
+    crossfade_b = duration_bars * sec_per_bar_b
+    if from_t + crossfade_a > a.duration - _SEAM_SAFETY_SECONDS:
+        raise ValueError(
+            f"A's seam leaves too little headroom: "
+            f"from={from_t:.1f}s + crossfade={crossfade_a:.1f}s > "
+            f"duration={a.duration:.1f}s - safety={_SEAM_SAFETY_SECONDS}s"
+        )
+    if to_t + crossfade_b > b.duration - _SEAM_SAFETY_SECONDS:
+        raise ValueError(
+            f"B's seam leaves too little headroom: "
+            f"to={to_t:.1f}s + crossfade={crossfade_b:.1f}s > "
+            f"duration={b.duration:.1f}s - safety={_SEAM_SAFETY_SECONDS}s"
+        )
 
 
 def _clamp_pitch_shifts(plan: list[dict]) -> list[dict]:
@@ -278,6 +336,13 @@ def render_transition(mix_plan_id: str) -> str | None:
             "sections": bundle.sections,
             "duration": bundle.duration,
             "energy_curve": energy_curve,
+            # Latest seam time that leaves a full 16-bar crossfade +
+            # 5s safety buffer in the song. The LLM must keep its
+            # seam at or before this value; the validator rejects
+            # plans that violate it.
+            "max_seam_time": _max_seam_time(
+                bundle.duration, bundle.bpm, bundle.time_signature
+            ),
         }
 
     async def _build_plan() -> list[dict]:
@@ -312,6 +377,7 @@ def render_transition(mix_plan_id: str) -> str | None:
         try:
             plan = await provider.plan_transition(a_llm_input, b_llm_input, tools_schema)
             _validate_llm_plan(plan)
+            _validate_seam_headroom(plan, a_bundle, b_bundle)
             return _clamp_pitch_shifts(plan)
         except Exception as exc:
             logger.error("render_transition: LLM planner failed, falling back to deterministic: %s", exc)
