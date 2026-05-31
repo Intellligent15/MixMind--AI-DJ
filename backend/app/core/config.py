@@ -24,7 +24,10 @@ class Settings(BaseSettings):
     genius_access_token: str = ""
     gemini_api_key: str = ""
     groq_api_key: str = ""
-    groq_model: str = "openai/gpt-oss-120b"
+    # llama-4-scout has 30K TPM on the Groq free tier (vs 8K for
+    # gpt-oss-120b). Our trimmed prompt is ~2–3K tokens, so this
+    # leaves 10x headroom for retries / parallel renders.
+    groq_model: str = "meta-llama/llama-4-scout-17b-16e-instruct"
     llm_provider: str = "gemini"  # gemini | groq
     use_llm_planner: bool = True
 

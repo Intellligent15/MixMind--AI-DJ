@@ -22,17 +22,17 @@ from app.services.storage import get_storage
 
 logger = logging.getLogger(__name__)
 
-# Default to OpenAI's open-weighted 120B — reasoning-tuned and the
-# most reliable JSON producer on Groq's free tier. Swap by setting
-# settings.groq_model.
-DEFAULT_MODEL = "openai/gpt-oss-120b"
+# Default to llama-4-scout — 30K TPM on Groq's free tier (vs 8K for
+# gpt-oss-120b), 17B/16-expert MoE, strong at structured JSON. Swap
+# via settings.groq_model if you want to A/B with another model.
+DEFAULT_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
 
 # Same 30s ceiling as Gemini. Free tier inference is fast enough that
 # this only fires on network trouble.
 GROQ_TIMEOUT_SECONDS = 30.0
 
 SYSTEM_PROMPT = """You are an expert DJ transitioning between two tracks.
-You will be provided with the musical analysis (BPM, keys, sections, downbeats, energy curve, vocal segments), lyrics with timestamps (aligned when available, otherwise raw transcription), and vocal-safe regions for two songs: Song A (outgoing) and Song B (incoming).
+You will be provided with the musical analysis (BPM, key, sections, downbeats, energy curve) and vocal-safe regions for two songs: Song A (outgoing) and Song B (incoming). The `vocal_safe_regions` are time intervals where no vocals are present — that is where cuts, stem swaps, and drop swaps should land.
 
 Your goal is to plan a seamless, professional transition from A to B. Return a JSON object with a single key "plan" whose value is the list of tool call objects. You have the following tools available:
 {tools_schema}

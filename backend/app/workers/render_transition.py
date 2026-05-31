@@ -86,6 +86,20 @@ def _validate_llm_plan(plan: list[dict]) -> None:
         raise ValueError(f"illegal tools in plan: {sorted(illegal)}")
 
 
+def _downsample(values: list[float], target: int = 30) -> list[float]:
+    """Return at most `target` evenly-spaced samples from `values`.
+
+    Energy curve is sampled at 1Hz in the analyzer (180 floats for a
+    3-min song). The LLM needs the shape, not the resolution — drop
+    to ~one value per 4–8s so the curve costs <1K tokens per song.
+    """
+    n = len(values)
+    if n <= target:
+        return values
+    step = n / target
+    return [values[int(i * step)] for i in range(target)]
+
+
 def _clamp_pitch_shifts(plan: list[dict]) -> list[dict]:
     """Clamp permanent `pitch_shift.semitones` to ±PERMANENT_PITCH_SHIFT_CAP."""
     clamped = []
@@ -193,22 +207,23 @@ def render_transition(mix_plan_id: str) -> str | None:
         # LLM-only inputs that don't ride through AnalysisBundle (which
         # the executor consumes and intentionally stays narrow). Snapshot
         # them here so the rest of the worker can stay session-free.
-        a_energy_curve = list(a_analysis.energy_curve or [])
-        b_energy_curve = list(b_analysis.energy_curve or [])
-        a_vocal_segments = list(a_analysis.vocal_segments or [])
-        b_vocal_segments = list(b_analysis.vocal_segments or [])
-        a_raw_segments = list(a_transcription.segments) if a_transcription else None
-        b_raw_segments = list(b_transcription.segments) if b_transcription else None
-        a_alignment_ok = (
-            a_lyrics is not None
-            and a_lyrics.alignment_status == LyricsAlignmentStatus.success
-        )
-        b_alignment_ok = (
-            b_lyrics is not None
-            and b_lyrics.alignment_status == LyricsAlignmentStatus.success
-        )
-        a_aligned_words = a_lyrics.aligned_words if a_alignment_ok else None
-        b_aligned_words = b_lyrics.aligned_words if b_alignment_ok else None
+        #
+        # `energy_curve` is sampled at 1Hz in the analyzer; downsample to
+        # one value per ~4s here. The LLM needs the shape (intro/build/
+        # drop) — sub-second resolution would just burn tokens.
+        a_energy_curve = _downsample(list(a_analysis.energy_curve or []))
+        b_energy_curve = _downsample(list(b_analysis.energy_curve or []))
+        # Per-word lyrics + raw Whisper segments + vocal_segments are
+        # deliberately NOT carried into the LLM input. Reasons:
+        #   - `vocal_safe_regions` already distills "where can/can't I
+        #     cut" from those signals; sending the raw text on top is
+        #     redundant and was the dominant cost in our prompts (we
+        #     hit Groq's 8K TPM limit at ~35K tokens).
+        #   - The LLM plans transitions, not lyric matching, so word-
+        #     level timestamps don't change its decisions.
+        # If a future phase wants lyrics for clever same-word vocal
+        # swaps, add a separate summary field (e.g. chorus hook lyric)
+        # — don't dump the full alignment.
 
     import json
     from app.services.vocal_safety.safety import vocal_safe_regions
@@ -233,7 +248,7 @@ def render_transition(mix_plan_id: str) -> str | None:
             duration_seconds=duration or 0.0,
         )
 
-    def _bundle_to_llm_dict(bundle: AnalysisBundle, energy_curve, vocal_segments) -> dict:
+    def _bundle_to_llm_dict(bundle: AnalysisBundle, energy_curve) -> dict:
         return {
             "bpm": bundle.bpm,
             "key": bundle.key,
@@ -243,7 +258,6 @@ def render_transition(mix_plan_id: str) -> str | None:
             "sections": bundle.sections,
             "duration": bundle.duration,
             "energy_curve": energy_curve,
-            "vocal_segments": vocal_segments,
         }
 
     async def _build_plan() -> list[dict]:
@@ -254,15 +268,11 @@ def render_transition(mix_plan_id: str) -> str | None:
         b_regions = await _fetch_safe_regions(b_transcription, b_lyrics, b_envelope_path, b.duration_seconds)
 
         a_llm_input = {
-            "analysis": _bundle_to_llm_dict(a_bundle, a_energy_curve, a_vocal_segments),
-            "aligned_lyrics": a_aligned_words,
-            "raw_transcription": None if a_alignment_ok else a_raw_segments,
+            "analysis": _bundle_to_llm_dict(a_bundle, a_energy_curve),
             "vocal_safe_regions": a_regions,
         }
         b_llm_input = {
-            "analysis": _bundle_to_llm_dict(b_bundle, b_energy_curve, b_vocal_segments),
-            "aligned_lyrics": b_aligned_words,
-            "raw_transcription": None if b_alignment_ok else b_raw_segments,
+            "analysis": _bundle_to_llm_dict(b_bundle, b_energy_curve),
             "vocal_safe_regions": b_regions,
         }
 

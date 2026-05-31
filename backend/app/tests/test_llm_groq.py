@@ -63,7 +63,7 @@ async def test_groq_provider_generation_unwraps_plan_key():
             assert written_key.startswith("mix_plan_logs/")
             written_data = json.loads(mock_storage.write.call_args[0][1].decode("utf-8"))
             assert written_data["response"] == dummy_plan
-            assert written_data["model"] == "openai/gpt-oss-120b"
+            assert written_data["model"] == "meta-llama/llama-4-scout-17b-16e-instruct"
 
 
 @pytest.mark.asyncio

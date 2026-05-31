@@ -219,6 +219,17 @@ def test_render_transition_missing_row_returns_none():
     assert result is None
 
 
+def test_downsample_helper():
+    """Energy-curve downsampler must cap length to `target` while keeping endpoints near the original."""
+    from app.workers.render_transition import _downsample
+    assert _downsample([], target=30) == []
+    assert _downsample([1.0, 2.0, 3.0], target=30) == [1.0, 2.0, 3.0]  # n <= target: passthrough
+    out = _downsample(list(range(180)), target=30)
+    assert len(out) == 30
+    assert out[0] == 0
+    assert out[-1] >= 168  # last sample comes from near the end of the input
+
+
 def _valid_plan(extra: list[dict] | None = None) -> list[dict]:
     """A minimally-valid LLM plan: one window + 4 stems (+ optional extras)."""
     plan = [
@@ -262,13 +273,20 @@ def test_render_transition_llm_planner(pair_with_plan):
         assert row.plan_json == mock_plan
     mock_llm_provider.plan_transition.assert_called_once()
 
-    # Verify the LLM saw the richer signals (energy_curve + sections + downbeats).
+    # Verify the LLM saw the signals it actually uses for planning, and
+    # NOT the redundant ones that dominated the prompt cost.
     call_args = mock_llm_provider.plan_transition.call_args.args
     from_song_input, to_song_input = call_args[0], call_args[1]
     assert "energy_curve" in from_song_input["analysis"]
     assert "downbeats" in from_song_input["analysis"]
     assert "sections" in from_song_input["analysis"]
-    assert "vocal_segments" in to_song_input["analysis"]
+    assert "vocal_safe_regions" in to_song_input
+    # Lyrics, raw transcription, and vocal_segments are intentionally
+    # absent — vocal_safe_regions already distills what the LLM needs,
+    # and including the raw signals blew us past Groq's TPM ceiling.
+    assert "aligned_lyrics" not in from_song_input
+    assert "raw_transcription" not in from_song_input
+    assert "vocal_segments" not in to_song_input["analysis"]
 
 
 def test_render_transition_llm_planner_fallback(pair_with_plan):

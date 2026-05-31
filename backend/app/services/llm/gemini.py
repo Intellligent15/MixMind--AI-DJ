@@ -10,7 +10,7 @@ from app.services.storage import get_storage
 logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = """You are an expert DJ transitioning between two tracks.
-You will be provided with the musical analysis (BPM, keys, sections, beat grid, downbeats, energy curve, vocal segments), lyrics with timestamps (aligned when available, otherwise raw transcription), and vocal-safe regions for two songs: Song A (outgoing) and Song B (incoming).
+You will be provided with the musical analysis (BPM, key, sections, downbeats, energy curve) and vocal-safe regions for two songs: Song A (outgoing) and Song B (incoming). The `vocal_safe_regions` are time intervals where no vocals are present — that is where cuts, stem swaps, and drop swaps should land.
 
 Your goal is to plan a seamless, professional transition from A to B. You must return a JSON list of tool calls. You have the following tools available:
 {tools_schema}
