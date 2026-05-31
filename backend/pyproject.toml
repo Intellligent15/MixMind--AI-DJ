@@ -32,6 +32,7 @@ dependencies = [
     "beautifulsoup4>=4.12,<4.13",
     "asgiref>=3.11.1",
     "google-genai>=1.2.0",
+    "groq>=1.4.0",
 ]
 
 [build-system]

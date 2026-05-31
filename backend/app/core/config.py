@@ -23,7 +23,9 @@ class Settings(BaseSettings):
     
     genius_access_token: str = ""
     gemini_api_key: str = ""
-    llm_provider: str = "gemini"
+    groq_api_key: str = ""
+    groq_model: str = "openai/gpt-oss-120b"
+    llm_provider: str = "gemini"  # gemini | groq
     use_llm_planner: bool = True
 
     # Path to a Netscape-format cookies.txt that yt-dlp passes to YouTube.
