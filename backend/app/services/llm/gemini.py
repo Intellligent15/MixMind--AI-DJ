@@ -10,7 +10,9 @@ from app.services.storage import get_storage
 logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = """You are an expert DJ transitioning between two tracks.
-You will be provided with the musical analysis (BPM, key, sections, downbeats, energy curve) and vocal-safe regions for two songs: Song A (outgoing) and Song B (incoming). The `vocal_safe_regions` are time intervals where no vocals are present — that is where cuts, stem swaps, and drop swaps should land.
+You will be provided with the musical analysis (BPM, key, sections, downbeats, energy curve) and vocal-safe regions for two songs labeled "A" (outgoing) and "B" (incoming). The `vocal_safe_regions` are time intervals where no vocals are present — that is where cuts, stem swaps, and drop swaps should land.
+
+CRITICAL: In every tool call, the `song`, `from_song`, and `to_song` fields MUST be exactly the single-character strings "A" or "B". Never "Song A", "song_a", "1", or any other variation — the executor will reject anything else.
 
 Your goal is to plan a seamless, professional transition from A to B. You must return a JSON list of tool calls. You have the following tools available:
 {tools_schema}
@@ -18,9 +20,9 @@ Your goal is to plan a seamless, professional transition from A to B. You must r
 Rules:
 1. Always start with exactly one `set_transition_window` call to define the alignment and crossfade duration.
 2. Hard cuts, stem swaps, and drop swaps should land inside the provided `vocal_safe_regions`. Outside them, prefer crossfades.
-3. You must emit exactly 4 `crossfade_stem` calls, one for each stem: "vocals", "drums", "bass", "other". All 4 MUST share the exact same `start_bar`, `duration_bars`, and `curve` ("equal_power" or "linear").
-4. If keys clash, you may use `pitch_shift` (permanent) or `temporary_pitch_shift` (returns to native key) on Song B. Permanent `pitch_shift` is capped at ±2 semitones — beyond that, pyrubberband artifacts outweigh the harmonic benefit, and the executor will clamp. Prefer `temporary_pitch_shift` for larger excursions.
-5. If tempos clash significantly, you may use `set_tempo_ramp` on Song B to ramp from A's BPM to B's BPM over a specified window.
+3. You must emit exactly 4 `crossfade_stem` calls, one for each stem: "vocals", "drums", "bass", "other". All 4 MUST share the exact same `start_bar`, `duration_bars`, and `curve` ("equal_power" or "linear"). Every call uses `"from_song": "A"` and `"to_song": "B"`.
+4. If keys clash, you may use `pitch_shift` (permanent) or `temporary_pitch_shift` (returns to native key) on song B (i.e. `"song": "B"`). Permanent `pitch_shift` is capped at ±2 semitones — beyond that, pyrubberband artifacts outweigh the harmonic benefit, and the executor will clamp. Prefer `temporary_pitch_shift` for larger excursions.
+5. If tempos clash significantly, you may use `set_tempo_ramp` on song B (`"song": "B"`) to ramp from A's BPM to B's BPM over a specified window.
 6. The output must be a valid JSON list containing only tool call objects.
 """
 
@@ -41,13 +43,16 @@ class GeminiProvider:
         to_song: dict[str, Any],
         tools_schema: str,
     ) -> list[dict[str, Any]]:
-        # 1. Compute Cache Key
+        # 1. Compute Cache Key — includes the formatted system prompt so a
+        #    prompt change invalidates cached plans automatically.
         storage = get_storage()
-        
+
+        system_instruction = SYSTEM_PROMPT.format(tools_schema=tools_schema)
         payload = {
             "from_song": from_song,
             "to_song": to_song,
             "tools_schema": tools_schema,
+            "system_instruction": system_instruction,
         }
         payload_bytes = json.dumps(payload, sort_keys=True).encode("utf-8")
         h = hashlib.sha256(payload_bytes).hexdigest()
@@ -67,9 +72,11 @@ class GeminiProvider:
             api_key=self.api_key,
             http_options=genai.types.HttpOptions(timeout=GEMINI_TIMEOUT_MS),
         )
-        system_instruction = SYSTEM_PROMPT.format(tools_schema=tools_schema)
-        
-        prompt = json.dumps({"Song A": from_song, "Song B": to_song}, indent=2)
+        # Songs are labeled "A"/"B" in the prompt to match what the
+        # system prompt requires in tool-call fields. Models parrot the
+        # labels from the user message — keeping them short reinforces
+        # the SongRef constraint.
+        prompt = json.dumps({"A": from_song, "B": to_song}, indent=2)
         
         response = client.models.generate_content(
             model="gemini-2.5-flash",

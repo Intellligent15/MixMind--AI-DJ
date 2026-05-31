@@ -62,6 +62,15 @@ _LEGAL_TOOLS = {
     "crossfade_stem",
 }
 _CANONICAL_STEMS = {"vocals", "drums", "bass", "other"}
+_LEGAL_SONG_REFS = {"A", "B"}
+# Which fields on each tool carry a song reference. The set is small
+# enough that an explicit map beats reflection over the TypedDicts.
+_SONG_FIELDS_BY_TOOL = {
+    "crossfade_stem": ("from_song", "to_song"),
+    "pitch_shift": ("song",),
+    "temporary_pitch_shift": ("song",),
+    "set_tempo_ramp": ("song",),
+}
 
 
 def _validate_llm_plan(plan: list[dict]) -> None:
@@ -84,6 +93,17 @@ def _validate_llm_plan(plan: list[dict]) -> None:
     illegal = {c.get("tool") for c in plan} - _LEGAL_TOOLS
     if illegal:
         raise ValueError(f"illegal tools in plan: {sorted(illegal)}")
+    # Song refs must be the single-char strings the executor expects.
+    # Models like to drift to "Song A" / "Song B" if the prompt
+    # introduces the songs that way; reject so we fall back instead of
+    # silently rendering with a misnamed field.
+    for call in plan:
+        for field in _SONG_FIELDS_BY_TOOL.get(call.get("tool"), ()):
+            val = call.get(field)
+            if val not in _LEGAL_SONG_REFS:
+                raise ValueError(
+                    f"{call['tool']}.{field}={val!r} must be 'A' or 'B'"
+                )
 
 
 def _downsample(values: list[float], target: int = 30) -> list[float]:

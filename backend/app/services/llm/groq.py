@@ -32,7 +32,9 @@ DEFAULT_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
 GROQ_TIMEOUT_SECONDS = 30.0
 
 SYSTEM_PROMPT = """You are an expert DJ transitioning between two tracks.
-You will be provided with the musical analysis (BPM, key, sections, downbeats, energy curve) and vocal-safe regions for two songs: Song A (outgoing) and Song B (incoming). The `vocal_safe_regions` are time intervals where no vocals are present — that is where cuts, stem swaps, and drop swaps should land.
+You will be provided with the musical analysis (BPM, key, sections, downbeats, energy curve) and vocal-safe regions for two songs labeled "A" (outgoing) and "B" (incoming). The `vocal_safe_regions` are time intervals where no vocals are present — that is where cuts, stem swaps, and drop swaps should land.
+
+CRITICAL: In every tool call, the `song`, `from_song`, and `to_song` fields MUST be exactly the single-character strings "A" or "B". Never "Song A", "song_a", "1", or any other variation — the executor will reject anything else.
 
 Your goal is to plan a seamless, professional transition from A to B. Return a JSON object with a single key "plan" whose value is the list of tool call objects. You have the following tools available:
 {tools_schema}
@@ -40,9 +42,9 @@ Your goal is to plan a seamless, professional transition from A to B. Return a J
 Rules:
 1. Always start with exactly one `set_transition_window` call to define the alignment and crossfade duration.
 2. Hard cuts, stem swaps, and drop swaps should land inside the provided `vocal_safe_regions`. Outside them, prefer crossfades.
-3. You must emit exactly 4 `crossfade_stem` calls, one for each stem: "vocals", "drums", "bass", "other". All 4 MUST share the exact same `start_bar`, `duration_bars`, and `curve` ("equal_power" or "linear").
-4. If keys clash, you may use `pitch_shift` (permanent) or `temporary_pitch_shift` (returns to native key) on Song B. Permanent `pitch_shift` is capped at ±2 semitones — beyond that, pyrubberband artifacts outweigh the harmonic benefit, and the executor will clamp. Prefer `temporary_pitch_shift` for larger excursions.
-5. If tempos clash significantly, you may use `set_tempo_ramp` on Song B to ramp from A's BPM to B's BPM over a specified window.
+3. You must emit exactly 4 `crossfade_stem` calls, one for each stem: "vocals", "drums", "bass", "other". All 4 MUST share the exact same `start_bar`, `duration_bars`, and `curve` ("equal_power" or "linear"). Every call uses `"from_song": "A"` and `"to_song": "B"`.
+4. If keys clash, you may use `pitch_shift` (permanent) or `temporary_pitch_shift` (returns to native key) on song B (i.e. `"song": "B"`). Permanent `pitch_shift` is capped at ±2 semitones — beyond that, pyrubberband artifacts outweigh the harmonic benefit, and the executor will clamp. Prefer `temporary_pitch_shift` for larger excursions.
+5. If tempos clash significantly, you may use `set_tempo_ramp` on song B (`"song": "B"`) to ramp from A's BPM to B's BPM over a specified window.
 6. The output must be a valid JSON object of the form {{"plan": [...]}}.
 """
 
@@ -60,12 +62,17 @@ class GroqProvider:
     ) -> list[dict[str, Any]]:
         storage = get_storage()
 
-        # Cache key includes the model — swapping models invalidates cache.
+        # Cache key includes the model and the formatted system prompt so
+        # swapping either invalidates stale plans automatically. Without
+        # this, a prompt fix would never reach pairs that already have a
+        # cached (wrong) plan.
+        system_instruction = SYSTEM_PROMPT.format(tools_schema=tools_schema)
         payload = {
             "from_song": from_song,
             "to_song": to_song,
             "tools_schema": tools_schema,
             "model": self.model,
+            "system_instruction": system_instruction,
         }
         payload_bytes = json.dumps(payload, sort_keys=True).encode("utf-8")
         h = hashlib.sha256(payload_bytes).hexdigest()
@@ -79,8 +86,11 @@ class GroqProvider:
         logger.info("GroqProvider: cache miss for %s, calling LLM", cache_key)
 
         client = Groq(api_key=self.api_key, timeout=GROQ_TIMEOUT_SECONDS)
-        system_instruction = SYSTEM_PROMPT.format(tools_schema=tools_schema)
-        prompt = json.dumps({"Song A": from_song, "Song B": to_song}, indent=2)
+        # Per the system prompt, the songs are labeled "A" and "B"
+        # everywhere — including the user message keys. The model parrots
+        # whatever labels the prompt uses, so keep them as "A"/"B" to
+        # reinforce the tool-call field requirement.
+        prompt = json.dumps({"A": from_song, "B": to_song}, indent=2)
 
         response = client.chat.completions.create(
             model=self.model,

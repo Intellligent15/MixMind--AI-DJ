@@ -361,6 +361,51 @@ def test_render_transition_llm_invalid_plan_falls_back(pair_with_plan):
         assert row.plan_json == fallback_plan
 
 
+def test_render_transition_rejects_wrong_song_refs(pair_with_plan):
+    """LLM uses 'Song A'/'Song B' instead of 'A'/'B' — validator rejects
+    and falls back to the deterministic planner."""
+    storage = AsyncMock()
+    async def _write(key, data):
+        return f"/abs/{key}"
+    storage.write = _write
+    storage.read.return_value = b'{"rms": [0.1], "peak": [0.2], "frame_hz": 10}'
+
+    mock_llm_provider = AsyncMock()
+    bad_plan = [
+        {"tool": "set_transition_window", "from_song_time_start": 0.0,
+         "to_song_time_start": 0.0, "duration_bars": 4},
+    ]
+    for stem in ("vocals", "drums", "bass", "other"):
+        bad_plan.append({
+            "tool": "crossfade_stem", "stem": stem,
+            "from_song": "Song A", "to_song": "Song B",  # wrong shape
+            "start_bar": 0, "duration_bars": 4, "curve": "equal_power",
+        })
+    mock_llm_provider.plan_transition.return_value = bad_plan
+
+    with (
+        patch("app.workers.render_transition.render", return_value=_patched_render()),
+        patch("app.workers.render_transition.get_storage", return_value=storage),
+        patch("app.workers.render_transition.get_llm_provider", return_value=mock_llm_provider),
+        patch("app.workers.render_transition.settings.use_llm_planner", True),
+        patch("app.workers.render_transition.build_pair_plan") as mock_fallback,
+    ):
+        mock_fallback.return_value = _valid_plan()
+        from app.workers.render_transition import render_transition
+        result = render_transition(pair_with_plan["plan_id"])
+
+    assert result == pair_with_plan["plan_id"]
+    mock_fallback.assert_called_once()
+    with SessionLocal() as db:
+        row = db.get(MixPlan, uuid.UUID(pair_with_plan["plan_id"]))
+        # Persisted plan is the deterministic fallback, not the bad LLM one.
+        assert all(
+            c.get("from_song", "A") == "A" and c.get("to_song", "B") == "B"
+            for c in row.plan_json
+            if c.get("tool") == "crossfade_stem"
+        )
+
+
 def test_render_transition_clamps_llm_permanent_pitch_shift(pair_with_plan):
     """LLM emits pitch_shift=+5; worker must clamp to +2 before persist."""
     storage = AsyncMock()
