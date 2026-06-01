@@ -23,6 +23,10 @@ StemName = Literal["vocals", "drums", "bass", "other"]
 # `exponential` are reserved for Phase 9 — the executor refuses them
 # with NotImplementedError until the LLM has reason to emit them.
 CrossfadeCurve = Literal["equal_power", "linear", "exponential", "s_curve"]
+# Filter shape for `filter_sweep`. Gentle 2-pole Butterworth — DJ filters
+# taste closer to "fade out the highs" than a resonant synth sweep, so we
+# avoid steeper orders that would ring at the cutoff.
+FilterType = Literal["lowpass", "highpass"]
 
 
 class SetTransitionWindow(TypedDict):
@@ -97,17 +101,103 @@ class CrossfadeStem(TypedDict):
     curve: CrossfadeCurve
 
 
-# Phase 9 will grow this union with apply_filter, apply_echo, swap_stem,
-# loop_section, set_reasoning. Phase 7's executor only handles
-# {set_transition_window, pitch_shift, crossfade_stem}; the rest are
-# vocabulary the LLM can already emit but the executor will refuse with
-# NotImplementedError until Phase 9 grows the dispatch table.
+class FilterSweep(TypedDict):
+    """Cutoff-sweeping filter applied to all 4 stems of one song.
+
+    Implements a 2-pole Butterworth that processes the audio in ~10 ms
+    blocks; the cutoff frequency is log-interpolated (geomspace) between
+    `start_cutoff_hz` and `end_cutoff_hz` across the sweep window. The
+    block size is small enough to be perceptually continuous and the
+    filter state is carried across blocks (sosfilt_zi) so there are no
+    boundary clicks.
+
+    Operates on the per-song stem buffer before the crossfade region is
+    built, so the swept signal participates in the existing crossfade
+    envelope rather than fighting it.
+    """
+
+    tool: Literal["filter_sweep"]
+    song: SongRef
+    type: FilterType
+    start_time: float          # seconds in original song time
+    end_time: float            # seconds in original song time
+    start_cutoff_hz: float     # Hz; clamped to 20 Hz floor
+    end_cutoff_hz: float       # Hz; clamped to 20 Hz floor
+
+
+class EchoOut(TypedDict):
+    """Hard-cut + tempo-locked echo tail on one song.
+
+    At `start_time` the dry signal is silenced and `beats` echoes of the
+    pre-cut signal are scheduled at one-beat intervals, each attenuated
+    by `feedback ** i` (i = 1..beats). `bpm` is supplied by the caller
+    so the executor doesn't need to consult song metadata.
+
+    Operates per-stem and writes a fresh buffer (the dry post-cut signal
+    is intentionally dropped — that's the "out" in echo_out).
+    """
+
+    tool: Literal["echo_out"]
+    song: SongRef
+    start_time: float          # seconds in original song time
+    beats: int                 # number of echo taps (>= 0; 0 = no-op)
+    feedback: float            # 0.0–0.9 per-tap gain
+    bpm: float                 # caller-supplied tempo for delay computation
+
+
+class LoopSection(TypedDict):
+    """Beat-locked loop of a fixed slice on one song.
+
+    Slices `beats` worth of audio starting at `start_time`, tiles it
+    `repeats` times, and writes the tiled section back in place. A 5 ms
+    equal-power crossfade joins each loop boundary to hide any phase
+    discontinuity at the slice edges.
+
+    `beats == 0` or `repeats == 0` is a silent no-op.
+    """
+
+    tool: Literal["loop_section"]
+    song: SongRef
+    start_time: float          # seconds in original song time
+    beats: int                 # length of the loop in beats
+    repeats: int               # number of times to play the loop
+    bpm: float                 # caller-supplied tempo for slice length
+
+
+class SwapStem(TypedDict):
+    """Zero-crossing-aligned hot-swap of one stem between songs.
+
+    At `time` (measured in OUTPUT timeline samples, not original-song
+    coordinates) the executor searches ±5 ms in both source stems for
+    the closest matched zero-crossing pair, then replaces all samples
+    after that boundary with `to_song`'s stem. Used for "drop swaps"
+    where a single element of the mix flips to the incoming track.
+
+    If `time` lands past the rendered output length the call is a
+    silent no-op.
+    """
+
+    tool: Literal["swap_stem"]
+    from_song: SongRef
+    to_song: SongRef
+    stem: StemName
+    time: float                # seconds in OUTPUT timeline
+
+
+# Phase 9 vocabulary now includes the four DSP additions
+# (filter_sweep, echo_out, loop_section, swap_stem). The executor's
+# dispatch table covers all of them; only `set_reasoning` (the LLM's
+# free-text scratchpad) is still purely informational and ignored.
 ToolCall = (
     SetTransitionWindow
     | PitchShift
     | TemporaryPitchShift
     | SetTempoRamp
     | CrossfadeStem
+    | FilterSweep
+    | EchoOut
+    | LoopSection
+    | SwapStem
 )
 MixPlanJSON = list[dict]  # list[ToolCall] but JSONB persists as plain dicts
 

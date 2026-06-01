@@ -669,3 +669,402 @@ def test_render_rejects_unsupported_curve():
     with patch("soundfile.read", side_effect=_fake_sf_read()):
         with pytest.raises(NotImplementedError, match="s_curve"):
             render(plan, a, b)
+
+
+def test_render_per_stem_envelopes_sum_correctly():
+    """Per-stem envelopes: vocals fade out earlier than drums/bass/other.
+
+    A's stems carry distinct constants; B's stems are zero. So at any output
+    sample inside the post-seam region we know exactly which stems should
+    still be ringing (gain≈1.0 on A-side because B is silent, less the
+    envelope fade applied during each stem's window). The sum at each
+    probe point matches the analytic expectation."""
+    a = _inputs(prefix="A")
+    b = _inputs(prefix="B")
+    sec_per_bar = 60.0 / 120.0 * 4  # = 2.0s; total stem N = 5s, seam at 0
+
+    # Distinct A levels per stem so the post-seam sum tells us which
+    # stems are still in. B silent so envelopes only fade A.
+    levels = {"vocals": 0.1, "drums": 0.2, "bass": 0.3, "other": 0.05}
+
+    def stems_read(path, always_2d=True, dtype="float32"):
+        if "B/" in path or "B_" in path or "/B/" in path:
+            return np.zeros((N, 2), dtype=np.float32), SR
+        for s, v in levels.items():
+            if f"/{s}." in path:
+                return v * np.ones((N, 2), dtype=np.float32), SR
+        return np.zeros((N, 2), dtype=np.float32), SR
+
+    # Vocals fade out bars [0, 1) → seconds [0, 2.0); other stems hold
+    # through bar 0 and fade in bars [1, 2) → seconds [2.0, 4.0).
+    plan = [
+        {"tool": "set_transition_window",
+         "from_song_time_start": 0.0, "to_song_time_start": 0.0,
+         "duration_bars": 2},
+        {"tool": "crossfade_stem", "stem": "vocals", "from_song": "A", "to_song": "B",
+         "start_bar": 0, "duration_bars": 1, "curve": "linear"},
+        {"tool": "crossfade_stem", "stem": "drums", "from_song": "A", "to_song": "B",
+         "start_bar": 1, "duration_bars": 1, "curve": "linear"},
+        {"tool": "crossfade_stem", "stem": "bass", "from_song": "A", "to_song": "B",
+         "start_bar": 1, "duration_bars": 1, "curve": "linear"},
+        {"tool": "crossfade_stem", "stem": "other", "from_song": "A", "to_song": "B",
+         "start_bar": 1, "duration_bars": 1, "curve": "linear"},
+    ]
+    with patch("soundfile.read", side_effect=stems_read):
+        result = render(plan, a, b)
+    out, _ = sf.read(io.BytesIO(result.wav_bytes), always_2d=True, dtype="float32")
+
+    # Probe at 0.25s into the vocal fade-out (t=0.125 in vocal window):
+    # vocals weight = 1 - 0.125 = 0.875 → vocals contribute 0.0875.
+    # drums/bass/other are still pre-window (pure A) → full levels.
+    probe_a = int(0.25 * SR)
+    expected_a = 0.875 * levels["vocals"] + levels["drums"] + levels["bass"] + levels["other"]
+    assert out[probe_a, 0] == pytest.approx(expected_a, abs=1e-3)
+
+    # Probe at 1.0s (bar 0.5 into vocals' window so vocal=0.5 gain,
+    # still pre-window for other stems):
+    probe_b = int(1.0 * SR)
+    expected_b = 0.5 * levels["vocals"] + levels["drums"] + levels["bass"] + levels["other"]
+    assert out[probe_b, 0] == pytest.approx(expected_b, abs=1e-3)
+
+    # Probe at 3.0s (mid-fade for drums/bass/other; vocals fully out):
+    # drums/bass/other gain = 1 - 0.5 = 0.5; vocals = 0.
+    probe_c = int(3.0 * SR)
+    expected_c = 0.5 * (levels["drums"] + levels["bass"] + levels["other"])
+    assert out[probe_c, 0] == pytest.approx(expected_c, abs=1e-3)
+def _baseline_stem_calls(curve: str = "equal_power") -> list[dict]:
+    """Standard 4-stem crossfade tail every plan needs."""
+    return [
+        {"tool": "crossfade_stem", "stem": s,
+         "from_song": "A", "to_song": "B",
+         "start_bar": 0, "duration_bars": 1, "curve": curve}
+        for s in ("vocals", "drums", "bass", "other")
+    ]
+
+
+def test_render_filter_sweep_lowpass_kills_high_frequencies():
+    """A lowpass sweep from 20 kHz → 200 Hz over the post-window region
+    should leave the high-frequency content noticeably attenuated by the
+    end of the sweep. We feed in a high-frequency sine on A and read the
+    energy out before vs after the sweep window."""
+    # 4 second signal so the sweep window has room.
+    long_dur = 4.0
+    long_n = int(SR * long_dur)
+
+    def _bundle_long() -> AnalysisBundle:
+        return AnalysisBundle(
+            bpm=120.0, key="C", camelot_key="8B", time_signature=4,
+            beat_grid=[i * 0.5 for i in range(int(long_dur / 0.5))],
+            downbeats=[i * 2.0 for i in range(int(long_dur / 2.0))],
+            sections=[{"start": 0.0, "end": long_dur, "label": "body"}],
+            duration=long_dur,
+        )
+
+    a = SongRenderInputs(stem_paths=_stems_dict("A"), analysis=_bundle_long())
+    b = SongRenderInputs(stem_paths=_stems_dict("B"), analysis=_bundle_long())
+
+    # A's stems are all a 5 kHz tone; B's are silent so we can isolate A.
+    t_axis = np.arange(long_n) / SR
+    tone = 0.1 * np.sin(2.0 * np.pi * 5000.0 * t_axis).astype(np.float32)
+    tone_stereo = np.column_stack([tone, tone])
+
+    def _read(path, always_2d=True, dtype="float32"):
+        if "/A/" in path:
+            return tone_stereo.copy(), SR
+        return np.zeros((long_n, 2), dtype=np.float32), SR
+
+    # Seam at 3.0s; A's body before the seam includes the sweep window
+    # [0.5s, 2.5s]. After 2.5s the 5 kHz energy should be much lower.
+    plan = [
+        {"tool": "set_transition_window",
+         "from_song_time_start": 3.0, "to_song_time_start": 0.0,
+         "duration_bars": 1},
+        {"tool": "filter_sweep", "song": "A", "type": "lowpass",
+         "start_time": 0.5, "end_time": 2.5,
+         "start_cutoff_hz": 20000.0, "end_cutoff_hz": 200.0},
+        *_baseline_stem_calls(),
+    ]
+    with patch("soundfile.read", side_effect=_read):
+        result = render(plan, a, b)
+    out, _ = sf.read(io.BytesIO(result.wav_bytes), always_2d=True, dtype="float32")
+
+    pre_rms = float(np.sqrt(np.mean(out[int(0.3 * SR): int(0.5 * SR)] ** 2)))
+    post_rms = float(np.sqrt(np.mean(out[int(2.6 * SR): int(2.9 * SR)] ** 2)))
+    # 5 kHz survives a 20 kHz cutoff (start) but is heavily attenuated by
+    # a 200 Hz cutoff (end). Expect at least a 10× drop.
+    assert post_rms < pre_rms * 0.1, (
+        f"lowpass sweep failed to kill highs: pre={pre_rms:.4f} post={post_rms:.4f}"
+    )
+
+
+def test_render_filter_sweep_clamps_zero_cutoff_silently():
+    """A 0 Hz cutoff is illegal for iirfilter (division by zero in the
+    bilinear transform). The executor clamps to 20 Hz silently rather
+    than raising — the LLM prompt-side rules will steer away from this,
+    but the DSP must not crash if it slips through."""
+    a = _inputs(prefix="A")
+    b = _inputs(prefix="B")
+    plan = [
+        {"tool": "set_transition_window",
+         "from_song_time_start": 2.0, "to_song_time_start": 0.0,
+         "duration_bars": 1},
+        {"tool": "filter_sweep", "song": "A", "type": "highpass",
+         "start_time": 0.5, "end_time": 1.5,
+         "start_cutoff_hz": 0.0, "end_cutoff_hz": -100.0},
+        *_baseline_stem_calls(),
+    ]
+    with patch("soundfile.read", side_effect=_fake_sf_read()):
+        result = render(plan, a, b)
+    # Just ensure we got a valid WAV back; the clamp shouldn't blow up.
+    decoded, _ = sf.read(io.BytesIO(result.wav_bytes), always_2d=True)
+    assert decoded.shape[0] > 0
+
+
+def test_render_echo_out_decaying_taps_after_cut():
+    """echo_out at start_time T: dry signal is hard-cut at T (silence
+    immediately after), and N taps of the pre-cut audio appear at one-beat
+    intervals after T, each attenuated by feedback ** i."""
+    long_dur = 6.0
+    long_n = int(SR * long_dur)
+
+    def _bundle_long() -> AnalysisBundle:
+        return AnalysisBundle(
+            bpm=120.0, key="C", camelot_key="8B", time_signature=4,
+            beat_grid=[i * 0.5 for i in range(int(long_dur / 0.5))],
+            downbeats=[i * 2.0 for i in range(int(long_dur / 2.0))],
+            sections=[{"start": 0.0, "end": long_dur, "label": "body"}],
+            duration=long_dur,
+        )
+
+    a = SongRenderInputs(stem_paths=_stems_dict("A"), analysis=_bundle_long())
+    b = SongRenderInputs(stem_paths=_stems_dict("B"), analysis=_bundle_long())
+
+    # Put a unit-amplitude pulse on A's vocal stem; everything else silent.
+    # Pulse fits within the last beat before the cut so it's the tap source.
+    bpm = 120.0
+    delay_samp = int(SR * 60.0 / bpm)
+    cut_samp = int(2.0 * SR)
+    pulse_start = cut_samp - delay_samp + 100  # a few samples into the tap window
+    pulse_len = 200
+
+    a_vocal = np.zeros((long_n, 2), dtype=np.float32)
+    a_vocal[pulse_start : pulse_start + pulse_len] = 0.5
+
+    def _read(path, always_2d=True, dtype="float32"):
+        if "/A/vocals" in path:
+            return a_vocal.copy(), SR
+        return np.zeros((long_n, 2), dtype=np.float32), SR
+
+    # Seam at 5s so the entire echo region is observable in the output.
+    plan = [
+        {"tool": "set_transition_window",
+         "from_song_time_start": 5.0, "to_song_time_start": 0.0,
+         "duration_bars": 1},
+        {"tool": "echo_out", "song": "A",
+         "start_time": 2.0, "beats": 3, "feedback": 0.5, "bpm": bpm},
+        *_baseline_stem_calls(),
+    ]
+    with patch("soundfile.read", side_effect=_read):
+        result = render(plan, a, b)
+    out, _ = sf.read(io.BytesIO(result.wav_bytes), always_2d=True, dtype="float32")
+
+    # The original pulse pre-cut is preserved.
+    assert out[pulse_start + 50, 0] == pytest.approx(0.5, abs=0.05)
+
+    # Dry signal is hard-cut: NO energy at sample (cut_samp + 100), well
+    # before the first echo lands.
+    dry_after = float(np.max(np.abs(out[cut_samp + 50 : cut_samp + 200])))
+    assert dry_after < 0.05, f"dry signal should be cut, got {dry_after}"
+
+    # Each tap is the same pulse, attenuated by feedback ** i, placed at
+    # cut_samp + i*delay_samp. The pulse arrives at the same offset within
+    # each tap window as it was within the pre-cut tap source.
+    pulse_offset_in_tap = pulse_start - (cut_samp - delay_samp)
+    for i in (1, 2, 3):
+        tap_peak_samp = cut_samp + i * delay_samp + pulse_offset_in_tap + 50
+        expected = 0.5 * (0.5 ** i)
+        # Output channels are stereo identical here.
+        observed = float(out[tap_peak_samp, 0])
+        assert observed == pytest.approx(expected, abs=0.05), (
+            f"tap {i}: expected ~{expected:.3f}, got {observed:.3f}"
+        )
+
+
+def test_render_loop_section_repeats_section_length():
+    """loop_section with repeats=2 and beats=1 should tile the chosen
+    slice twice; the second copy is content-identical to the first.
+
+    We mark the loop-source slice with a unique amplitude on A's vocal
+    stem so we can detect it by reading the rendered output."""
+    long_dur = 8.0
+    long_n = int(SR * long_dur)
+    bpm = 120.0
+    beat_samp = int(SR * 60.0 / bpm)
+
+    def _bundle_long() -> AnalysisBundle:
+        return AnalysisBundle(
+            bpm=bpm, key="C", camelot_key="8B", time_signature=4,
+            beat_grid=[i * 0.5 for i in range(int(long_dur / 0.5))],
+            downbeats=[i * 2.0 for i in range(int(long_dur / 2.0))],
+            sections=[{"start": 0.0, "end": long_dur, "label": "body"}],
+            duration=long_dur,
+        )
+
+    a = SongRenderInputs(stem_paths=_stems_dict("A"), analysis=_bundle_long())
+    b = SongRenderInputs(stem_paths=_stems_dict("B"), analysis=_bundle_long())
+
+    # A's vocal: zero everywhere except a distinct stamp inside the loop slice.
+    loop_start = int(1.0 * SR)
+    stamp_offset = beat_samp // 4  # well inside the 1-beat loop window
+    stamp_len = 100
+    stamp_amp = 0.6
+
+    a_vocal = np.zeros((long_n, 2), dtype=np.float32)
+    a_vocal[loop_start + stamp_offset : loop_start + stamp_offset + stamp_len] = stamp_amp
+
+    def _read(path, always_2d=True, dtype="float32"):
+        if "/A/vocals" in path:
+            return a_vocal.copy(), SR
+        return np.zeros((long_n, 2), dtype=np.float32), SR
+
+    # Seam at 7s so the entire looped region is in the output.
+    plan = [
+        {"tool": "set_transition_window",
+         "from_song_time_start": 7.0, "to_song_time_start": 0.0,
+         "duration_bars": 1},
+        {"tool": "loop_section", "song": "A",
+         "start_time": 1.0, "beats": 1, "repeats": 2, "bpm": bpm},
+        *_baseline_stem_calls(),
+    ]
+    with patch("soundfile.read", side_effect=_read):
+        result = render(plan, a, b)
+    out, _ = sf.read(io.BytesIO(result.wav_bytes), always_2d=True, dtype="float32")
+
+    # First copy: the original stamp is still where we put it.
+    first_peak = float(out[loop_start + stamp_offset + 10, 0])
+    assert first_peak == pytest.approx(stamp_amp, abs=0.05)
+
+    # Second copy: same stamp shifted by exactly one beat (the loop length).
+    second_idx = loop_start + beat_samp + stamp_offset + 10
+    second_peak = float(out[second_idx, 0])
+    assert second_peak == pytest.approx(stamp_amp, abs=0.05), (
+        f"second loop copy missing: idx={second_idx} got {second_peak}"
+    )
+
+
+def test_render_loop_section_zero_beats_is_noop():
+    """beats=0 or repeats=0 must NOT raise — silent no-op."""
+    a = _inputs(prefix="A")
+    b = _inputs(prefix="B")
+    plan = [
+        {"tool": "set_transition_window",
+         "from_song_time_start": 2.0, "to_song_time_start": 0.0,
+         "duration_bars": 1},
+        {"tool": "loop_section", "song": "A",
+         "start_time": 0.0, "beats": 0, "repeats": 4, "bpm": 120.0},
+        {"tool": "loop_section", "song": "A",
+         "start_time": 0.0, "beats": 2, "repeats": 0, "bpm": 120.0},
+        *_baseline_stem_calls(),
+    ]
+    with patch("soundfile.read", side_effect=_fake_sf_read()):
+        result = render(plan, a, b)
+    decoded, _ = sf.read(io.BytesIO(result.wav_bytes), always_2d=True)
+    assert decoded.shape[0] > 0
+
+
+def test_render_swap_stem_replaces_output_tail_with_to_song_stem():
+    """swap_stem at time T: every output sample after T equals
+    to_song's stem buffer on that channel."""
+    long_dur = 6.0
+    long_n = int(SR * long_dur)
+
+    def _bundle_long() -> AnalysisBundle:
+        return AnalysisBundle(
+            bpm=120.0, key="C", camelot_key="8B", time_signature=4,
+            beat_grid=[i * 0.5 for i in range(int(long_dur / 0.5))],
+            downbeats=[i * 2.0 for i in range(int(long_dur / 2.0))],
+            sections=[{"start": 0.0, "end": long_dur, "label": "body"}],
+            duration=long_dur,
+        )
+
+    a = SongRenderInputs(stem_paths=_stems_dict("A"), analysis=_bundle_long())
+    b = SongRenderInputs(stem_paths=_stems_dict("B"), analysis=_bundle_long())
+
+    # A's vocal stem is a distinctive +0.4 ramp; everything else 0.
+    # We'll swap to A's vocal after the seam region — but easier to swap
+    # to B's vocals using a sign-flipping signal so the assertion is
+    # unambiguous.
+    t_axis = np.arange(long_n) / SR
+    b_vocal_signal = (0.3 * np.sin(2.0 * np.pi * 220.0 * t_axis)).astype(np.float32)
+    b_vocal_stereo = np.column_stack([b_vocal_signal, b_vocal_signal])
+
+    def _read(path, always_2d=True, dtype="float32"):
+        if "/B/vocals" in path:
+            return b_vocal_stereo.copy(), SR
+        if "/A/" in path:
+            return 0.1 * np.ones((long_n, 2), dtype=np.float32), SR
+        return np.zeros((long_n, 2), dtype=np.float32), SR
+
+    swap_time = 4.0
+    plan = [
+        {"tool": "set_transition_window",
+         "from_song_time_start": 1.0, "to_song_time_start": 0.0,
+         "duration_bars": 1},
+        *_baseline_stem_calls(),
+        {"tool": "swap_stem", "from_song": "A", "to_song": "B",
+         "stem": "vocals", "time": swap_time},
+    ]
+    # Same-BPM songs: rate = 1.0 so the stretch is a passthrough and the
+    # B-side buffers stay in their original sample positions.
+    with (
+        patch("soundfile.read", side_effect=_read),
+        patch("pyrubberband.pyrb.time_stretch", side_effect=lambda y, sr, r: y),
+    ):
+        result = render(plan, a, b)
+    out, _ = sf.read(io.BytesIO(result.wav_bytes), always_2d=True, dtype="float32")
+
+    # After the swap (allowing a few samples for the ZC snap), output
+    # should match B's vocal stem on both channels.
+    probe = int(swap_time * SR) + 200
+    assert out[probe, 0] == pytest.approx(b_vocal_stereo[probe, 0], abs=1e-3)
+    assert out[probe, 1] == pytest.approx(b_vocal_stereo[probe, 1], abs=1e-3)
+    # Pre-swap region is unaffected.
+    pre = int(swap_time * SR) - 1000
+    assert out[pre, 0] != pytest.approx(b_vocal_stereo[pre, 0], abs=1e-3)
+
+
+def test_render_swap_stem_past_output_length_is_noop():
+    """time past output end → no-op (don't raise)."""
+    a = _inputs(prefix="A")
+    b = _inputs(prefix="B")
+    plan = [
+        {"tool": "set_transition_window",
+         "from_song_time_start": 0.0, "to_song_time_start": 0.0,
+         "duration_bars": 1},
+        *_baseline_stem_calls(),
+        {"tool": "swap_stem", "from_song": "A", "to_song": "B",
+         "stem": "drums", "time": 9999.0},
+    ]
+    with patch("soundfile.read", side_effect=_fake_sf_read()):
+        result = render(plan, a, b)
+    decoded, _ = sf.read(io.BytesIO(result.wav_bytes), always_2d=True)
+    assert decoded.shape[0] > 0
+
+
+def test_render_unknown_tool_still_raises():
+    """The dispatch's else-branch now raises 'unknown tool' (rather than
+    the old Phase-7 message) — the wrap-up signal stays the same so the
+    worker's failure path still distinguishes 'plan bug' from
+    'precondition error'."""
+    a = _inputs(prefix="A")
+    b = _inputs(prefix="B")
+    plan = [
+        {"tool": "set_transition_window",
+         "from_song_time_start": 0.0, "to_song_time_start": 0.0,
+         "duration_bars": 1},
+        {"tool": "make_coffee", "song": "A"},
+        *_baseline_stem_calls(),
+    ]
+    with patch("soundfile.read", side_effect=_fake_sf_read()):
+        with pytest.raises(NotImplementedError, match="unknown tool"):
+            render(plan, a, b)
