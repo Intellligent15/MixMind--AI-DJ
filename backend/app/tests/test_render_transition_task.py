@@ -463,6 +463,68 @@ def test_render_transition_rejects_wrong_song_refs(pair_with_plan):
         )
 
 
+def test_validate_llm_plan_accepts_per_stem_envelopes():
+    """Validator must accept 4 stem calls with DIFFERENT start_bar/
+    duration_bars/curve — that's the whole point of per-stem envelopes."""
+    from app.workers.render_transition import _validate_llm_plan
+    plan = [
+        {"tool": "set_transition_window", "from_song_time_start": 0.0,
+         "to_song_time_start": 0.0, "duration_bars": 16},
+        {"tool": "crossfade_stem", "stem": "vocals", "from_song": "A", "to_song": "B",
+         "start_bar": 0, "duration_bars": 8, "curve": "linear"},
+        {"tool": "crossfade_stem", "stem": "drums", "from_song": "A", "to_song": "B",
+         "start_bar": 4, "duration_bars": 12, "curve": "equal_power"},
+        {"tool": "crossfade_stem", "stem": "bass", "from_song": "A", "to_song": "B",
+         "start_bar": 2, "duration_bars": 6, "curve": "equal_power"},
+        {"tool": "crossfade_stem", "stem": "other", "from_song": "A", "to_song": "B",
+         "start_bar": 8, "duration_bars": 4, "curve": "linear"},
+    ]
+    # No exception → accepted.
+    _validate_llm_plan(plan)
+
+
+def test_render_transition_accepts_per_stem_envelope_plan(pair_with_plan):
+    """End-to-end: LLM returns a per-stem envelope plan; worker persists it
+    unchanged (no fallback) and downstream render is called with it."""
+    storage = AsyncMock()
+    async def _write(key, data):
+        return f"/abs/{key}"
+    storage.write = _write
+    storage.read.return_value = b'{"rms": [0.1], "peak": [0.2], "frame_hz": 10}'
+
+    # Plan with per-stem envelopes: vocals fade out early, drums hold.
+    per_stem_plan = [
+        {"tool": "set_transition_window", "from_song_time_start": 0.0,
+         "to_song_time_start": 0.0, "duration_bars": 16},
+        {"tool": "crossfade_stem", "stem": "vocals", "from_song": "A", "to_song": "B",
+         "start_bar": 0, "duration_bars": 8, "curve": "linear"},
+        {"tool": "crossfade_stem", "stem": "drums", "from_song": "A", "to_song": "B",
+         "start_bar": 8, "duration_bars": 8, "curve": "equal_power"},
+        {"tool": "crossfade_stem", "stem": "bass", "from_song": "A", "to_song": "B",
+         "start_bar": 8, "duration_bars": 8, "curve": "equal_power"},
+        {"tool": "crossfade_stem", "stem": "other", "from_song": "A", "to_song": "B",
+         "start_bar": 8, "duration_bars": 8, "curve": "equal_power"},
+    ]
+    mock_llm_provider = AsyncMock()
+    mock_llm_provider.plan_transition.return_value = per_stem_plan
+
+    with (
+        patch("app.workers.render_transition.render", return_value=_patched_render()),
+        patch("app.workers.render_transition.get_storage", return_value=storage),
+        patch("app.workers.render_transition.get_llm_provider", return_value=mock_llm_provider),
+        patch("app.workers.render_transition.settings.use_llm_planner", True),
+        patch("app.workers.render_transition.build_pair_plan") as mock_fallback,
+    ):
+        from app.workers.render_transition import render_transition
+        result = render_transition(pair_with_plan["plan_id"])
+
+    assert result == pair_with_plan["plan_id"]
+    mock_fallback.assert_not_called()  # per-stem envelopes are valid; no fallback
+    with SessionLocal() as db:
+        row = db.get(MixPlan, uuid.UUID(pair_with_plan["plan_id"]))
+        assert row.plan_json == per_stem_plan
+
+
 def test_render_transition_clamps_llm_permanent_pitch_shift(pair_with_plan):
     """LLM emits pitch_shift=+5; worker must clamp to +2 before persist."""
     storage = AsyncMock()

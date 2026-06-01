@@ -60,6 +60,10 @@ _LEGAL_TOOLS = {
     "temporary_pitch_shift",
     "pitch_shift",
     "crossfade_stem",
+    "filter_sweep",
+    "echo_out",
+    "loop_section",
+    "swap_stem",
 }
 _CANONICAL_STEMS = {"vocals", "drums", "bass", "other"}
 _LEGAL_SONG_REFS = {"A", "B"}
@@ -70,6 +74,10 @@ _SONG_FIELDS_BY_TOOL = {
     "pitch_shift": ("song",),
     "temporary_pitch_shift": ("song",),
     "set_tempo_ramp": ("song",),
+    "filter_sweep": ("song",),
+    "echo_out": ("song",),
+    "loop_section": ("song",),
+    "swap_stem": ("from_song", "to_song"),
 }
 
 
@@ -371,6 +379,10 @@ def render_transition(mix_plan_id: str) -> str | None:
             {"tool": "pitch_shift", "song": "str", "semitones": "float"},
             {"tool": "temporary_pitch_shift", "song": "str", "start_time": "float", "semitones": "float", "fade_in_bars": "int", "hold_bars": "int", "fade_out_bars": "int"},
             {"tool": "set_tempo_ramp", "song": "str", "start_time": "float", "end_time": "float", "start_bpm": "float", "end_bpm": "float"},
+            {"tool": "filter_sweep", "song": "str", "type": "str (lowpass|highpass)", "start_time": "float", "end_time": "float", "start_cutoff_hz": "float", "end_cutoff_hz": "float"},
+            {"tool": "echo_out", "song": "str", "start_time": "float", "beats": "int", "feedback": "float (0..0.9)", "bpm": "float"},
+            {"tool": "loop_section", "song": "str", "start_time": "float", "beats": "int", "repeats": "int", "bpm": "float"},
+            {"tool": "swap_stem", "from_song": "str", "to_song": "str", "stem": "str (vocals|drums|bass|other)", "time": "float (output-timeline seconds)"},
         ], indent=2)
 
         provider = get_llm_provider()
