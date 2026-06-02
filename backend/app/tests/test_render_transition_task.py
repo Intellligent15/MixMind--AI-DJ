@@ -219,15 +219,20 @@ def test_render_transition_missing_row_returns_none():
     assert result is None
 
 
-def test_downsample_helper():
-    """Energy-curve downsampler must cap length to `target` while keeping endpoints near the original."""
-    from app.workers.render_transition import _downsample
-    assert _downsample([], target=30) == []
-    assert _downsample([1.0, 2.0, 3.0], target=30) == [1.0, 2.0, 3.0]  # n <= target: passthrough
-    out = _downsample(list(range(180)), target=30)
-    assert len(out) == 30
-    assert out[0] == 0
-    assert out[-1] >= 168  # last sample comes from near the end of the input
+def test_enrich_sections_helper():
+    """Each section gets mean energy normalized to the hottest section."""
+    from app.workers.render_transition import _enrich_sections
+    # 1 Hz energy curve: 0-10s quiet, 10-20s loud.
+    curve = [0.1] * 10 + [0.8] * 10
+    sections = [
+        {"start": 0.0, "end": 10.0, "label": "intro"},
+        {"start": 10.0, "end": 20.0, "label": "drop"},
+    ]
+    out = _enrich_sections(sections, curve)
+    assert out[0]["energy"] == round(0.1 / 0.8, 2)  # quiet section, relative
+    assert out[1]["energy"] == 1.0  # hottest section normalizes to 1.0
+    assert "label" not in out[0]  # opaque cluster id dropped
+    assert _enrich_sections([], curve) == []
 
 
 def _valid_plan(extra: list[dict] | None = None) -> list[dict]:
@@ -277,12 +282,17 @@ def test_render_transition_llm_planner(pair_with_plan):
     # NOT the redundant ones that dominated the prompt cost.
     call_args = mock_llm_provider.plan_transition.call_args.args
     from_song_input, to_song_input = call_args[0], call_args[1]
-    assert "energy_curve" in from_song_input["analysis"]
-    assert "downbeats" in from_song_input["analysis"]
     assert "sections" in from_song_input["analysis"]
+    assert "seconds_per_bar" in from_song_input["analysis"]
     assert "max_seam_time" in from_song_input["analysis"]
     assert "max_seam_time" in to_song_input["analysis"]
     assert "vocal_safe_regions" in to_song_input
+    # Sections carry normalized energy; the standalone energy_curve and
+    # the raw downbeats array are intentionally dropped — energy is
+    # folded into sections, and bar length comes from seconds_per_bar.
+    assert "energy_curve" not in from_song_input["analysis"]
+    assert "downbeats" not in from_song_input["analysis"]
+    assert all("energy" in s for s in from_song_input["analysis"]["sections"])
     # Lyrics, raw transcription, and vocal_segments are intentionally
     # absent — vocal_safe_regions already distills what the LLM needs,
     # and including the raw signals blew us past Groq's TPM ceiling.

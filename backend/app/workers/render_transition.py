@@ -137,18 +137,33 @@ def _max_seam_time(duration: float, bpm: float, time_signature: int) -> float:
     return max(0.0, duration - _MAX_CROSSFADE_BARS * sec_per_bar - _SEAM_SAFETY_SECONDS)
 
 
-def _downsample(values: list[float], target: int = 30) -> list[float]:
-    """Return at most `target` evenly-spaced samples from `values`.
+def _enrich_sections(sections: list[dict], energy_curve: list[float]) -> list[dict]:
+    """Annotate each section with mean energy, normalized 0..1 over the song.
 
-    Energy curve is sampled at 1Hz in the analyzer (180 floats for a
-    3-min song). The LLM needs the shape, not the resolution — drop
-    to ~one value per 4–8s so the curve costs <1K tokens per song.
+    The analyzer's section `label`s are opaque cluster IDs (`section_1`
+    …`section_5`) — they tell the LLM nothing about musical role. The
+    energy curve is sampled at 1 Hz, so its index ≈ second; we average
+    it over each section's span and normalize to the song's hottest
+    section. The LLM uses that to read structure (low = intro/breakdown,
+    ~1.0 = drop/chorus), pick a style, and place a musical seam. We drop
+    the meaningless `label` and the standalone energy_curve in favor of
+    this.
     """
-    n = len(values)
-    if n <= target:
-        return values
-    step = n / target
-    return [values[int(i * step)] for i in range(target)]
+    if not sections:
+        return []
+    n = len(energy_curve)
+    raw: list[float] = []
+    for s in sections:
+        lo = int(s["start"])
+        hi = max(lo + 1, int(round(s["end"])))
+        window = energy_curve[lo:hi] if n else []
+        raw.append(sum(window) / len(window) if window else 0.0)
+    peak = max(raw) or 1.0
+    return [
+        {"start": round(s["start"], 1), "end": round(s["end"], 1),
+         "energy": round(e / peak, 2)}
+        for s, e in zip(sections, raw)
+    ]
 
 
 def _validate_seam_headroom(
@@ -294,11 +309,12 @@ def render_transition(mix_plan_id: str) -> str | None:
         # the executor consumes and intentionally stays narrow). Snapshot
         # them here so the rest of the worker can stay session-free.
         #
-        # `energy_curve` is sampled at 1Hz in the analyzer; downsample to
-        # one value per ~4s here. The LLM needs the shape (intro/build/
-        # drop) — sub-second resolution would just burn tokens.
-        a_energy_curve = _downsample(list(a_analysis.energy_curve or []))
-        b_energy_curve = _downsample(list(b_analysis.energy_curve or []))
+        # `energy_curve` is sampled at 1Hz in the analyzer. We don't send
+        # the raw curve to the LLM (no timestamps → unusable); instead we
+        # average it per section in `_enrich_sections` so structure and
+        # energy arrive together.
+        a_energy_curve = list(a_analysis.energy_curve or [])
+        b_energy_curve = list(b_analysis.energy_curve or [])
         # Per-word lyrics + raw Whisper segments + vocal_segments are
         # deliberately NOT carried into the LLM input. Reasons:
         #   - `vocal_safe_regions` already distills "where can/can't I
@@ -335,15 +351,23 @@ def render_transition(mix_plan_id: str) -> str | None:
         )
 
     def _bundle_to_llm_dict(bundle: AnalysisBundle, energy_curve) -> dict:
+        sec_per_bar = (
+            round((60.0 / bundle.bpm) * bundle.time_signature, 3)
+            if bundle.bpm else 0.0
+        )
         return {
             "bpm": bundle.bpm,
             "key": bundle.key,
             "camelot_key": bundle.camelot_key,
             "time_signature": bundle.time_signature,
-            "downbeats": bundle.downbeats,
-            "sections": bundle.sections,
+            # Bar length so the LLM can convert section times <-> bars
+            # without us shipping the full downbeats array (which was
+            # ~40% of the prompt and pure noise).
+            "seconds_per_bar": sec_per_bar,
             "duration": bundle.duration,
-            "energy_curve": energy_curve,
+            # Sections carry their normalized mean energy (see
+            # _enrich_sections) — this is the LLM's structural map.
+            "sections": _enrich_sections(bundle.sections, energy_curve),
             # Latest seam time that leaves a full 16-bar crossfade +
             # 5s safety buffer in the song. The LLM must keep its
             # seam at or before this value; the validator rejects
@@ -375,7 +399,7 @@ def render_transition(mix_plan_id: str) -> str | None:
         # of redundant floats per prompt.
         tools_schema = json.dumps([
             {"tool": "set_transition_window", "from_song_time_start": "float", "to_song_time_start": "float", "duration_bars": "int"},
-            {"tool": "crossfade_stem", "stem": "str", "from_song": "str", "to_song": "str", "start_bar": "int", "duration_bars": "int", "curve": "str"},
+            {"tool": "crossfade_stem", "stem": "str", "from_song": "str", "to_song": "str", "start_bar": "int", "duration_bars": "int", "curve": "str", "a_fade_out_bars": "int (optional; bars over which A fades out, <= duration_bars; default duration_bars)"},
             {"tool": "pitch_shift", "song": "str", "semitones": "float"},
             {"tool": "temporary_pitch_shift", "song": "str", "start_time": "float", "semitones": "float", "fade_in_bars": "int", "hold_bars": "int", "fade_out_bars": "int"},
             {"tool": "set_tempo_ramp", "song": "str", "start_time": "float", "end_time": "float", "start_bpm": "float", "end_bpm": "float"},

@@ -31,39 +31,65 @@ DEFAULT_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
 # this only fires on network trouble.
 GROQ_TIMEOUT_SECONDS = 30.0
 
-SYSTEM_PROMPT = """You are an expert DJ transitioning between two tracks.
-You will be provided with the musical analysis (BPM, key, sections, downbeats, energy curve) and vocal-safe regions for two songs labeled "A" (outgoing) and "B" (incoming). The `vocal_safe_regions` are time intervals where no vocals are present — that is where cuts, stem swaps, and drop swaps should land.
+SYSTEM_PROMPT = """You are an expert DJ planning a seamless transition from track A (outgoing) into track B (incoming). A great transition is varied and musical — NOT the same long crossfade every time.
 
-CRITICAL: In every tool call, the `song`, `from_song`, and `to_song` fields MUST be exactly the single-character strings "A" or "B". Never "Song A", "song_a", "1", or any other variation — the executor will reject anything else.
+INPUT — for each of A and B you get:
+- bpm, key, camelot_key, time_signature, seconds_per_bar, duration
+- max_seam_time: the latest time you may leave A / enter B. A hard ceiling (see Hard rules).
+- sections: [{"start","end","energy"}] — your structural map. energy is 0..1 normalized to the song's hottest section: ~1.0 = a drop or chorus, low values = intro, breakdown, or outro.
+- vocal_safe_regions: [{"start","end"}] — spans with NO vocals. The ONLY places a hard cut or stem swap may land.
 
-Your goal is to plan a seamless, professional transition from A to B. Return a JSON object with a single key "plan" whose value is the list of tool call objects. You have the following tools available:
+PLAN IN THIS ORDER:
+1. Choose the seam. from_song_time_start = where you leave A; to_song_time_start = where you enter B. Land both on a section boundary near a downbeat (use seconds_per_bar to reason in bars). Use energy to make it musical: blend a high-energy A tail into a high-energy B section, or drop B in where A has gone quiet. Keep both <= max_seam_time.
+2. Choose ONE style below that actually fits these two songs. Reach past Classic Blend whenever the songs give you a reason to — variety across transitions is the goal.
+3. Emit that style's tool calls.
+
+TRANSITION STYLES (pick one; emit its calls — do not name it):
+- Classic Blend — similar energy, compatible keys, nothing special to exploit. All 4 crossfade_stem: start_bar=0, duration_bars=16, equal_power. The fallback, not the default.
+- Vocal-First Out — A has a strong vocal hook to clear before B enters. vocals: start_bar=0, duration_bars=8; drums/bass/other: start_bar=8, duration_bars=8. A's instrumental hands off after its vocal is gone.
+- Drum-Bridge — both tracks drum-driven. vocals/bass/other: start_bar=0, duration_bars=8; drums: start_bar=4, duration_bars=12, so A's drums hold while B's come in early and bridge the two grids.
+- Drop Swap — B opens on a drop (B's first section energy near 1.0) and A has a clean bar inside a vocal_safe_region at the seam. All 4 stems: same start_bar on that safe downbeat, duration_bars=2..4, equal_power. Snaps A→B at the drop.
+- Filter Sweep Out — A is bright/high-energy, B darker, or you want to deconstruct A. One filter_sweep on A: lowpass, start_time = seam minus 8 bars, end_time = seam, start_cutoff_hz=20000, end_cutoff_hz=200, plus a normal 16-bar 4-stem crossfade. Do NOT pitch_shift B here.
+- Loop & Echo Trail — A has a clean instrumental tail (no vocals in its last 8 bars) and B intros softly. One loop_section on A's last 4 bars (beats=16, repeats=2, bpm=A.bpm), then one echo_out at the loop end (beats=4, feedback=0.5, bpm=A.bpm); the 4 crossfade_stem calls can be short (duration_bars=4).
+
+DON'T LET A LINGER: by default A only goes silent when B reaches full, so a long crossfade keeps A audible across the whole overlap and muddies the mix. Set `a_fade_out_bars` shorter than `duration_bars` so A clears out early while B keeps swelling in on its own — e.g. duration_bars=16, a_fade_out_bars=8 means A is gone halfway through while B keeps rising. Use this on most transitions; reserve a_fade_out_bars == duration_bars for when you genuinely want A and B locked together to the end. Keep crossfades punchy (8–16 bars), don't reflexively max the duration.
+
+Available tools:
 {tools_schema}
 
-Rules:
-1. Always start with exactly one `set_transition_window` call to define the alignment and crossfade duration.
-2. SEAM HEADROOM (critical, hard validator check): `from_song_time_start` MUST be <= A's `analysis.max_seam_time`, and `to_song_time_start` MUST be <= B's `analysis.max_seam_time`. These values are pre-computed to leave room for a full 16-bar crossfade plus a 5-second safety buffer (absorbs stem-WAV drift vs metadata). DO NOT derive your own headroom from `duration` and `bpm` — trust the pre-computed `max_seam_time` field literally; the validator uses a wider buffer than the obvious math suggests, and plans that fail this check are silently replaced with a worse deterministic fallback. For the most musical result, place `from_song_time_start` at the start of A's last section (the outro) clamped to be <= A's `max_seam_time`.
-3. Hard cuts, stem swaps, and drop swaps should land inside the provided `vocal_safe_regions`. Outside them, prefer crossfades.
-4. You must emit exactly 4 `crossfade_stem` calls, one for each stem: "vocals", "drums", "bass", "other". They MAY use different `start_bar`, `duration_bars`, and `curve` ("equal_power" or "linear") values to build stem-swap transitions where one stem fades out before another. Every call uses `"from_song": "A"` and `"to_song": "B"`.
-5. If keys clash, you may use `pitch_shift` (permanent) or `temporary_pitch_shift` (returns to native key) on song B (i.e. `"song": "B"`). Permanent `pitch_shift` is capped at ±2 semitones — beyond that, pyrubberband artifacts outweigh the harmonic benefit, and the executor will clamp. Prefer `temporary_pitch_shift` for larger excursions.
-6. If tempos clash significantly, you may use `set_tempo_ramp` on song B (`"song": "B"`) to ramp from A's BPM to B's BPM over a specified window.
-7. The output must be a valid JSON object of the form {{"plan": [...]}}.
+WORKED EXAMPLES (copy these shapes; change the numbers to fit the songs):
 
-Transition styles (pick ONE based on the two songs' energy_curve, BPM, key, and vocal_safe_regions; emit the matching tool calls — do NOT label which style you picked):
+Example — Drum-Bridge, A and B both 128 BPM (seconds_per_bar 1.875), seam at A 180.0s / B 32.0s:
+{"plan": [
+  {"tool": "set_transition_window", "from_song_time_start": 180.0, "to_song_time_start": 32.0, "duration_bars": 16},
+  {"tool": "crossfade_stem", "stem": "vocals", "from_song": "A", "to_song": "B", "start_bar": 0, "duration_bars": 8, "curve": "equal_power"},
+  {"tool": "crossfade_stem", "stem": "bass", "from_song": "A", "to_song": "B", "start_bar": 0, "duration_bars": 8, "curve": "equal_power"},
+  {"tool": "crossfade_stem", "stem": "other", "from_song": "A", "to_song": "B", "start_bar": 0, "duration_bars": 8, "curve": "equal_power"},
+  {"tool": "crossfade_stem", "stem": "drums", "from_song": "A", "to_song": "B", "start_bar": 4, "duration_bars": 12, "curve": "equal_power"}
+]}
 
-- Classic Blend — use when A and B have similar energy and compatible keys. All 4 `crossfade_stem` calls share `start_bar=0`, `duration_bars=16`, `curve="equal_power"`. Smooth long blend; the default when nothing else fits.
+Example — Filter Sweep Out, A 128 BPM bright, B 124 BPM darker, seam at A 200.0s / B 16.0s:
+{"plan": [
+  {"tool": "set_transition_window", "from_song_time_start": 200.0, "to_song_time_start": 16.0, "duration_bars": 16},
+  {"tool": "set_tempo_ramp", "song": "B", "start_time": 16.0, "end_time": 47.0, "start_bpm": 128.0, "end_bpm": 124.0},
+  {"tool": "filter_sweep", "song": "A", "type": "lowpass", "start_time": 185.0, "end_time": 200.0, "start_cutoff_hz": 20000, "end_cutoff_hz": 200},
+  {"tool": "crossfade_stem", "stem": "vocals", "from_song": "A", "to_song": "B", "start_bar": 0, "duration_bars": 16, "a_fade_out_bars": 8, "curve": "equal_power"},
+  {"tool": "crossfade_stem", "stem": "drums", "from_song": "A", "to_song": "B", "start_bar": 0, "duration_bars": 16, "a_fade_out_bars": 8, "curve": "equal_power"},
+  {"tool": "crossfade_stem", "stem": "bass", "from_song": "A", "to_song": "B", "start_bar": 0, "duration_bars": 16, "a_fade_out_bars": 8, "curve": "equal_power"},
+  {"tool": "crossfade_stem", "stem": "other", "from_song": "A", "to_song": "B", "start_bar": 0, "duration_bars": 16, "a_fade_out_bars": 8, "curve": "equal_power"}
+]}
 
-- Vocal-First Out — use when A and B are different songs but have similar tempo, especially when A has a strong vocal hook you want to clear before B's instrumental enters. Vocals call uses an earlier and shorter envelope (e.g. `start_bar=0`, `duration_bars=8`); drums / bass / other call a later one (e.g. `start_bar=8`, `duration_bars=8`). A's instrumental hands off after the vocal is already gone.
+Also available: swap_stem — a hard cut of ONE stem at a downbeat (time is in OUTPUT-timeline seconds). Use it to instant-swap drums while the other 3 stems crossfade.
 
-- Drop Swap — use when B starts with a drop and A has a clean bar at its end inside a `vocal_safe_region`. All 4 stems share `start_bar` aligned to that safe downbeat and a short `duration_bars` (2 to 4); `curve="equal_power"`. Snaps from A to B at the drop.
-
-- Drum-Bridge — use when both songs are drum-driven. Vocals / bass / other fade first (e.g. `start_bar=0`, `duration_bars=8`), drums fade later (e.g. `start_bar=4`, `duration_bars=12`) so A's drums hold while B's drums come in early and bridge the two beat grids.
-
-- Filter Sweep Out — use when A is bright/high-energy and B is darker, or when you want to "deconstruct" A before B enters. Emit one `filter_sweep` on `"song": "A"` with `type="lowpass"`, `start_time` aligned to A's last 8 bars before the seam, `end_time` at the seam, `start_cutoff_hz=20000`, `end_cutoff_hz=200`. Combine with a standard 4-stem crossfade (e.g. Classic Blend params) — the sweep removes A's brightness so B's entry feels like opening a curtain. Do NOT also use `pitch_shift` on B here; the sweep is the focal effect.
-
-- Loop & Echo Trail — use when A has a clean instrumental tail (no vocals in the last 8 bars per `vocal_safe_regions`) and B intros softly. Emit one `loop_section` on A around its last 4 bars before the seam (`beats=16`, `repeats=2`, `bpm=A.bpm`) to extend the bridge, then one `echo_out` on A at the loop's end (`beats=4`, `feedback=0.5`, `bpm=A.bpm`) so A dissolves into echoes while the 4 `crossfade_stem` calls bring B in over the top. The crossfade can be short (`duration_bars=4`) because A is already vanishing.
-
-Advanced moves (use sparingly, when the style above calls for them):
-- `swap_stem` is a hard cut on a SINGLE stem at a downbeat (`time` is in OUTPUT-timeline seconds, not original-song). Use to instant-swap drums while letting the other stems crossfade smoothly. Pair with 3 normal `crossfade_stem` calls for the other stems.
+HARD RULES (break one and the whole plan is discarded for a worse fallback):
+1. song / from_song / to_song are EXACTLY "A" or "B" — never "Song A", "song_a", "1".
+2. Exactly one set_transition_window, and it comes first.
+3. Exactly 4 crossfade_stem calls — vocals, drums, bass, other — each from_song "A", to_song "B". Their start_bar / duration_bars / curve may differ; that is how stem-swap styles are built.
+4. SEAM HEADROOM: from_song_time_start <= A.max_seam_time AND to_song_time_start <= B.max_seam_time. These are pre-computed with the full safety buffer baked in — use them literally, never derive your own headroom from duration/bpm.
+5. Hard cuts, swap_stem, and Drop Swap must land inside a vocal_safe_region.
+6. KEYS: pitch-shift B only if A and B camelot_key are neither equal nor adjacent (adjacent = same number with the other letter, or number ±1 with the same letter). When they clash, prefer temporary_pitch_shift on B; permanent pitch_shift is capped at ±2 semitones. Compatible keys → no pitch shift at all.
+7. TEMPO: if bpm differs enough to matter, set_tempo_ramp on B from A's bpm to B's bpm.
+8. Output ONLY a JSON object of the form {"plan": [ ...tool-call objects... ]} — no prose.
 """
 
 
@@ -84,7 +110,7 @@ class GroqProvider:
         # swapping either invalidates stale plans automatically. Without
         # this, a prompt fix would never reach pairs that already have a
         # cached (wrong) plan.
-        system_instruction = SYSTEM_PROMPT.format(tools_schema=tools_schema)
+        system_instruction = SYSTEM_PROMPT.replace("{tools_schema}", tools_schema)
         payload = {
             "from_song": from_song,
             "to_song": to_song,
