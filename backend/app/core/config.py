@@ -28,7 +28,14 @@ class Settings(BaseSettings):
     # gpt-oss-120b). Our trimmed prompt is ~2–3K tokens, so this
     # leaves 10x headroom for retries / parallel renders.
     groq_model: str = "meta-llama/llama-4-scout-17b-16e-instruct"
-    llm_provider: str = "gemini"  # gemini | groq
+    # DigitalOcean Serverless Inference (OpenAI-compatible). gpt-oss-120b
+    # is the best model accessible on the tier-1 subscription (all OpenAI
+    # GPT-5.x and Anthropic Claude models are 403-gated behind a higher
+    # tier) and is fast enough (~10s) to stay under the 30s timeout. To
+    # use GPT-5.5/Claude, upgrade the DO tier and set openai-gpt-5.5 here.
+    do_inference_api_key: str = ""
+    do_inference_model: str = "openai-gpt-oss-120b"
+    llm_provider: str = "gemini"  # gemini | groq | digitalocean
     use_llm_planner: bool = True
 
     # Path to a Netscape-format cookies.txt that yt-dlp passes to YouTube.
