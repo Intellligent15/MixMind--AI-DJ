@@ -732,6 +732,19 @@ def render(
         xf_len = end_off - start_off
         curve = call["curve"]
 
+        # Optional decoupled A fade-out. By default A fades out over the
+        # full B fade-in window (a classic coupled crossfade). When
+        # `a_fade_out_bars` < `duration_bars`, A reaches silence earlier
+        # and B keeps swelling on its own for the remainder — i.e. cut A
+        # out without shortening B's entrance. Defaults to duration_bars
+        # so omitting it is bit-identical to the coupled crossfade.
+        afb = call.get("a_fade_out_bars")
+        a_fade_bars = int(afb) if afb is not None else int(call["duration_bars"])
+        a_fade_off = int(round(
+            (int(call["start_bar"]) + a_fade_bars) * samples_per_bar_a
+        ))
+        a_fade_off = max(start_off, min(a_fade_off, end_off))
+
         out_xf_start = a_seam_sample + start_off
         out_xf_end = a_seam_sample + end_off
         out_post_end = a_seam_sample + max_end_offset
@@ -746,7 +759,16 @@ def render(
         # Crossfade window.
         if xf_len > 0:
             t = np.linspace(0.0, 1.0, xf_len, endpoint=False, dtype=np.float32)
-            a_gain, b_gain = _curve_envelopes(curve, t)
+            # B fades in over the full window. A fades out over its own
+            # (possibly shorter) sub-window, then stays silent so B keeps
+            # rising alone.
+            _, b_gain = _curve_envelopes(curve, t)
+            a_gain = np.zeros(xf_len, dtype=np.float32)
+            a_fade_len = max(0, min(a_fade_off - start_off, xf_len))
+            if a_fade_len > 0:
+                t_a = np.linspace(0.0, 1.0, a_fade_len, endpoint=False, dtype=np.float32)
+                a_env, _ = _curve_envelopes(curve, t_a)
+                a_gain[:a_fade_len] = a_env
             a_region = a_stem[a_seam_sample + start_off : a_seam_sample + end_off]
             b_region = b_stem[b_seam_sample + start_off : b_seam_sample + end_off]
             # a_region/b_region may be shorter than xf_len if the source

@@ -1068,3 +1068,87 @@ def test_render_unknown_tool_still_raises():
     with patch("soundfile.read", side_effect=_fake_sf_read()):
         with pytest.raises(NotImplementedError, match="unknown tool"):
             render(plan, a, b)
+
+
+def _ab_reader(a_amp: float, b_amp: float):
+    """soundfile.read stub returning a constant tone whose amplitude
+    depends on which song's stem path is requested ('/A/' vs '/B/')."""
+    def _read(path, always_2d=True, dtype="float32"):
+        amp = a_amp if "/A/" in path else b_amp
+        return amp * np.ones((N, 2), dtype=np.float32), SR
+    return _read
+
+
+def test_render_a_fade_out_bars_cuts_a_early():
+    """With B silent, a_fade_out_bars < duration_bars must drive A to
+    silence by the half-way point while a coupled crossfade keeps A
+    audible across the whole window."""
+    a = _inputs(prefix="A")
+    b = _inputs(prefix="B")
+    # 120bpm => 2s/bar = 88200 samples. seam at 0.0 (a downbeat, no snap);
+    # the 2-bar window starts at output sample 0.
+    bar = int(2.0 * SR)
+    win_start = 0                 # start_bar=0, seam at 0.0
+    win_half = win_start + bar    # a_fade ends here when a_fade_out_bars=1
+    win_end = win_start + 2 * bar
+
+    def _plan(a_fade):
+        stems = []
+        for s in ("vocals", "drums", "bass", "other"):
+            call = {"tool": "crossfade_stem", "stem": s,
+                    "from_song": "A", "to_song": "B",
+                    "start_bar": 0, "duration_bars": 2, "curve": "equal_power"}
+            if a_fade is not None:
+                call["a_fade_out_bars"] = a_fade
+            stems.append(call)
+        return [
+            {"tool": "set_transition_window",
+             "from_song_time_start": 0.0, "to_song_time_start": 0.0,
+             "duration_bars": 2},
+            *stems,
+        ]
+
+    # A audible (0.2/stem), B silent.
+    with patch("soundfile.read", side_effect=_ab_reader(0.2, 0.0)):
+        coupled = render(_plan(None), a, b)       # default == full-window A fade
+        decoupled = render(_plan(1), a, b)        # A gone at the half point
+
+    cd, _ = sf.read(io.BytesIO(coupled.wav_bytes), always_2d=True)
+    dd, _ = sf.read(io.BytesIO(decoupled.wav_bytes), always_2d=True)
+
+    back_coupled = np.max(np.abs(cd[win_half:win_end]))
+    back_decoupled = np.max(np.abs(dd[win_half:win_end]))
+    front_decoupled = np.max(np.abs(dd[win_start:win_half]))
+
+    assert back_coupled > 0.1          # coupled: A still ringing in 2nd half
+    assert back_decoupled < 1e-3       # decoupled: A silent in 2nd half (B silent too)
+    assert front_decoupled > 0.1       # A still present in the 1st half
+
+
+def test_render_a_fade_out_bars_default_is_identical():
+    """Omitting a_fade_out_bars must be byte-identical to setting it equal
+    to duration_bars — i.e. the coupled crossfade is unchanged."""
+    a = _inputs(prefix="A")
+    b = _inputs(prefix="B")
+
+    def _plan(explicit):
+        stems = []
+        for s in ("vocals", "drums", "bass", "other"):
+            call = {"tool": "crossfade_stem", "stem": s,
+                    "from_song": "A", "to_song": "B",
+                    "start_bar": 0, "duration_bars": 1, "curve": "equal_power"}
+            if explicit:
+                call["a_fade_out_bars"] = 1
+            stems.append(call)
+        return [
+            {"tool": "set_transition_window",
+             "from_song_time_start": 1.0, "to_song_time_start": 0.0,
+             "duration_bars": 1},
+            *stems,
+        ]
+
+    with patch("soundfile.read", side_effect=_fake_sf_read()):
+        omitted = render(_plan(False), a, b)
+        explicit = render(_plan(True), a, b)
+
+    assert omitted.wav_bytes == explicit.wav_bytes
