@@ -16,7 +16,12 @@ import numpy as np
 import pytest
 import soundfile as sf
 
-from app.services.mixer.executor import render
+from app.services.mixer.executor import (
+    SOFT_CLIP_CEILING,
+    SOFT_KNEE_THRESHOLD,
+    _soft_knee_limit,
+    render,
+)
 from app.services.mixer.types import (
     AnalysisBundle,
     MixerPreconditionError,
@@ -310,11 +315,13 @@ def test_render_temporary_pitch_mutes_vocal_then_fades_it_in():
     assert result.pitch_shift_warning  # |-4| > 2
 
 
-def test_render_tempo_ramp_alone_mutes_vocal_then_fades_it_in():
-    """Tempo-only path (no temp pitch shift): B's vocal must be silent
-    while the tempo ramp is active and fade in only once B has settled at
-    native tempo. Same fade window as the temp-pitch path so the two
-    behave consistently."""
+def test_render_tempo_ramp_alone_keeps_vocal_present():
+    """Tempo-only path (no temp pitch shift): B's vocal is NOT muted. The
+    ramp lands after the crossfade and B is a clean constant-tempo stretch
+    through the blend, so holding the vocal out until the ramp settles would
+    make it arrive jarringly late. Only a temp *pitch* shift gates the vocal
+    (see test_render_temp_pitch_*). The vocal rides in with the crossfade and
+    stays present across the ramp window."""
     long_dur = 16.0
     long_n = int(SR * long_dur)
     sec_per_bar = 2.0  # 120 bpm, 4/4
@@ -336,8 +343,8 @@ def test_render_tempo_ramp_alone_mutes_vocal_then_fades_it_in():
         return amp * np.ones((long_n, 2), dtype=np.float32), SR
 
     # Tempo ramp 4 s → 10 s, no temp pitch. Same BPM end-to-end so the
-    # mocked timemap_stretch is a passthrough. Vocal stays silent through
-    # the entire ramp, then fades in over [10 s, 14 s], full from 14 s on.
+    # mocked timemap_stretch is a passthrough. Vocal rides in with the 1-bar
+    # crossfade and stays present — the ramp does not mute it.
     plan = [
         {"tool": "set_transition_window",
          "from_song_time_start": 0.0, "to_song_time_start": 0.0,
@@ -359,13 +366,13 @@ def test_render_tempo_ramp_alone_mutes_vocal_then_fades_it_in():
         result = render(plan, a, b)
 
     out, _ = sf.read(io.BytesIO(result.wav_bytes), always_2d=True, dtype="float32")
-    # Mid-ramp (~7 s): vocal must be muted.
-    during = np.max(np.abs(out[int(7.0 * SR): int(7.1 * SR)]))
-    assert during < 0.05, f"vocal should be muted during tempo ramp, got {during}"
-    # Just before settle (~9 s): still muted.
-    just_before = np.max(np.abs(out[int(9.0 * SR): int(9.1 * SR)]))
-    assert just_before < 0.05, f"vocal should still be muted at 9s, got {just_before}"
-    # After the vocal fade-in completes (~15 s): vocal at full level.
+    # Mid-ramp (~7 s): vocal is present, NOT muted (the regression we fixed).
+    during = np.mean(np.abs(out[int(7.0 * SR): int(7.1 * SR)]))
+    assert during > 0.4, f"vocal should ride through the tempo ramp, got {during}"
+    # Just before settle (~9 s): still present.
+    just_before = np.mean(np.abs(out[int(9.0 * SR): int(9.1 * SR)]))
+    assert just_before > 0.4, f"vocal should still be present at 9s, got {just_before}"
+    # Past the ramp (~15 s): still at full level.
     present = np.mean(np.abs(out[int(15.0 * SR): int(15.1 * SR)]))
     assert present > 0.4, f"vocal should be present once tempo settles, got {present}"
 
@@ -492,6 +499,38 @@ def test_render_precondition_rejects_mono():
     with patch("soundfile.read", side_effect=mono_read):
         with pytest.raises(MixerPreconditionError, match="channels"):
             render(plan, a, b)
+
+
+def test_soft_knee_limit_passes_through_below_ceiling():
+    """A buffer already at/under the ceiling is returned untouched — no
+    global attenuation. This is the core regression vs the old normalize,
+    which scaled the whole buffer whenever any sample crossed the ceiling."""
+    rng = np.random.default_rng(0)
+    audio = (rng.standard_normal((1000, 2)).astype(np.float32) * 0.3).clip(-0.8, 0.8)
+    out = _soft_knee_limit(audio, SOFT_KNEE_THRESHOLD, SOFT_CLIP_CEILING)
+    assert out is audio  # untouched, not even copied
+
+
+def test_soft_knee_limit_does_not_duck_quiet_samples():
+    """One loud transient must not pull down the quiet body. The old
+    normalize multiplied everything by ceiling/peak; the limiter leaves
+    sub-knee samples exactly as they were and only shapes what's over."""
+    audio = np.full((100, 2), 0.3, dtype=np.float32)
+    audio[50] = 1.6  # single loud transient
+    out = _soft_knee_limit(audio, SOFT_KNEE_THRESHOLD, SOFT_CLIP_CEILING)
+    # Quiet body untouched (would be 0.3 * 0.999/1.6 ≈ 0.187 under the old normalize).
+    assert out[0, 0] == pytest.approx(0.3, abs=1e-6)
+    assert out[99, 0] == pytest.approx(0.3, abs=1e-6)
+    # Transient tamed below the ceiling, sign preserved.
+    assert 0.9 < out[50, 0] < SOFT_CLIP_CEILING
+
+
+def test_soft_knee_limit_caps_and_preserves_sign():
+    """Output never reaches the ceiling and keeps the input's sign."""
+    audio = np.array([[5.0, -5.0], [0.95, -0.95]], dtype=np.float32)
+    out = _soft_knee_limit(audio, SOFT_KNEE_THRESHOLD, SOFT_CLIP_CEILING)
+    assert np.all(np.abs(out) < SOFT_CLIP_CEILING)
+    assert out[0, 0] > 0 and out[0, 1] < 0
 
 
 def test_render_soft_clips_loud_sum():

@@ -37,6 +37,12 @@ logger = logging.getLogger(__name__)
 REQUIRED_SAMPLE_RATE = 44100
 REQUIRED_CHANNELS = 2
 SOFT_CLIP_CEILING = 0.999
+# Soft-knee limiter: |sample| <= SOFT_KNEE_THRESHOLD passes through
+# untouched; the region above it is tanh-compressed into
+# [threshold, SOFT_CLIP_CEILING]. Keeps song bodies (which sit near but
+# under full scale) unchanged while taming the crossfade overlap, where
+# two near-full-scale masters stack to ~+3 dB.
+SOFT_KNEE_THRESHOLD = 0.9
 LARGE_SHIFT_THRESHOLD = 2
 # Temporary-pitch path: bars over which B's (unshifted) vocal fades back in
 # at the tail of the ramp, so it arrives just as B reaches its native key.
@@ -336,6 +342,35 @@ def _find_zero_crossing(audio: np.ndarray, center: int, search_samples: int) -> 
     return int(absolute[np.argmin(np.abs(absolute - center))])
 
 
+def _soft_knee_limit(
+    audio: np.ndarray, threshold: float, ceiling: float
+) -> np.ndarray:
+    """Stateless soft-knee limiter.
+
+    Samples with ``|x| <= threshold`` pass through unchanged; the region
+    above the knee is mapped ``[threshold, inf) -> [threshold, ceiling)``
+    via ``tanh``. Because ``tanh'(0) == 1`` the curve joins the unity line
+    with a continuous slope at the knee (no audible kink), and the output
+    can never reach ``ceiling``. When the whole buffer already sits at or
+    under ``ceiling`` there's nothing to clip, so we return it untouched —
+    the common case stays bit-exact and, crucially, a single overlap
+    transient no longer attenuates the entire track the way the old
+    whole-buffer normalize did.
+    """
+    peak = float(np.max(np.abs(audio)))
+    if peak <= ceiling:
+        return audio
+    span = ceiling - threshold
+    mag = np.abs(audio)
+    over = mag > threshold
+    if not np.any(over):
+        return audio
+    shaped = audio.copy()
+    limited = threshold + span * np.tanh((mag[over] - threshold) / span)
+    shaped[over] = np.sign(audio[over]) * limited
+    return shaped
+
+
 def render(
     plan: MixPlanJSON,
     a: SongRenderInputs,
@@ -517,13 +552,15 @@ def render(
                 _stretch(b_stems_raw[stem]), int(perm_pitch["semitones"])
             )
     else:
-        # Any temporary transition (temp pitch and/or tempo ramp) mutes B's
-        # vocal until the transition has fully settled, then fades the vocal
-        # back in. Rationale: pitched-and-stretched vocals are the ugliest
-        # artifact of a transition, and the vocal source we have is the
-        # Demucs stem — colored already. Hiding it through the whole tempo
-        # change + key return + back-to-native window keeps the listener's
-        # attention on A's vocal until B is cleanly itself again.
+        # A temporary *pitch* shift mutes B's vocal until the key settles —
+        # a vocal sung in the wrong key is the ugliest artifact of a
+        # transition, and our vocal source is the Demucs stem (colored
+        # already), so we hide it until B is back in its own key. A tempo
+        # ramp ALONE does NOT mute the vocal: the ramp now lands after the
+        # crossfade (system prompt rule 7), and B is a clean constant-tempo
+        # stretch through the crossfade, so the vocal rides in with the
+        # blend instead of being held out for tens of seconds until the ramp
+        # settles (which made B's vocal arrive jarringly late).
         instr_native_per_stem = {
             s: _stretch(b_stems_raw[s]) for s in ("drums", "bass", "other")
         }
@@ -574,11 +611,10 @@ def render(
             instr = sum(instr_per_stem.values())  # type: ignore[assignment]
             vocal_resume_out = max(vocal_resume_out, fade_end)
 
-        # Tempo ramp on its own also counts as a temp transition for vocal
-        # muting purposes — vocals stretched alongside a changing tempo
-        # sound warbly, so hold them out until the ramp lands.
-        if tempo_ramp and b_native_out is not None:
-            vocal_resume_out = max(vocal_resume_out, b_native_out)
+        # NOTE: a tempo ramp on its own intentionally does NOT push
+        # vocal_resume_out — see the block comment above. Only a temp pitch
+        # shift gates the vocal. The master splice below still waits for the
+        # ramp to land (b_settle_out is clamped to b_native_out).
 
         n = min(instr.shape[0], vocal_native.shape[0])
         if vocal_resume_out > 0:
@@ -594,8 +630,13 @@ def render(
             for s in ("drums", "bass", "other"):
                 b_stems_processed[s] = instr_per_stem[s][:n]
             b_stems_processed["vocals"] = vocal_native[:n] * vocal_gain[:, None]
-            # Fully settled once the vocal has finished fading in.
+            # Fully settled once the vocal has finished fading in — and, if a
+            # tempo ramp is running, not before B reaches native tempo (the
+            # spliced master is native-rate, so it can't replace the mix
+            # mid-ramp).
             b_settle_out = v_end
+            if tempo_ramp and b_native_out is not None:
+                b_settle_out = max(b_settle_out, b_native_out)
         else:
             # No temporary transition: vocal stays present from the start.
             b_mix = instr[:n] + vocal_native[:n]
@@ -840,15 +881,18 @@ def render(
             if boundary + tail_len < out.shape[0]:
                 out[boundary + tail_len :] = 0.0
 
-    # 7. Soft-clip to SOFT_CLIP_CEILING.
+    # 7. Soft-knee limit to SOFT_CLIP_CEILING. Unlike the old whole-buffer
+    #    normalize (which ducked the entire track — and so every transition
+    #    by a different amount — whenever one overlap transient peaked),
+    #    this leaves song bodies untouched and only tames samples above the
+    #    knee, keeping loudness consistent across the stitched queue.
     peak = float(np.max(np.abs(out)))
     if peak > SOFT_CLIP_CEILING:
-        attenuation = SOFT_CLIP_CEILING / peak
         logger.info(
-            "render: soft-clipping output (peak=%.4f, attenuation=%.4f)",
-            peak, attenuation,
+            "render: soft-knee limiting output (peak=%.4f, knee=%.3f, ceiling=%.3f)",
+            peak, SOFT_KNEE_THRESHOLD, SOFT_CLIP_CEILING,
         )
-        out *= attenuation
+        out = _soft_knee_limit(out, SOFT_KNEE_THRESHOLD, SOFT_CLIP_CEILING)
 
     # 8. Encode to 16-bit PCM WAV in memory.
     buf = io.BytesIO()
