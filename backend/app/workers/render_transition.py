@@ -101,6 +101,17 @@ def _validate_llm_plan(plan: list[dict]) -> None:
     illegal = {c.get("tool") for c in plan} - _LEGAL_TOOLS
     if illegal:
         raise ValueError(f"illegal tools in plan: {sorted(illegal)}")
+    # Permanent pitch_shift detunes B for the rest of the song. When B is
+    # later mixed OUT as the next pair's A (which is never pitched), the
+    # stitch junction snaps it back to its real pitch — an audible glitch.
+    # The prompt forbids it; reject here too so a model slip falls back to
+    # the deterministic planner instead of shipping a detuned song. Use
+    # temporary_pitch_shift (which returns B to its key) for clashes.
+    if any(c.get("tool") == "pitch_shift" for c in plan):
+        raise ValueError(
+            "permanent pitch_shift is not allowed (breaks the next stitch "
+            "junction); use temporary_pitch_shift"
+        )
     # Song refs must be the single-char strings the executor expects.
     # Models like to drift to "Song A" / "Song B" if the prompt
     # introduces the songs that way; reject so we fall back instead of

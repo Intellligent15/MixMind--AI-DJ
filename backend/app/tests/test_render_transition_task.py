@@ -252,6 +252,29 @@ def _valid_plan(extra: list[dict] | None = None) -> list[dict]:
     return plan
 
 
+def test_validate_llm_plan_rejects_permanent_pitch_shift():
+    """Permanent pitch_shift detunes B for the rest of the song and glitches
+    at the next stitch junction — the validator must reject it so the render
+    falls back to the deterministic planner."""
+    from app.workers.render_transition import _validate_llm_plan
+
+    plan = _valid_plan(extra=[{"tool": "pitch_shift", "song": "B", "semitones": -2}])
+    with pytest.raises(ValueError, match="permanent pitch_shift"):
+        _validate_llm_plan(plan)
+
+
+def test_validate_llm_plan_allows_temporary_pitch_shift():
+    """temporary_pitch_shift returns B to its key before the seam, so it's
+    the allowed way to fix a key clash."""
+    from app.workers.render_transition import _validate_llm_plan
+
+    plan = _valid_plan(extra=[{
+        "tool": "temporary_pitch_shift", "song": "B", "start_time": 0.0,
+        "semitones": -2, "fade_in_bars": 0, "hold_bars": 4, "fade_out_bars": 2,
+    }])
+    _validate_llm_plan(plan)  # should not raise
+
+
 def test_render_transition_llm_planner(pair_with_plan):
     storage = AsyncMock()
     async def _write(key, data):
