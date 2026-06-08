@@ -22,7 +22,7 @@ import logging
 import numpy as np
 import pyrubberband.pyrb as pyrb
 import soundfile as sf
-from scipy.signal import iirfilter, sosfilt, sosfilt_zi
+from scipy.signal import fftconvolve, iirfilter, sosfilt, sosfilt_zi
 
 from app.services.mixer.types import (
     AnalysisBundle,
@@ -64,6 +64,114 @@ LOOP_XFADE_MS = 5.0
 # swap_stem: search window for a matched zero-crossing on either side of
 # the requested swap time, in milliseconds.
 SWAP_ZC_SEARCH_MS = 5.0
+
+# Pair-phase alignment (render-time downbeat correction). Per-song downbeat
+# detection can still mis-call one track's bar-1; aligning A's seam downbeat to
+# B's then locks the two grids a beat or two out of phase (right tempo, wrong
+# bar — the subtle "off" feel). At the seam we re-check by trying B at each
+# whole-beat offset within the bar and keeping whichever makes B's low-band
+# (kick/bass) onset pattern best match A's over a few bars — but only when the
+# win over "don't shift" is clear, so a confident detection isn't second-guessed
+# on noise.
+PAIR_PHASE_WINDOW_BARS = 4
+PAIR_PHASE_LOW_BAND_HZ = 250.0
+# Required gain in normalized correlation for a non-zero offset to beat the
+# no-shift baseline. ~0.12 keeps us from flipping a good alignment on noise.
+PAIR_PHASE_MIN_MARGIN = 0.12
+
+
+def _low_band_onset(seg: np.ndarray, sr: int) -> np.ndarray | None:
+    """Mono low-band onset-strength envelope for a (samples, ch) segment.
+
+    Returns None when the segment is too short or too flat (silence / constant
+    tone) to carry a usable rhythmic pattern — callers treat that as "can't
+    disambiguate, don't shift"."""
+    if seg.ndim == 2:
+        mono = seg.mean(axis=1).astype(np.float32)
+    else:
+        mono = seg.astype(np.float32)
+    if mono.shape[0] < sr // 4:  # < 0.25 s
+        return None
+    if float(np.std(mono)) < 1e-5:
+        return None
+    import librosa
+
+    mel = librosa.feature.melspectrogram(y=mono, sr=sr, n_mels=64)
+    freqs = librosa.mel_frequencies(n_mels=64, fmin=0.0, fmax=sr / 2.0)
+    low = freqs <= PAIR_PHASE_LOW_BAND_HZ
+    if not low.any():
+        low[0] = True
+    env = librosa.onset.onset_strength(
+        S=librosa.power_to_db(mel[low], ref=np.max), sr=sr
+    )
+    if env.shape[0] < 4 or float(np.std(env)) < 1e-6:
+        return None
+    return env
+
+
+def _norm_corr(a: np.ndarray, b: np.ndarray) -> float:
+    """Zero-lag normalized cross-correlation of two 1-D envelopes (-1..1)."""
+    n = min(a.shape[0], b.shape[0])
+    if n < 4:
+        return -1.0
+    a = a[:n] - a[:n].mean()
+    b = b[:n] - b[:n].mean()
+    na = float(np.linalg.norm(a))
+    nb = float(np.linalg.norm(b))
+    if na < 1e-9 or nb < 1e-9:
+        return -1.0
+    return float(np.dot(a, b) / (na * nb))
+
+
+def _align_pair_phase(
+    a_mix: np.ndarray,
+    b_mix: np.ndarray,
+    a_seam: int,
+    b_seam: int,
+    samples_per_bar: float,
+    time_signature: int,
+    sr: int,
+) -> int:
+    """Return a possibly-corrected ``b_seam`` so B's bar phase matches A's.
+
+    Tries entering B at each whole-beat offset within the bar
+    (0..time_signature-1), correlating low-band onset patterns over
+    PAIR_PHASE_WINDOW_BARS bars at the seam, and keeps the offset that best
+    matches A. Only overrides the analysis-derived seam when it beats the
+    no-shift baseline by PAIR_PHASE_MIN_MARGIN — otherwise returns ``b_seam``
+    unchanged. Both mixes are in output (post-stretch) time here, so one
+    "beat" is ``samples_per_bar / time_signature`` for both songs."""
+    if samples_per_bar <= 0 or time_signature <= 1:
+        return b_seam
+    spb_beat = samples_per_bar / time_signature
+    win = int(round(PAIR_PHASE_WINDOW_BARS * samples_per_bar))
+    a_env = _low_band_onset(a_mix[a_seam : a_seam + win], sr)
+    if a_env is None:
+        return b_seam
+
+    base_corr: float | None = None
+    best_k, best_corr = 0, -1.0
+    for k in range(time_signature):
+        bs = b_seam + int(round(k * spb_beat))
+        b_env = _low_band_onset(b_mix[bs : bs + win], sr)
+        if b_env is None:
+            continue
+        c = _norm_corr(a_env, b_env)
+        if k == 0:
+            base_corr = c
+        if c > best_corr:
+            best_corr, best_k = c, k
+
+    if base_corr is None:
+        return b_seam
+    if best_k != 0 and (best_corr - base_corr) >= PAIR_PHASE_MIN_MARGIN:
+        logger.info(
+            "render: pair-phase shifted B by %d beat(s) at the seam "
+            "(corr %.3f vs %.3f no-shift)",
+            best_k, best_corr, base_corr,
+        )
+        return b_seam + int(round(best_k * spb_beat))
+    return b_seam
 
 
 def _load_and_sum_stems(inputs: SongRenderInputs) -> np.ndarray:
@@ -274,6 +382,106 @@ def _apply_echo_out(audio: np.ndarray, call: dict) -> np.ndarray:
         usable = tap_end - tap_start
         out[tap_start:tap_end] += (gain * tap_src[:usable]).astype(out.dtype)
     return out
+    return out
+
+
+def _apply_reverb(audio: np.ndarray, call: dict) -> np.ndarray:
+    """Wash-out reverb using FFT convolution with decaying noise."""
+    bpm = float(call.get("bpm", 0.0))
+    tail_bars = float(call.get("tail_duration_bars", 0.0))
+    wet_level = float(call.get("wet_level", 0.0))
+    if tail_bars <= 0 or bpm <= 0 or wet_level <= 0:
+        return audio
+
+    start_samp = max(0, min(int(float(call.get("start_time", 0.0)) * REQUIRED_SAMPLE_RATE), audio.shape[0]))
+    
+    decay_sec = tail_bars * (60.0 / bpm) * 4.0
+    ir_len = int(decay_sec * REQUIRED_SAMPLE_RATE)
+    if ir_len <= 0 or start_samp >= audio.shape[0]:
+        return audio
+        
+    t = np.linspace(0, decay_sec, ir_len, dtype=np.float32)
+    tau = decay_sec / 6.0 
+    env = np.exp(-t / tau).astype(np.float32)[:, None]
+    
+    noise = np.random.randn(ir_len, REQUIRED_CHANNELS).astype(np.float32)
+    ir = noise * env
+    ir /= (np.linalg.norm(ir) + 1e-6)
+    
+    dry = audio[start_samp:]
+    if dry.shape[0] == 0:
+        return audio
+        
+    wet = np.empty_like(dry)
+    for ch in range(REQUIRED_CHANNELS):
+        wet[:, ch] = fftconvolve(dry[:, ch], ir[:, ch], mode='full')[:dry.shape[0]]
+        
+    out = audio.copy()
+    out[start_samp:] = dry * (1.0 - wet_level) + wet * wet_level
+    return out
+
+
+def _apply_turntable_stop(audio: np.ndarray, call: dict) -> np.ndarray:
+    """Simulates hitting stop on a turntable."""
+    duration_bars = float(call.get("duration_bars", 0.0))
+    bpm = float(call.get("bpm", 0.0))
+    start_time = float(call.get("start_time", 0.0))
+    if duration_bars <= 0 or bpm <= 0:
+        return audio
+
+    start_samp = max(0, min(int(start_time * REQUIRED_SAMPLE_RATE), audio.shape[0]))
+    duration_sec = duration_bars * (60.0 / bpm) * 4.0
+    stop_len = int(duration_sec * REQUIRED_SAMPLE_RATE)
+    
+    if stop_len <= 0 or start_samp >= audio.shape[0]:
+        return audio
+        
+    stop_end = min(start_samp + stop_len, audio.shape[0])
+    actual_len = stop_end - start_samp
+    
+    out = audio.copy()
+    out[stop_end:] = 0.0
+    
+    t = np.arange(actual_len, dtype=np.float64)
+    phase = t - (t**2) / (2.0 * actual_len)
+    
+    for ch in range(REQUIRED_CHANNELS):
+        out[start_samp:stop_end, ch] = np.interp(
+            phase, 
+            np.arange(actual_len, dtype=np.float64), 
+            audio[start_samp:stop_end, ch]
+        ).astype(np.float32)
+        
+    return out
+
+
+def _apply_volume_fade(audio: np.ndarray, call: dict) -> np.ndarray:
+    """Standalone volume automation curve."""
+    start_gain = float(call.get("start_gain", 1.0))
+    end_gain = float(call.get("end_gain", 1.0))
+    duration_bars = float(call.get("duration_bars", 0.0))
+    bpm = float(call.get("bpm", 0.0))
+    start_time = float(call.get("start_time", 0.0))
+    if duration_bars <= 0 or bpm <= 0:
+        return audio
+
+    start_samp = max(0, min(int(start_time * REQUIRED_SAMPLE_RATE), audio.shape[0]))
+    duration_sec = duration_bars * (60.0 / bpm) * 4.0
+    fade_len = int(duration_sec * REQUIRED_SAMPLE_RATE)
+    
+    if fade_len <= 0 or start_samp >= audio.shape[0]:
+        return audio
+        
+    fade_end = min(start_samp + fade_len, audio.shape[0])
+    actual_len = fade_end - start_samp
+    
+    out = audio.copy()
+    t = np.linspace(start_gain, end_gain, actual_len, dtype=np.float32)[:, None]
+    out[start_samp:fade_end] *= t
+    if fade_end < out.shape[0]:
+        out[fade_end:] *= end_gain
+        
+    return out
 
 
 def _apply_loop_section(audio: np.ndarray, call: dict) -> np.ndarray:
@@ -282,7 +490,7 @@ def _apply_loop_section(audio: np.ndarray, call: dict) -> np.ndarray:
     Equal-power crossfades the seam between successive loop copies over
     LOOP_XFADE_MS to hide phase discontinuity at slice edges.
     """
-    beats = int(call["beats"])
+    beats = float(call["beats"])
     repeats = int(call["repeats"])
     bpm = float(call["bpm"])
     if beats <= 0 or repeats <= 0 or bpm <= 0:
@@ -426,7 +634,7 @@ def render(
             tempo_ramp = call
         elif tool == "crossfade_stem":
             stem_calls.append(call)
-        elif tool in ("filter_sweep", "echo_out", "loop_section"):
+        elif tool in ("filter_sweep", "echo_out", "loop_section", "apply_reverb", "turntable_stop", "volume_fade"):
             pre_fx.append(call)
         elif tool == "swap_stem":
             post_fx.append(call)
@@ -452,6 +660,12 @@ def render(
                 target[name] = _apply_echo_out(target[name], fx)
             elif tool == "loop_section":
                 target[name] = _apply_loop_section(target[name], fx)
+            elif tool == "apply_reverb":
+                target[name] = _apply_reverb(target[name], fx)
+            elif tool == "turntable_stop":
+                target[name] = _apply_turntable_stop(target[name], fx)
+            elif tool == "volume_fade":
+                target[name] = _apply_volume_fade(target[name], fx)
         if song == "A":
             a_mix = _stems_sum(a_stems)
         else:
@@ -695,6 +909,22 @@ def render(
 
     sec_per_bar_a = (60.0 / a.analysis.bpm) * a.analysis.time_signature
     samples_per_bar_a = sec_per_bar_a * REQUIRED_SAMPLE_RATE
+
+    # 4c. Pair-phase correction. A's and B's downbeats are aligned at the seam,
+    #     but if either song's bar-1 was mis-detected the grids lock a beat or
+    #     two out of phase. Re-check against A's actual low-band onsets at the
+    #     seam and nudge B onto the matching bar phase (no-op unless the win is
+    #     clear). Both mixes are in output time, so beats are aligned at the
+    #     same tempo already — this only fixes the bar-level phase.
+    b_seam_sample = _align_pair_phase(
+        a_mix,
+        b_mix,
+        a_seam_sample,
+        b_seam_sample,
+        samples_per_bar_a,
+        a.analysis.time_signature,
+        REQUIRED_SAMPLE_RATE,
+    )
 
     # 5. Per-stem crossfade windows. Each call places its own envelope at
     #    [seam + start_bar*bar, seam + (start_bar + duration_bars)*bar]

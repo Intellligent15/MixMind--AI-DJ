@@ -40,6 +40,14 @@ TIME_SIGNATURE = 4  # see deviation note in the notes
 # off-beat emphasis. When the initial BPM lands outside this preferred range,
 # we re-run beat_track with alternate hints and pick the result whose beats
 # coincide most strongly with the onset envelope.
+# Upper bound (Hz) of the "low band" used to phase-align downbeats. The kick
+# fundamental and the bass note live here; snare (~200 Hz + broadband) and hats
+# are mostly excluded. Picking the downbeat phase off a full-spectrum onset
+# envelope gets fooled by loud hats/snares on the backbeat — beat 1 is carried
+# by the kick + bass, so a low-band onset envelope is a cleaner "where's the
+# bar?" signal.
+DOWNBEAT_LOW_BAND_HZ = 250.0
+
 TEMPO_PREFERRED_MIN = 85.0
 TEMPO_PREFERRED_MAX = 170.0
 # Multiplier candidates to try as start_bpm hints. Covers the common
@@ -144,6 +152,26 @@ def _correct_tempo_octave(
     return bpm0, beat_frames0
 
 
+def _low_band_onset_env(y: np.ndarray, sr: int) -> np.ndarray:
+    """Onset-strength envelope built from only the low mel bands (kick + bass).
+
+    Used for downbeat phase-picking. A full-spectrum onset envelope weights
+    hats/snares (often loudest on the offbeat / backbeat) as heavily as the
+    kick, so `_pick_downbeat_phase` can lock onto beat 2/4. Restricting the
+    onset flux to <= DOWNBEAT_LOW_BAND_HZ makes beat 1 (kick fundamental + bass
+    note) stand out. Uses the default hop (512), matching `beat_track`'s frames
+    so the offset search indexes consistently.
+    """
+    mel = librosa.feature.melspectrogram(y=y, sr=sr, n_mels=128)
+    freqs = librosa.mel_frequencies(n_mels=128, fmin=0.0, fmax=sr / 2.0)
+    low = freqs <= DOWNBEAT_LOW_BAND_HZ
+    if not low.any():
+        low[0] = True
+    return librosa.onset.onset_strength(
+        S=librosa.power_to_db(mel[low], ref=np.max), sr=sr
+    )
+
+
 def _pick_downbeat_phase(
     beat_frames: np.ndarray,
     onset_env: np.ndarray,
@@ -202,8 +230,12 @@ class AnalysisService:
         )
         beat_times = librosa.frames_to_time(beat_frames, sr=sr).tolist()
 
+        # Phase-pick downbeats off a LOW-BAND onset envelope (kick + bass), not
+        # the full-spectrum one — beat 1 is carried by the kick/bass, so this
+        # is far less likely to lock onto a loud backbeat snare/hat.
+        phase_env = _low_band_onset_env(y, sr)
         downbeat_offset = _pick_downbeat_phase(
-            beat_frames, onset_env, TIME_SIGNATURE
+            beat_frames, phase_env, TIME_SIGNATURE
         )
         downbeats = beat_times[downbeat_offset::TIME_SIGNATURE]
 

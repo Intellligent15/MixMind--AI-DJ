@@ -128,6 +128,37 @@ def test_pick_downbeat_phase_picks_offset_2_when_emphasis_is_there():
     assert chosen == 2
 
 
+def test_low_band_onset_env_isolates_low_frequencies():
+    """The low-band onset envelope should fire on a kick-range transient and
+    stay near-silent for a hat-range one — that's what lets downbeat phase
+    picking ignore a loud backbeat hat/snare and lock onto the kick."""
+    from app.services.analysis.service import _low_band_onset_env
+
+    sr = 22050
+    y = np.zeros(int(sr * 3.0), dtype=np.float32)
+
+    def _burst(t: float, freq: float, length: float = 0.08) -> None:
+        i = int(t * sr)
+        n = int(length * sr)
+        decay = np.exp(-np.linspace(0.0, 6.0, n)).astype(np.float32)
+        y[i : i + n] += (decay * np.sin(2 * np.pi * freq * np.arange(n) / sr)).astype(
+            np.float32
+        )
+
+    _burst(1.0, 60.0)     # kick-range (in band)
+    _burst(2.0, 6000.0)   # hat-range (out of band)
+
+    env = _low_band_onset_env(y, sr)
+    hop = 512
+    f_low = int(round(1.0 * sr / hop))
+    f_high = int(round(2.0 * sr / hop))
+
+    def _peak(f: int) -> float:
+        return float(env[max(0, f - 3) : f + 4].max())
+
+    assert _peak(f_low) > 2.0 * (_peak(f_high) + 1e-6)
+
+
 def test_correct_tempo_octave_in_range_returns_unchanged():
     # 120 BPM is well inside the preferred range; no correction attempted.
     y = np.zeros(SR * 2, dtype=np.float32)

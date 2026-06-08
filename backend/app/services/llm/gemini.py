@@ -20,16 +20,16 @@ INPUT — for each of A and B you get:
 PLAN IN THIS ORDER:
 1. Choose A's OUT point (from_song_time_start): a downbeat LATE in A — inside A's final or second-to-last section — at or before A.max_seam_time. This is where A bows out.
 2. Choose B's IN point (to_song_time_start): a downbeat EARLY in B — its intro or its FIRST energy rise (first drop/chorus), normally within B's first 1–3 sections. The listener should hear almost all of B, so NEVER enter B in its back half. B.max_seam_time is only a hard ceiling, NOT a target — entering anywhere near it means B is already ending. Match energy by blending A's tail into B's FIRST high-energy section, or dropping B's intro in where A has gone quiet.
-3. Pick the style whose TRIGGER fits these two songs (next section). Different pairs must hit different styles — variety across the set is the goal.
-4. Emit that style's tool calls.
+3. Design a transition that fits these two songs. Mix and match tools! Different pairs must have different transition styles — variety across the set is the goal.
+4. Emit your tool calls.
 
-TRANSITION STYLES — reason from the section energies AT YOUR SEAM: A_out = energy of A's out-section, B_in = energy of B's in-section. Pick the FIRST style whose trigger fits; emit its calls (don't name it). Do NOT default to one style across the set.
-- Drop Swap — TRIGGER: B_in >= 0.95 (B enters on a drop) AND A's OUT downbeat sits inside a vocal_safe_region. All 4 crossfade_stem: same start_bar on that safe downbeat, duration_bars=2..4, equal_power. Snaps A→B at the drop.
-- Drum-Bridge — TRIGGER: both drum-driven at the seam (A_out >= 0.7 AND B_in >= 0.7). vocals/bass/other: start_bar=0, duration_bars=8; drums: start_bar=4, duration_bars=12, so A's drums hold while B's come in early and bridge the two grids.
-- Filter Sweep Out — TRIGGER: A's tail is hot but B comes in calmer (A_out >= 0.8 AND B_in <= 0.6). One filter_sweep on A: lowpass, start_time = seam minus 8 bars, end_time = seam, start_cutoff_hz=20000, end_cutoff_hz=200, plus a normal 16-bar 4-stem crossfade. Do NOT pitch_shift B here.
-- Loop & Echo Trail — TRIGGER: A's last 8 bars are inside a vocal_safe_region AND B intros soft (B_in <= 0.5). One loop_section on A's last 4 bars (beats=16, repeats=2, bpm=A.bpm), then one echo_out at the loop end (beats=4, feedback=0.5, bpm=A.bpm); the 4 crossfade_stem calls can be short (duration_bars=4).
-- Vocal-First Out — TRIGGER: A's OUT point still has vocals (no vocal_safe_region there) and a strong hook to clear before B enters. vocals: start_bar=0, duration_bars=8; drums/bass/other: start_bar=8, duration_bars=8. A's instrumental hands off after its vocal is gone.
-- Classic Blend — FALLBACK only, when no trigger above fits. All 4 crossfade_stem: start_bar=0, duration_bars=16, equal_power. Don't pick this just because it's safe.
+TRANSITION IDEAS — Be creative! Combine these tools or use them standalone. Do NOT default to one style across the set.
+- Drop Swap — B enters on a drop. Snap A→B instantly with a 2-4 bar crossfade starting on the exact downbeat.
+- Drum-Bridge — Both tracks are drum-driven. Fade in B's drums early (over 12 bars) while holding A's drums, bridging the two grids before the bass swaps.
+- Wash Out — A's tail is hot but B is calmer. Use `apply_reverb` (wet_level=0.8) or `filter_sweep` to wash out A's tail, letting B fade in cleanly underneath.
+- Stutter Build-up — Build tension before a drop by using `loop_section` with fractional beats (e.g. 0.5 or 0.25) repeating rapidly right before the seam.
+- Vinyl Stop — B is a completely different tempo or vibe. Use `turntable_stop` on A for 1-2 bars to kill its momentum, then drop B in cleanly.
+- EQ Kill — Use `volume_fade` to kill A's bass 4 bars early so B's bass hits harder when it drops.
 
 DON'T LET A LINGER: by default A only goes silent when B reaches full, so a long crossfade keeps A audible across the whole overlap and muddies the mix. Set `a_fade_out_bars` shorter than `duration_bars` so A clears out early while B keeps swelling in on its own — e.g. duration_bars=16, a_fade_out_bars=8 means A is gone halfway through while B keeps rising. Use this on most transitions; reserve a_fade_out_bars == duration_bars for when you genuinely want A and B locked together to the end. Keep crossfades punchy (8–16 bars), don't reflexively max the duration.
 
@@ -58,7 +58,12 @@ Example — Filter Sweep Out, A 128 BPM bright, B 124 BPM darker, seam at A 200.
   {"tool": "crossfade_stem", "stem": "other", "from_song": "A", "to_song": "B", "start_bar": 0, "duration_bars": 16, "a_fade_out_bars": 8, "curve": "equal_power"}
 ]
 
-Also available: swap_stem — a hard cut of ONE stem at a downbeat (time is in OUTPUT-timeline seconds). Use it to instant-swap drums while the other 3 stems crossfade.
+Also available: 
+- swap_stem — a hard cut of ONE stem at a downbeat (time is in OUTPUT-timeline seconds). Use it to instant-swap drums while the other 3 stems crossfade.
+- apply_reverb — wet_level (0.0-1.0), tail_duration_bars. Great for making a vocal or synth trail off into space.
+- turntable_stop — duration_bars to slow down to a halt.
+- volume_fade — start_gain to end_gain over duration_bars.
+- loop_section — beats can be fractional (0.5, 0.25) to create rapid stutters.
 
 HARD RULES (break one and the whole plan is discarded for a worse fallback):
 1. song / from_song / to_song are EXACTLY "A" or "B" — never "Song A", "song_a", "1".

@@ -501,6 +501,64 @@ def test_render_precondition_rejects_mono():
             render(plan, a, b)
 
 
+def _kick_train(emphasis_beat: int, n_beats: int, spb_beat: int) -> np.ndarray:
+    """Stereo low-freq (55 Hz) kick pattern with a distinctive per-bar shape:
+    a strong hit on the bar's `emphasis_beat` (the downbeat) and a weaker one
+    at the half-bar, silence on the off-beats. That gives the low-band onset
+    envelope a clear bar phase for the aligner to lock onto (unlike a
+    four-on-the-floor train, where every beat looks the same and the aligner
+    should — and does — refuse to shift)."""
+    spbar = spb_beat * 4
+    out = np.zeros((n_beats * spb_beat + spbar, 2), dtype=np.float32)
+    n = int(0.1 * SR)
+    decay = np.exp(-np.linspace(0.0, 6.0, n)).astype(np.float32)
+    tone = np.sin(2 * np.pi * 55.0 * np.arange(n) / SR).astype(np.float32)
+    for i in range(n_beats):
+        phase = (i - emphasis_beat) % 4
+        amp = 1.0 if phase == 0 else (0.5 if phase == 2 else 0.0)
+        if amp == 0.0:
+            continue
+        s = i * spb_beat
+        out[s : s + n] += (amp * decay * tone)[:, None]
+    return out
+
+
+def test_align_pair_phase_shifts_when_b_bar_is_offset():
+    """B's bar emphasis is one beat late vs A → the aligner enters B one beat
+    later so the bars lock in phase."""
+    from app.services.mixer.executor import _align_pair_phase
+
+    spb_beat = int(round(60.0 / 120.0 * SR))  # samples per beat @120bpm
+    spbar = float(spb_beat * 4)
+    a = _kick_train(emphasis_beat=0, n_beats=24, spb_beat=spb_beat)
+    b = _kick_train(emphasis_beat=1, n_beats=24, spb_beat=spb_beat)
+
+    out_seam = _align_pair_phase(a, b, 0, 0, spbar, 4, SR)
+    assert out_seam == spb_beat  # shifted forward by exactly 1 beat
+
+
+def test_align_pair_phase_no_shift_when_already_aligned():
+    from app.services.mixer.executor import _align_pair_phase
+
+    spb_beat = int(round(60.0 / 120.0 * SR))
+    spbar = float(spb_beat * 4)
+    a = _kick_train(emphasis_beat=0, n_beats=24, spb_beat=spb_beat)
+    b = _kick_train(emphasis_beat=0, n_beats=24, spb_beat=spb_beat)
+
+    assert _align_pair_phase(a, b, 0, 0, spbar, 4, SR) == 0
+
+
+def test_align_pair_phase_no_shift_on_flat_audio():
+    """Constant tone has no rhythmic pattern to disambiguate → leave the
+    analysis-derived seam alone (the synthetic-tone executor tests rely on
+    this no-op)."""
+    from app.services.mixer.executor import _align_pair_phase
+
+    flat = np.full((4 * SR, 2), 0.2, dtype=np.float32)
+    spbar = float(int(round(60.0 / 120.0 * SR)) * 4)
+    assert _align_pair_phase(flat, flat, 0, 0, spbar, 4, SR) == 0
+
+
 def test_soft_knee_limit_passes_through_below_ceiling():
     """A buffer already at/under the ceiling is returned untouched — no
     global attenuation. This is the core regression vs the old normalize,
@@ -1191,3 +1249,62 @@ def test_render_a_fade_out_bars_default_is_identical():
         explicit = render(_plan(True), a, b)
 
     assert omitted.wav_bytes == explicit.wav_bytes
+
+
+@pytest.mark.parametrize(
+    "fx",
+    [
+        {"tool": "apply_reverb", "song": "A", "start_time": 1.0,
+         "tail_duration_bars": 1.0, "wet_level": 0.6, "bpm": 120.0},
+        {"tool": "turntable_stop", "song": "A", "start_time": 2.0,
+         "duration_bars": 1.0, "bpm": 120.0},
+        {"tool": "volume_fade", "song": "A", "start_time": 0.0,
+         "duration_bars": 1.0, "start_gain": 1.0, "end_gain": 0.0, "bpm": 120.0},
+    ],
+)
+def test_render_applies_new_dsp_tools(fx):
+    """apply_reverb / turntable_stop / volume_fade run through the executor's
+    pre_fx path and produce a valid, full-length render."""
+    a = _inputs(prefix="A")
+    b = _inputs(prefix="B")
+    plan = [
+        {"tool": "set_transition_window",
+         "from_song_time_start": 1.0, "to_song_time_start": 1.0,
+         "duration_bars": 1},
+        fx,
+        *[
+            {"tool": "crossfade_stem", "stem": s,
+             "from_song": "A", "to_song": "B",
+             "start_bar": 0, "duration_bars": 1, "curve": "linear"}
+            for s in ("vocals", "drums", "bass", "other")
+        ],
+    ]
+    with patch("soundfile.read", side_effect=_fake_sf_read()):
+        result = render(plan, a, b)
+    decoded, sr = sf.read(io.BytesIO(result.wav_bytes), always_2d=True)
+    assert sr == SR
+    assert decoded.shape[0] > 0
+    assert np.all(np.abs(decoded) < 1.0001)
+
+
+def test_render_new_dsp_tool_missing_key_is_noop_not_crash():
+    """A new-tool call missing required params degrades to a no-op instead of
+    stranding the whole render (KeyError -> failed plan)."""
+    a = _inputs(prefix="A")
+    b = _inputs(prefix="B")
+    plan = [
+        {"tool": "set_transition_window",
+         "from_song_time_start": 1.0, "to_song_time_start": 1.0,
+         "duration_bars": 1},
+        {"tool": "turntable_stop", "song": "A"},  # no bpm/duration
+        *[
+            {"tool": "crossfade_stem", "stem": s,
+             "from_song": "A", "to_song": "B",
+             "start_bar": 0, "duration_bars": 1, "curve": "linear"}
+            for s in ("vocals", "drums", "bass", "other")
+        ],
+    ]
+    with patch("soundfile.read", side_effect=_fake_sf_read()):
+        result = render(plan, a, b)  # must not raise
+    decoded, _ = sf.read(io.BytesIO(result.wav_bytes), always_2d=True)
+    assert decoded.shape[0] > 0

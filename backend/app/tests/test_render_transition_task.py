@@ -275,6 +275,35 @@ def test_validate_llm_plan_allows_temporary_pitch_shift():
     _validate_llm_plan(plan)  # should not raise
 
 
+def test_validate_llm_plan_allows_new_dsp_tools():
+    """apply_reverb / turntable_stop / volume_fade are legal tools — the
+    validator must accept them so the LLM's plan isn't bounced to the
+    deterministic fallback the moment it uses one."""
+    from app.workers.render_transition import _validate_llm_plan
+
+    plan = _valid_plan(extra=[
+        {"tool": "apply_reverb", "song": "A", "start_time": 1.0,
+         "tail_duration_bars": 2.0, "wet_level": 0.7, "bpm": 120.0},
+        {"tool": "turntable_stop", "song": "A", "start_time": 1.0,
+         "duration_bars": 1.0, "bpm": 120.0},
+        {"tool": "volume_fade", "song": "B", "start_time": 0.0,
+         "duration_bars": 2.0, "start_gain": 1.0, "end_gain": 0.0, "bpm": 120.0},
+    ])
+    _validate_llm_plan(plan)  # should not raise
+
+
+def test_validate_llm_plan_rejects_bad_song_ref_on_new_tool():
+    """The new tools carry a `song` field — it's still validated to 'A'/'B'."""
+    from app.workers.render_transition import _validate_llm_plan
+
+    plan = _valid_plan(extra=[
+        {"tool": "apply_reverb", "song": "Song A", "start_time": 1.0,
+         "tail_duration_bars": 2.0, "wet_level": 0.7, "bpm": 120.0},
+    ])
+    with pytest.raises(ValueError, match="must be 'A' or 'B'"):
+        _validate_llm_plan(plan)
+
+
 def _b_bundle(bpm: float = 120.0, duration: float = 200.0):
     """A minimal B AnalysisBundle for the revert-timing guard (bpm + ts +
     duration are all it reads)."""

@@ -106,9 +106,19 @@ def _describe_transition(plan: list[dict]) -> dict:
         effects.append("key lift")
     if "set_tempo_ramp" in tools:
         effects.append("tempo ramp")
+    if "apply_reverb" in tools:
+        effects.append("reverb wash")
+    if "turntable_stop" in tools:
+        effects.append("vinyl stop")
+    if "volume_fade" in tools:
+        effects.append("volume fade")
 
-    if "swap_stem" in tools:
+    if "turntable_stop" in tools:
+        label = "Vinyl stop"
+    elif "swap_stem" in tools:
         label = "Stem swap"
+    elif "apply_reverb" in tools:
+        label = "Reverb wash"
     elif "filter_sweep" in tools:
         label = "Filter sweep"
     elif "echo_out" in tools:

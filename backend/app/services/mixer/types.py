@@ -159,7 +159,7 @@ class LoopSection(TypedDict):
     tool: Literal["loop_section"]
     song: SongRef
     start_time: float          # seconds in original song time
-    beats: int                 # length of the loop in beats
+    beats: float               # length of the loop in beats (can be fractional for stutters)
     repeats: int               # number of times to play the loop
     bpm: float                 # caller-supplied tempo for slice length
 
@@ -184,6 +184,50 @@ class SwapStem(TypedDict):
     time: float                # seconds in OUTPUT timeline
 
 
+class ApplyReverb(TypedDict):
+    """Wash-out reverb effect.
+    
+    Convolves the audio with an exponentially decaying noise burst
+    to create a dense, expansive tail. Great for throwing vocals
+    or synths into a huge space before a transition drop.
+    """
+    tool: Literal["apply_reverb"]
+    song: SongRef
+    start_time: float          # seconds in original song time
+    tail_duration_bars: float  # how long the reverb tail takes to decay
+    wet_level: float           # 0.0 to 1.0 mix level of the reverb signal
+    bpm: float                 # tempo to compute duration
+
+
+class TurntableStop(TypedDict):
+    """Vinyl brake / turntable stop effect.
+    
+    Simulates a DJ hitting the stop button on a turntable. The playback
+    speed (and pitch) decelerates to zero over the specified duration.
+    Leaves the stem silent after the stop completes.
+    """
+    tool: Literal["turntable_stop"]
+    song: SongRef
+    start_time: float
+    duration_bars: float
+    bpm: float
+
+
+class VolumeFade(TypedDict):
+    """Standalone volume automation curve.
+    
+    Allows fading a specific song's stems in or out independently
+    of the main A->B crossfade (e.g. killing the bass early).
+    """
+    tool: Literal["volume_fade"]
+    song: SongRef
+    start_time: float
+    duration_bars: float
+    start_gain: float
+    end_gain: float
+    bpm: float
+
+
 # Phase 9 vocabulary now includes the four DSP additions
 # (filter_sweep, echo_out, loop_section, swap_stem). The executor's
 # dispatch table covers all of them; only `set_reasoning` (the LLM's
@@ -198,6 +242,9 @@ ToolCall = (
     | EchoOut
     | LoopSection
     | SwapStem
+    | ApplyReverb
+    | TurntableStop
+    | VolumeFade
 )
 MixPlanJSON = list[dict]  # list[ToolCall] but JSONB persists as plain dicts
 
