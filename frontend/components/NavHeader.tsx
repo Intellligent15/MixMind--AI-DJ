@@ -28,7 +28,7 @@ export function NavHeader({ subtitle }: Props) {
   return (
     <header className="flex items-baseline justify-between">
       <h1 className="text-3xl font-bold">
-        <Link href="/">AI DJ</Link>
+        <Link href="/">MixMind</Link>
       </h1>
       <nav className="flex items-baseline gap-4 text-sm">
         <Link href="/" className="hover:underline">

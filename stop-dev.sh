@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# AI DJ — stop the dev stack. The native Celery worker is Ctrl-C'd separately.
+# MixMind — stop the dev stack. The native Celery worker is Ctrl-C'd separately.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

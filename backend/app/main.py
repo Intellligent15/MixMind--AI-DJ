@@ -8,7 +8,7 @@ from app.api import songs as songs_api
 from app.core.db import check_db
 from app.core.redis_client import check_redis
 
-app = FastAPI(title="AI DJ Backend", version="0.0.0")
+app = FastAPI(title="MixMind Backend", version="0.0.0")
 
 app.add_middleware(
     CORSMiddleware,

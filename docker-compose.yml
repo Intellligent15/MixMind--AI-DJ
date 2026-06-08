@@ -1,4 +1,4 @@
-# AI DJ — base compose stack.
+# MixMind — base compose stack.
 #
 # The dockerized `worker` is profile-gated to `prod`. On macOS dev the
 # worker runs natively (start-dev.sh) so it can use MPS for Demucs/Whisper;

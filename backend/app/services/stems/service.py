@@ -16,8 +16,6 @@ logger = logging.getLogger(__name__)
 # htdemucs (single-model, not the _ft 4-bag ensemble) — same 4-stem
 # output, ~4× faster on MPS since it runs one forward pass instead of
 # averaging four checkpoints. Quality loss is inaudible for DJ mixing.
-# Spec → Locked Decisions originally said `htdemucs_ft`; the deviation
-# is tracked in docs/the notes.
 STEM_NAMES = ("drums", "bass", "other", "vocals")
 
 

@@ -1,4 +1,4 @@
-# AI DJ Mixing Web App — Project Specification
+# MixMind — Project Specification
 
 ## Overview
 
@@ -35,7 +35,7 @@ This is a personal project, not a public product. It uses yt-dlp to source audio
 Monorepo:
 
 ```
-ai-dj/
+mixmind/
 ├── docker-compose.yml
 ├── docker-compose.dev.yml
 ├── .env.example

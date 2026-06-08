@@ -7,11 +7,7 @@ bytes. No DB.
 Coordinate convention: tool-call times are in *original-song* time
 (seconds in A, seconds in B before any stretch). The executor handles
 the original→post-stretch translation internally. This matches what
-the Phase 9 LLM will produce — it sees analyses in original time.
-
-Full algorithm + math: see
-the design notes
-→ Layer 2 — services/mixer/executor.py.
+the LLM planner produces — it sees analyses in original time.
 """
 
 from __future__ import annotations

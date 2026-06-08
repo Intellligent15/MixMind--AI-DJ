@@ -3,7 +3,7 @@ import "./globals.css";
 import { QueryProvider } from "@/lib/query-provider";
 
 export const metadata: Metadata = {
-  title: "AI DJ",
+  title: "MixMind",
   description: "AI-mixed DJ sets from a YouTube queue",
 };
 

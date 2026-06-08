@@ -32,7 +32,7 @@ from app.services.analysis.sections.factory import get_section_detector
 logger = logging.getLogger(__name__)
 
 ANALYSIS_SR = 22050
-TIME_SIGNATURE = 4  # see deviation note in the notes
+TIME_SIGNATURE = 4  # assumed 4/4 (the common case for the target material)
 
 # Tempo octave-correction parameters. librosa.beat.beat_track uses a Gaussian
 # tempo prior centered on `start_bpm` (default 120) — it can pick half-time,

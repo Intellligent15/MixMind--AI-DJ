@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# AI DJ — bring up the full dev stack.
+# MixMind — bring up the full dev stack.
 #
 # - Docker: postgres, redis, backend, frontend
 # - Native (host): Celery worker (needs MPS access on macOS)

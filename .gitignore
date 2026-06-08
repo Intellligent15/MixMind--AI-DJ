@@ -54,9 +54,10 @@ yarn-error.log*
 .DS_Store
 Thumbs.db
 
-# IDE
+# IDE / local tooling
 .idea/
 .vscode/
+.claude/
 *.swp
 *.swo
 

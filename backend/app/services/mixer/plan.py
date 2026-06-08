@@ -1,9 +1,9 @@
-"""Hand-built mix-plan generator — Phase 7's stand-in for the Phase 9 LLM.
+"""Hand-built mix-plan generator — the deterministic fallback for the LLM.
 
 Takes two AnalysisBundles and emits a list of tool-call dicts matching
 the spec's Mix Plan Schema. Pure function; no I/O, no DB.
 
-Strategy (full design: the design notes):
+Strategy:
 1. Seam in A = last section start, clamped to "no more than 16 bars
    before A.duration", snapped to nearest downbeat ≥ that point.
 2. Seam in B = first downbeat ≥ end of B's first section (skip silent

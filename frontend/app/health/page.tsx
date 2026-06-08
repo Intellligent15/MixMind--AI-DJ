@@ -23,8 +23,8 @@ export default async function HomePage() {
 
   return (
     <main className="min-h-screen flex flex-col items-center justify-center gap-6 p-8 font-mono">
-      <h1 className="text-3xl font-bold">AI DJ</h1>
-      <p className="text-sm opacity-70">Phase 1 — infra skeleton</p>
+      <h1 className="text-3xl font-bold">MixMind</h1>
+      <p className="text-sm opacity-70">System health</p>
 
       <section className="border rounded-lg p-6 min-w-[320px]">
         <h2 className="font-semibold mb-3">Backend health</h2>

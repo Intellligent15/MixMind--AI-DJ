@@ -25,8 +25,7 @@ DEFAULT_MODEL_NAME = "large-v3"
 # Full mlx-whisper override set. Kept as a module-level dict so tuning is
 # one place to look. Inline comments explain why each knob is set where it
 # is — defaults that are functionally no-ops are included for documentation
-# (so a future reader can see the full set of decisions). See
-# docs/the notes deviation #9 for the model history.
+# (so a future reader can see the full set of decisions).
 WHISPER_OPTIONS: dict = {
     # --- Hallucination / quality guards ---
     # gzip-ratio decode-fail threshold. Default 2.4 was eating real lyric

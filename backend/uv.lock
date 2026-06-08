@@ -3,93 +3,6 @@ revision = 3
 requires-python = "==3.11.*"
 
 [[package]]
-name = "ai-dj-backend"
-version = "0.0.0"
-source = { editable = "." }
-dependencies = [
-    { name = "aioboto3" },
-    { name = "alembic" },
-    { name = "asgiref" },
-    { name = "beautifulsoup4" },
-    { name = "celery", extra = ["redis"] },
-    { name = "fastapi" },
-    { name = "google-genai" },
-    { name = "groq" },
-    { name = "httpx" },
-    { name = "librosa" },
-    { name = "modal" },
-    { name = "numpy" },
-    { name = "openai" },
-    { name = "psycopg", extra = ["binary"] },
-    { name = "pydantic" },
-    { name = "pydantic-settings" },
-    { name = "pyrubberband" },
-    { name = "python-dotenv" },
-    { name = "redis" },
-    { name = "scipy" },
-    { name = "soundfile" },
-    { name = "sqlalchemy" },
-    { name = "uvicorn", extra = ["standard"] },
-    { name = "yt-dlp" },
-]
-
-[package.dev-dependencies]
-dev = [
-    { name = "httpx" },
-    { name = "pytest" },
-    { name = "pytest-asyncio" },
-    { name = "ruff" },
-]
-worker = [
-    { name = "demucs" },
-    { name = "mlx-whisper" },
-    { name = "torch" },
-    { name = "torchaudio" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "aioboto3", specifier = ">=15.5.0" },
-    { name = "alembic", specifier = ">=1.13,<1.14" },
-    { name = "asgiref", specifier = ">=3.11.1" },
-    { name = "beautifulsoup4", specifier = ">=4.12,<4.13" },
-    { name = "celery", extras = ["redis"], specifier = ">=5.4,<5.5" },
-    { name = "fastapi", specifier = ">=0.115,<0.116" },
-    { name = "google-genai", specifier = ">=1.2.0" },
-    { name = "groq", specifier = ">=1.4.0" },
-    { name = "httpx", specifier = ">=0.27,<0.28" },
-    { name = "librosa", specifier = ">=0.11.0" },
-    { name = "modal", specifier = ">=1.4.3" },
-    { name = "numpy", specifier = ">=2.4.5" },
-    { name = "openai", specifier = ">=2.39.0" },
-    { name = "psycopg", extras = ["binary"], specifier = ">=3.2,<3.3" },
-    { name = "pydantic", specifier = ">=2.9,<3.0" },
-    { name = "pydantic-settings", specifier = ">=2.5,<3.0" },
-    { name = "pyrubberband", specifier = ">=0.4.0" },
-    { name = "python-dotenv", specifier = ">=1.0,<2.0" },
-    { name = "redis", specifier = ">=5.0,<6.0" },
-    { name = "scipy", specifier = ">=1.17.1" },
-    { name = "soundfile", specifier = ">=0.13.1" },
-    { name = "sqlalchemy", specifier = ">=2.0,<2.1" },
-    { name = "uvicorn", extras = ["standard"], specifier = ">=0.32,<0.33" },
-    { name = "yt-dlp", specifier = ">=2026.3.17" },
-]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "httpx", specifier = ">=0.27,<0.28" },
-    { name = "pytest", specifier = ">=8.3,<9.0" },
-    { name = "pytest-asyncio", specifier = ">=0.24,<0.25" },
-    { name = "ruff", specifier = ">=0.7,<0.8" },
-]
-worker = [
-    { name = "demucs", specifier = ">=4.0.1" },
-    { name = "mlx-whisper", specifier = ">=0.4.3" },
-    { name = "torch", specifier = ">=2.12.0" },
-    { name = "torchaudio", specifier = ">=2.11.0" },
-]
-
-[[package]]
 name = "aioboto3"
 version = "15.5.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1140,6 +1053,93 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/d6/54/cfe61301667036ec958cb99bd3efefba235e65cdeb9c84d24a8293ba1d90/mdurl-0.1.2.tar.gz", hash = "sha256:bb413d29f5eea38f31dd4754dd7377d4465116fb207585f97bf925588687c1ba", size = 8729, upload-time = "2022-08-14T12:40:10.846Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/b3/38/89ba8ad64ae25be8de66a6d463314cf1eb366222074cfda9ee839c56a4b4/mdurl-0.1.2-py3-none-any.whl", hash = "sha256:84008a41e51615a49fc9966191ff91509e3c40b939176e643fd50a5c2196b8f8", size = 9979, upload-time = "2022-08-14T12:40:09.779Z" },
+]
+
+[[package]]
+name = "mixmind-backend"
+version = "0.0.0"
+source = { editable = "." }
+dependencies = [
+    { name = "aioboto3" },
+    { name = "alembic" },
+    { name = "asgiref" },
+    { name = "beautifulsoup4" },
+    { name = "celery", extra = ["redis"] },
+    { name = "fastapi" },
+    { name = "google-genai" },
+    { name = "groq" },
+    { name = "httpx" },
+    { name = "librosa" },
+    { name = "modal" },
+    { name = "numpy" },
+    { name = "openai" },
+    { name = "psycopg", extra = ["binary"] },
+    { name = "pydantic" },
+    { name = "pydantic-settings" },
+    { name = "pyrubberband" },
+    { name = "python-dotenv" },
+    { name = "redis" },
+    { name = "scipy" },
+    { name = "soundfile" },
+    { name = "sqlalchemy" },
+    { name = "uvicorn", extra = ["standard"] },
+    { name = "yt-dlp" },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "httpx" },
+    { name = "pytest" },
+    { name = "pytest-asyncio" },
+    { name = "ruff" },
+]
+worker = [
+    { name = "demucs" },
+    { name = "mlx-whisper" },
+    { name = "torch" },
+    { name = "torchaudio" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "aioboto3", specifier = ">=15.5.0" },
+    { name = "alembic", specifier = ">=1.13,<1.14" },
+    { name = "asgiref", specifier = ">=3.11.1" },
+    { name = "beautifulsoup4", specifier = ">=4.12,<4.13" },
+    { name = "celery", extras = ["redis"], specifier = ">=5.4,<5.5" },
+    { name = "fastapi", specifier = ">=0.115,<0.116" },
+    { name = "google-genai", specifier = ">=1.2.0" },
+    { name = "groq", specifier = ">=1.4.0" },
+    { name = "httpx", specifier = ">=0.27,<0.28" },
+    { name = "librosa", specifier = ">=0.11.0" },
+    { name = "modal", specifier = ">=1.4.3" },
+    { name = "numpy", specifier = ">=2.4.5" },
+    { name = "openai", specifier = ">=2.39.0" },
+    { name = "psycopg", extras = ["binary"], specifier = ">=3.2,<3.3" },
+    { name = "pydantic", specifier = ">=2.9,<3.0" },
+    { name = "pydantic-settings", specifier = ">=2.5,<3.0" },
+    { name = "pyrubberband", specifier = ">=0.4.0" },
+    { name = "python-dotenv", specifier = ">=1.0,<2.0" },
+    { name = "redis", specifier = ">=5.0,<6.0" },
+    { name = "scipy", specifier = ">=1.17.1" },
+    { name = "soundfile", specifier = ">=0.13.1" },
+    { name = "sqlalchemy", specifier = ">=2.0,<2.1" },
+    { name = "uvicorn", extras = ["standard"], specifier = ">=0.32,<0.33" },
+    { name = "yt-dlp", specifier = ">=2026.3.17" },
+]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "httpx", specifier = ">=0.27,<0.28" },
+    { name = "pytest", specifier = ">=8.3,<9.0" },
+    { name = "pytest-asyncio", specifier = ">=0.24,<0.25" },
+    { name = "ruff", specifier = ">=0.7,<0.8" },
+]
+worker = [
+    { name = "demucs", specifier = ">=4.0.1" },
+    { name = "mlx-whisper", specifier = ">=0.4.3" },
+    { name = "torch", specifier = ">=2.12.0" },
+    { name = "torchaudio", specifier = ">=2.11.0" },
 ]
 
 [[package]]
