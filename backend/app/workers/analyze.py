@@ -51,7 +51,7 @@ def analyze_song(song_id: str) -> str | None:
             update(Song)
             .where(Song.id == song_uuid)
             .where(Song.status.in_(CLAIMABLE_STATUSES))
-            .values(status=SongStatus.analyzing)
+            .values(status=SongStatus.analyzing, error_text=None)
         )
         db.commit()
 
@@ -75,12 +75,13 @@ def analyze_song(song_id: str) -> str | None:
         try:
             asyncio.run(storage.download_file(audio_key, audio_path))
             result = service.analyze(audio_path)
-        except Exception:
+        except Exception as exc:
             logger.exception("analysis failed for song %s", song_id)
             with SessionLocal() as db:
                 song = db.get(Song, song_uuid)
                 if song is not None:
                     song.status = SongStatus.failed
+                    song.error_text = f"analysis failed: {exc}"[:1000]
                     db.commit()
             raise
 

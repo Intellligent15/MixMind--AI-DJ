@@ -40,6 +40,12 @@ class Song(Base):
         default=SongStatus.pending,
     )
 
+    # Human-readable reason the song last landed in `failed`, so the
+    # Processing view can show *what* broke instead of asking the user to
+    # scrape worker logs. Cleared when a stage succeeds or a retry is
+    # dispatched. Mirrors MixPlan.error_text / QueueRender.error_text.
+    error_text: Mapped[str | None] = mapped_column(String, nullable=True)
+
     # Set to True when the user signals they want full pipeline processing
     # (queue lock, or manual /analyze /separate /transcribe API call). Each
     # worker checks this on success and only auto-dispatches the next stage

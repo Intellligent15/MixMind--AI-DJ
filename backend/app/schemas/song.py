@@ -35,6 +35,9 @@ class SongRead(BaseModel):
     thumbnail_url: str | None
     audio_path: str | None
     status: SongStatus
+    # Reason the song last failed (null otherwise). Surfaced in the
+    # Processing view so a failure isn't a silent stall.
+    error_text: str | None = None
     created_at: datetime
     updated_at: datetime
     # Derived from related rows so the Library + Player can render a

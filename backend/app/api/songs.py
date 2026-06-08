@@ -5,11 +5,11 @@ import uuid
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Response, status
 from fastapi.responses import StreamingResponse
-from sqlalchemy import exists, or_, select
+from sqlalchemy import exists, select
 from sqlalchemy.orm import Session
 
 from app.api.deps import get_db
-from app.models import Analysis, MixPlan, Song, SongStatus, Stems, Transcription
+from app.models import Analysis, Song, SongStatus, Stems, Transcription
 from app.schemas import (
     AnalysisRead,
     SongCreate,
@@ -39,6 +39,19 @@ TRANSCRIBE_TASK = "app.workers.transcribe.transcribe_song"
 STEM_NAMES: tuple[str, ...] = ("vocals", "drums", "bass", "other")
 
 router = APIRouter(prefix="/api/songs", tags=["songs"])
+
+
+def _touch_song(db: Session, song: Song) -> None:
+    """Bump ``last_accessed_at`` to now — the LRU clock the cache evictor
+    orders by. Called wherever a song's audio is actually served. Cheap and
+    best-effort; a failure here must never break the audio response."""
+    from datetime import datetime, timezone
+
+    try:
+        song.last_accessed_at = datetime.now(timezone.utc)
+        db.commit()
+    except Exception:
+        db.rollback()
 
 
 def _song_read_with_flags(
@@ -133,36 +146,12 @@ async def delete_song(
     if song is None:
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
-    keys: list[str] = []
-    if song.audio_path:
-        keys.append(song.audio_path)
+    # Same enumeration the LRU evictor uses, so manual delete + eviction free
+    # the identical blob set (audio, stems, vocal envelope, transcription
+    # sidecar, and per-pair renders touching this song).
+    from app.services.cache.eviction import collect_song_storage_keys
 
-    stems = db.scalar(select(Stems).where(Stems.song_id == song_id))
-    if stems is not None:
-        for k in (
-            stems.vocals_path,
-            stems.drums_path,
-            stems.bass_path,
-            stems.other_path,
-            stems.vocal_envelope_path,
-        ):
-            if k:
-                keys.append(k)
-
-    # The Modal transcription path uploads a sidecar JSON keyed by
-    # youtube_video_id (the local mlx-whisper path doesn't, but
-    # storage.delete is idempotent on misses, so an extra attempt is
-    # free).
-    keys.append(f"transcriptions/{song.youtube_video_id}.json")
-
-    plans = db.scalars(
-        select(MixPlan).where(
-            or_(MixPlan.from_song_id == song_id, MixPlan.to_song_id == song_id)
-        )
-    ).all()
-    for plan in plans:
-        if plan.rendered_audio_path:
-            keys.append(plan.rendered_audio_path)
+    keys = collect_song_storage_keys(song, db)
 
     storage = get_storage()
     for key in keys:
@@ -263,6 +252,9 @@ async def get_song_audio(
             status_code=409,
             detail=f"audio not available (status={song.status.value})",
         )
+    # Serving the audio == the song is being played: refresh its LRU clock so
+    # the cache evictor reclaims genuinely-stale library content first.
+    _touch_song(db, song)
     return await _stream_audio_response(song.audio_path, "audio/wav", range)
 
 
@@ -285,6 +277,62 @@ def trigger_analyze_song(song_id: uuid.UUID, db: Session = Depends(get_db)) -> S
     song.pipeline_requested = True
     db.commit()
     analyze_song.apply_async(args=[str(song.id)], priority=PRI_ANALYZE)
+    return song
+
+
+@router.post(
+    "/{song_id}/retry",
+    response_model=SongRead,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def retry_song(song_id: uuid.UUID, db: Session = Depends(get_db)) -> Song:
+    """Re-dispatch a failed song from the most-advanced stage it hasn't yet
+    cleared, so a transient worker error is one click to recover from.
+
+    Picks the stage by which artifacts already exist (not by status), so a
+    song that failed at transcription doesn't pay for a fresh download +
+    Demucs run. Each worker's claim gate accepts `failed`, and the
+    download→analyze→separate→transcribe auto-chain (gated on
+    `pipeline_requested`) carries it the rest of the way — which also re-fires
+    the eager-stitch hook when the queue's last song lands `ready`.
+    """
+    song = db.get(Song, song_id)
+    if song is None:
+        raise HTTPException(status_code=404, detail="song not found")
+    if song.status != SongStatus.failed:
+        raise HTTPException(
+            status_code=409,
+            detail=f"song is {song.status.value}, not failed — nothing to retry",
+        )
+
+    has_analysis = (
+        db.scalar(select(Analysis.id).where(Analysis.song_id == song_id)) is not None
+    )
+    has_stems = (
+        db.scalar(select(Stems.id).where(Stems.song_id == song_id)) is not None
+    )
+    has_transcription = (
+        db.scalar(select(Transcription.id).where(Transcription.song_id == song_id))
+        is not None
+    )
+
+    song.pipeline_requested = True
+    song.error_text = None
+    db.commit()
+
+    sid = str(song.id)
+    if not song.audio_path:
+        download_song.apply_async(args=[sid], priority=PRI_DOWNLOAD)
+    elif not has_analysis:
+        analyze_song.apply_async(args=[sid], priority=PRI_ANALYZE)
+    elif not has_stems:
+        celery_app.send_task(SEPARATE_TASK, args=[sid], priority=PRI_SEPARATE)
+    elif not has_transcription:
+        celery_app.send_task(TRANSCRIBE_TASK, args=[sid], priority=PRI_TRANSCRIBE)
+    else:
+        # Everything present but the song is failed — re-run the cheapest
+        # terminal stage to settle it back to `ready`.
+        celery_app.send_task(TRANSCRIBE_TASK, args=[sid], priority=PRI_TRANSCRIBE)
     return song
 
 
@@ -364,6 +412,7 @@ async def get_song_stem_audio(
     if key is None:
         raise HTTPException(status_code=409, detail=f"{stem_name} stem not written yet")
 
+    _touch_song(db, song)
     return await _stream_audio_response(key, "audio/wav", range)
 
 

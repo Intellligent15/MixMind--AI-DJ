@@ -12,6 +12,12 @@ class Settings(BaseSettings):
 
     storage_backend: str = "local"
     local_storage_path: Path = Path("./cache")
+    # Phase 11 LRU cache budget. When the total footprint of generated
+    # artifacts exceeds this, the evictor deletes least-recently-accessed
+    # Songs (audio + stems + their renders) until back under budget. Songs
+    # in any queue, songs mid-pipeline, and the mix_plan_logs/ LLM-plan
+    # cache are exempt. See app/services/cache/eviction.py.
+    cache_max_size_gb: float = 50.0
     s3_endpoint_url: str = ""
     s3_bucket_name: str = ""
     s3_access_key: str = ""

@@ -120,6 +120,22 @@ class S3Storage:
                 ExpiresIn=PRESIGNED_URL_TTL_SECONDS,
             )
 
+    async def list_objects(self, prefix: str = "") -> list[tuple[str, int]]:
+        """List (key, size) for every object under `prefix`.
+
+        Uses the list_objects_v2 paginator — Key and Size both come back in
+        the listing, so sizing the whole cache is one paginated call rather
+        than a HEAD per object."""
+        out: list[tuple[str, int]] = []
+        async with self._client() as client:
+            paginator = client.get_paginator("list_objects_v2")
+            async for page in paginator.paginate(
+                Bucket=self.bucket_name, Prefix=prefix
+            ):
+                for obj in page.get("Contents", []):
+                    out.append((obj["Key"], int(obj["Size"])))
+        return out
+
     async def download_file(self, key: str, dest_path: Path) -> None:
         dest_path.parent.mkdir(parents=True, exist_ok=True)
         async with self._client() as client:

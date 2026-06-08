@@ -93,7 +93,7 @@ def transcribe_song(song_id: str) -> str | None:
             update(Song)
             .where(Song.id == song_uuid)
             .where(Song.status.in_(CLAIMABLE_STATUSES))
-            .values(status=SongStatus.transcribing)
+            .values(status=SongStatus.transcribing, error_text=None)
         )
         db.commit()
 
@@ -119,6 +119,10 @@ def transcribe_song(song_id: str) -> str | None:
             song = db.get(Song, song_uuid)
             assert song is not None
             song.status = SongStatus.failed
+            song.error_text = (
+                "transcription failed: no separated vocal stem "
+                "(separation must run first)"
+            )
             db.commit()
             return None
 
@@ -200,7 +204,7 @@ def transcribe_song(song_id: str) -> str | None:
                 duration_seconds = result.duration_seconds
                 model_name = service.model_name
                 
-        except Exception:
+        except Exception as exc:
             logger.exception("transcription failed for song %s", song_id)
             with SessionLocal() as db:
                 _delete_existing(db, song_uuid)
@@ -218,6 +222,7 @@ def transcribe_song(song_id: str) -> str | None:
                 song = db.get(Song, song_uuid)
                 if song is not None:
                     song.status = SongStatus.failed
+                    song.error_text = f"transcription failed: {exc}"[:1000]
                 db.commit()
             raise
 

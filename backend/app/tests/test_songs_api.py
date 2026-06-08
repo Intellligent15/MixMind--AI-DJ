@@ -242,6 +242,116 @@ def _downloaded_song(db: Session, vid: str = "downloaded") -> Song:
     return song
 
 
+def test_audio_serve_bumps_last_accessed_at(
+    db_session: Session, tmp_storage: LocalFilesystemStorage
+):
+    from datetime import datetime, timedelta, timezone
+
+    key = "audio/touchme.wav"
+    tmp_storage._path(key).parent.mkdir(parents=True, exist_ok=True)
+    tmp_storage._path(key).write_bytes(b"RIFF" + b"\x00" * 10)
+
+    old = datetime.now(timezone.utc) - timedelta(days=10)
+    song = Song(
+        youtube_video_id="touchme",
+        title="T",
+        artist=None,
+        duration_seconds=10.0,
+        audio_path=key,
+        status=SongStatus.ready,
+        last_accessed_at=old,
+    )
+    db_session.add(song)
+    db_session.commit()
+
+    client = _client(db_session)
+    r = client.get(f"/api/songs/{song.id}/audio")
+    assert r.status_code == 200
+
+    db_session.refresh(song)
+    # The LRU clock moved forward — recent access protects it from eviction.
+    assert song.last_accessed_at > old
+
+
+def test_retry_dispatches_analyze_for_failed_with_audio_no_analysis(
+    db_session: Session,
+):
+    from app.workers import PRI_ANALYZE
+
+    song = Song(
+        youtube_video_id="retry-a",
+        title="T",
+        artist=None,
+        duration_seconds=10.0,
+        audio_path="audio/retry-a.wav",
+        status=SongStatus.failed,
+        error_text="analysis failed: boom",
+    )
+    db_session.add(song)
+    db_session.commit()
+
+    client = _client(db_session)
+    with patch("app.api.songs.analyze_song.apply_async") as dispatch:
+        r = client.post(f"/api/songs/{song.id}/retry")
+    assert r.status_code == 202
+    dispatch.assert_called_once_with(args=[str(song.id)], priority=PRI_ANALYZE)
+    db_session.refresh(song)
+    assert song.pipeline_requested is True
+    assert song.error_text is None  # cleared on retry
+
+
+def test_retry_dispatches_download_for_failed_without_audio(db_session: Session):
+    from app.workers import PRI_DOWNLOAD
+
+    song = Song(
+        youtube_video_id="retry-dl",
+        title="T",
+        artist=None,
+        duration_seconds=10.0,
+        audio_path=None,
+        status=SongStatus.failed,
+        error_text="download failed: nope",
+    )
+    db_session.add(song)
+    db_session.commit()
+
+    client = _client(db_session)
+    with patch("app.api.songs.download_song.apply_async") as dispatch:
+        r = client.post(f"/api/songs/{song.id}/retry")
+    assert r.status_code == 202
+    dispatch.assert_called_once_with(args=[str(song.id)], priority=PRI_DOWNLOAD)
+
+
+def test_retry_409_when_not_failed(db_session: Session):
+    song = _downloaded_song(db_session, vid="retry-ok")
+    client = _client(db_session)
+    r = client.post(f"/api/songs/{song.id}/retry")
+    assert r.status_code == 409
+
+
+def test_retry_404_unknown_song(db_session: Session):
+    client = _client(db_session)
+    r = client.post("/api/songs/00000000-0000-0000-0000-000000000000/retry")
+    assert r.status_code == 404
+
+
+def test_song_read_exposes_error_text(db_session: Session):
+    song = Song(
+        youtube_video_id="errtext",
+        title="T",
+        artist=None,
+        duration_seconds=10.0,
+        status=SongStatus.failed,
+        error_text="separation failed: kaboom",
+    )
+    db_session.add(song)
+    db_session.commit()
+    client = _client(db_session)
+    r = client.get(f"/api/songs/{song.id}")
+    assert r.status_code == 200
+    assert r.json()["error_text"] == "separation failed: kaboom"
+
+
 def test_trigger_analyze_enqueues_when_downloaded(db_session: Session):
     from app.workers import PRI_ANALYZE
     song = _downloaded_song(db_session)

@@ -99,7 +99,7 @@ def separate_stems(song_id: str) -> str | None:
             update(Song)
             .where(Song.id == song_uuid)
             .where(Song.status.in_(CLAIMABLE_STATUSES))
-            .values(status=SongStatus.separating)
+            .values(status=SongStatus.separating, error_text=None)
         )
         db.commit()
 
@@ -160,12 +160,13 @@ def separate_stems(song_id: str) -> str | None:
                 vocal_rms = result.vocal_rms
                 model_name = service.model_name
 
-        except Exception:
+        except Exception as exc:
             logger.exception("separation failed for song %s", song_id)
             with SessionLocal() as db:
                 song = db.get(Song, song_uuid)
                 if song is not None:
                     song.status = SongStatus.failed
+                    song.error_text = f"separation failed: {exc}"[:1000]
                     db.commit()
             raise
 

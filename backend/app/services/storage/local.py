@@ -39,6 +39,23 @@ class LocalFilesystemStorage:
     async def get_url(self, key: str) -> str:
         return str(self._path(key))
 
+    async def list_objects(self, prefix: str = "") -> list[tuple[str, int]]:
+        base = self._path(prefix) if prefix else self.root
+        # A prefix that names a file (not a dir) lists just that file; a
+        # missing path lists nothing.
+        if base.is_file():
+            return [(prefix, base.stat().st_size)]
+        if not base.exists():
+            return []
+        out: list[tuple[str, int]] = []
+        for p in base.rglob("*"):
+            if p.is_file():
+                # Keys are POSIX-style relative paths from the storage root,
+                # matching how they were written.
+                key = p.relative_to(self.root).as_posix()
+                out.append((key, p.stat().st_size))
+        return out
+
     async def download_file(self, key: str, dest_path: Path) -> None:
         import shutil
         src = self._path(key)

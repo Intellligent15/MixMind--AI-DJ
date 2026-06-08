@@ -177,6 +177,9 @@ def add_queue_item(
         position=current_count,
     )
     db.add(item)
+    # Queuing a song is an access — refresh its LRU clock so it sorts as
+    # recently-used even after this queue is later replaced.
+    song.last_accessed_at = datetime.now(timezone.utc)
     db.commit()
 
     # NOTE: POST /api/songs already dispatches download_song on song
@@ -331,6 +334,10 @@ def lock_queue(queue_id: uuid.UUID, db: Session = Depends(get_db)) -> Queue:
     # Snapshot songs while the session is open; we'll enqueue after commit
     # so a transient task-broker failure doesn't roll back the lock.
     songs_to_pipeline = [item.song for item in queue.items]
+    # Locking accesses every song in the queue — refresh their LRU clocks.
+    now = datetime.now(timezone.utc)
+    for item in queue.items:
+        item.song.last_accessed_at = now
     db.commit()
     db.refresh(queue)
 

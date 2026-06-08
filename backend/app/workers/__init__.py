@@ -26,6 +26,7 @@ celery_app = Celery(
         "app.workers.stitch_queue",
         "app.workers.fetch_lyrics",
         "app.workers.align_lyrics",
+        "app.workers.evict_cache",
     ],
 )
 

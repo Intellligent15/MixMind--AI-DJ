@@ -49,7 +49,7 @@ def download_song(song_id: str) -> str | None:
             update(Song)
             .where(Song.id == song_uuid)
             .where(Song.status.in_(CLAIMABLE_STATUSES))
-            .values(status=SongStatus.downloading)
+            .values(status=SongStatus.downloading, error_text=None)
         )
         db.commit()
 
@@ -75,12 +75,13 @@ def download_song(song_id: str) -> str | None:
         try:
             yt.download(video_id, dest)
             asyncio.run(storage.upload_file(dest, key))
-        except Exception:
+        except Exception as exc:
             logger.exception("download failed for %s", video_id)
             with SessionLocal() as db:
                 song = db.get(Song, song_uuid)
                 if song is not None:
                     song.status = SongStatus.failed
+                    song.error_text = f"download failed: {exc}"[:1000]
                     db.commit()
             raise
 
@@ -101,5 +102,12 @@ def download_song(song_id: str) -> str | None:
     # added songs that nobody queued stop here.
     if wants_pipeline:
         analyze_song.apply_async(args=[song_id], priority=PRI_ANALYZE)
+
+    # A fresh download is the moment the cache grows from user action — kick
+    # the LRU evictor (no-op under budget). By NAME so this stays decoupled.
+    try:
+        celery_app.send_task("app.workers.evict_cache.enforce_cache_budget")
+    except Exception:  # pragma: no cover - broker hiccup must not fail the DL
+        logger.warning("download_song: failed to dispatch cache eviction", exc_info=True)
 
     return key

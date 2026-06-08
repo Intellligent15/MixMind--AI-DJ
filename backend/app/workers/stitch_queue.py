@@ -414,7 +414,15 @@ def stitch_queue(queue_id: str) -> str | None:
             row.error_text = None
             row.timeline = timeline
             db.commit()
-            
+
+    # Stitching just wrote the largest single artifact (the whole-queue
+    # FLAC) — nudge the LRU evictor (no-op under budget). By name to stay
+    # decoupled from the evictor module.
+    try:
+        celery_app.send_task("app.workers.evict_cache.enforce_cache_budget")
+    except Exception:  # pragma: no cover - broker hiccup must not fail stitch
+        logger.warning("stitch_queue: failed to dispatch cache eviction", exc_info=True)
+
     return queue_id
 
 
