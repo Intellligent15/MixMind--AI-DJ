@@ -5,7 +5,7 @@ import { NavHeader } from "@/components/NavHeader";
 export default function LibraryPage() {
   return (
     <main className="min-h-screen max-w-4xl mx-auto p-8 flex flex-col gap-8 font-mono">
-      <NavHeader subtitle="Library" />
+      <NavHeader />
       <SearchPanel />
       <DownloadedSongs />
     </main>
