@@ -131,13 +131,20 @@ export function Player() {
   const timeline = mixData?.timeline ?? null;
   const mixCurrentSong = useMemo(() => {
     if (activeMode !== "mix" || !timeline?.songs.length) return null;
-    const found = timeline.songs.find(
-      (s) => position >= s.start && position < s.end
-    );
-    if (found) return found;
-    // Past the last boundary (or a sub-second gap) → clamp to nearest end.
-    const last = timeline.songs[timeline.songs.length - 1];
-    return position >= last.start ? last : timeline.songs[0];
+    // Each song owns [start, end); the gaps BETWEEN those spans are the
+    // transition regions (the timeline tracks transitions separately). During
+    // a transition the playhead sits in that gap, so a strict [start, end)
+    // containment finds nothing. Resolve "now playing" as the last song that
+    // has started (start <= position): inside a song span that's the song
+    // itself, and during a transition it's the outgoing song — which then
+    // flips to the incoming song exactly when the transition ends. songs are
+    // ordered by ascending start, so the last match wins.
+    let lead = timeline.songs[0];
+    for (const s of timeline.songs) {
+      if (s.start <= position) lead = s;
+      else break;
+    }
+    return lead;
   }, [activeMode, timeline, position]);
   const mixUpcomingSong = useMemo(() => {
     if (!timeline || !mixCurrentSong) return null;
