@@ -275,6 +275,76 @@ def test_validate_llm_plan_allows_temporary_pitch_shift():
     _validate_llm_plan(plan)  # should not raise
 
 
+def _b_bundle(bpm: float = 120.0, duration: float = 200.0):
+    """A minimal B AnalysisBundle for the revert-timing guard (bpm + ts +
+    duration are all it reads)."""
+    from app.services.mixer.types import AnalysisBundle
+
+    return AnalysisBundle(
+        bpm=bpm, key="C", camelot_key="8B", time_signature=4,
+        beat_grid=[], downbeats=[], sections=[], duration=duration,
+    )
+
+
+def test_enforce_revert_defers_tempo_ramp_into_crossfade():
+    """A tempo ramp that begins before the crossfade ends unlocks B's tempo
+    while A is still audible — the guard snaps its start to the crossfade end
+    (here 4 bars × 2.0 s/bar = 8.0 s) and slides end_time to keep its length."""
+    from app.workers.render_transition import _enforce_revert_after_crossfade
+
+    plan = _valid_plan(extra=[{
+        "tool": "set_tempo_ramp", "song": "B",
+        "start_time": 4.0, "end_time": 20.0,
+        "start_bpm": 128.0, "end_bpm": 120.0,
+    }])
+    out = _enforce_revert_after_crossfade(plan, _b_bundle())
+    ramp = next(c for c in out if c["tool"] == "set_tempo_ramp")
+    assert ramp["start_time"] == 8.0
+    assert ramp["end_time"] == 24.0  # 20.0 + (8.0 - 4.0) delta, length preserved
+
+
+def test_enforce_revert_leaves_post_crossfade_ramp_untouched():
+    from app.workers.render_transition import _enforce_revert_after_crossfade
+
+    plan = _valid_plan(extra=[{
+        "tool": "set_tempo_ramp", "song": "B",
+        "start_time": 8.0, "end_time": 30.0,
+        "start_bpm": 128.0, "end_bpm": 120.0,
+    }])
+    out = _enforce_revert_after_crossfade(plan, _b_bundle())
+    ramp = next(c for c in out if c["tool"] == "set_tempo_ramp")
+    assert ramp["start_time"] == 8.0
+    assert ramp["end_time"] == 30.0
+
+
+def test_enforce_revert_defers_temporary_pitch_shift():
+    from app.workers.render_transition import _enforce_revert_after_crossfade
+
+    plan = _valid_plan(extra=[{
+        "tool": "temporary_pitch_shift", "song": "B", "start_time": 2.0,
+        "semitones": -2, "fade_in_bars": 0, "hold_bars": 0, "fade_out_bars": 4,
+    }])
+    out = _enforce_revert_after_crossfade(plan, _b_bundle())
+    pitch = next(c for c in out if c["tool"] == "temporary_pitch_shift")
+    assert pitch["start_time"] == 8.0  # deferred to the crossfade end
+
+
+def test_enforce_revert_clamps_ramp_end_to_b_duration():
+    """If deferring the ramp would push its end past B's audio, end_time is
+    clamped so the stretch map can't run off the end of B."""
+    from app.workers.render_transition import _enforce_revert_after_crossfade
+
+    plan = _valid_plan(extra=[{
+        "tool": "set_tempo_ramp", "song": "B",
+        "start_time": 4.0, "end_time": 19.0,
+        "start_bpm": 128.0, "end_bpm": 120.0,
+    }])
+    out = _enforce_revert_after_crossfade(plan, _b_bundle(duration=20.0))
+    ramp = next(c for c in out if c["tool"] == "set_tempo_ramp")
+    assert ramp["start_time"] == 8.0
+    assert ramp["end_time"] == 20.0  # 23.0 clamped down to B.duration
+
+
 def test_render_transition_llm_planner(pair_with_plan):
     storage = AsyncMock()
     async def _write(key, data):

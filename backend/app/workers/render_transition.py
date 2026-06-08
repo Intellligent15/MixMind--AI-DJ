@@ -229,6 +229,76 @@ def _clamp_pitch_shifts(plan: list[dict]) -> list[dict]:
     return clamped
 
 
+def _enforce_revert_after_crossfade(
+    plan: list[dict], b: AnalysisBundle
+) -> list[dict]:
+    """Defer B's tempo ramp / temporary-pitch return until AFTER the A→B
+    crossfade has fully finished.
+
+    B is auto-stretched to A's tempo (and held in A's key) at the seam, so it
+    is beat- and key-locked while A is audible. If the ramp or the pitch
+    return begins *during* the crossfade, B speeds up / flips back to its own
+    key while A is still playing — A's and B's beats drift apart for those
+    bars (the misalignment clears the moment the crossfade ends). We snap any
+    such start up to the crossfade end (the bar where the LAST stem finishes
+    its fade), so the revert only ever happens once the transition is done.
+
+    The deterministic planner already places both at the crossfade end, so
+    this is a no-op there; it's the guard that keeps an LLM plan honest
+    regardless of how well the model followed the prompt. A tempo ramp's
+    `end_time` slides by the same delta to preserve its length (clamped to B's
+    duration so the stretch map can't run past the audio)."""
+    window = next(
+        (c for c in plan if c.get("tool") == "set_transition_window"), None
+    )
+    if window is None:
+        return plan
+    sec_per_bar_b = (60.0 / b.bpm) * b.time_signature if b.bpm else 0.0
+    if sec_per_bar_b <= 0:
+        return plan
+
+    stem_calls = [c for c in plan if c.get("tool") == "crossfade_stem"]
+    if not stem_calls:
+        return plan
+    n_bars = max(
+        int(c.get("start_bar", 0)) + int(c.get("duration_bars", 0))
+        for c in stem_calls
+    )
+    to_start = float(window.get("to_song_time_start", 0.0))
+    crossfade_end_b = to_start + n_bars * sec_per_bar_b
+
+    out: list[dict] = []
+    for call in plan:
+        tool = call.get("tool")
+        if tool == "set_tempo_ramp":
+            start = float(call.get("start_time", 0.0))
+            if start < crossfade_end_b:
+                delta = crossfade_end_b - start
+                end = float(call.get("end_time", start)) + delta
+                end = min(end, b.duration)
+                # Guard against a degenerate (end <= start) ramp if the
+                # crossfade end lands past B's usable tail.
+                if end <= crossfade_end_b:
+                    end = b.duration
+                logger.info(
+                    "render_transition: deferred tempo ramp start %.2f -> %.2f "
+                    "(after crossfade end)",
+                    start, crossfade_end_b,
+                )
+                call = {**call, "start_time": crossfade_end_b, "end_time": end}
+        elif tool == "temporary_pitch_shift":
+            start = float(call.get("start_time", 0.0))
+            if start < crossfade_end_b:
+                logger.info(
+                    "render_transition: deferred pitch return start %.2f -> %.2f "
+                    "(after crossfade end)",
+                    start, crossfade_end_b,
+                )
+                call = {**call, "start_time": crossfade_end_b}
+        out.append(call)
+    return out
+
+
 def _to_bundle(analysis: Analysis, duration: float) -> AnalysisBundle:
     return AnalysisBundle(
         bpm=analysis.bpm,
@@ -431,6 +501,9 @@ def render_transition(mix_plan_id: str) -> str | None:
             return build_pair_plan(a_bundle, b_bundle)
             
     plan_json = existing_plan_json or asyncio.run(_build_plan())
+    # Guarantee B's tempo/pitch revert only fires once the crossfade is done,
+    # whatever the source of the plan (fresh LLM, cached, or deterministic).
+    plan_json = _enforce_revert_after_crossfade(plan_json, b_bundle)
 
     import tempfile
     from pathlib import Path
