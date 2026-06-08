@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 from sqlalchemy import select
@@ -78,21 +78,25 @@ def test_stitch_409_when_queue_not_locked(db_session: Session):
 
 
 def test_stitch_dispatches_when_all_mixes_ready(db_session: Session):
+    # Phase 10 routes the manual stitch through auto_stitch; all plans are
+    # ready in the seed, so the stitch task fires directly (no render chord).
     q = _seed_locked_queue(db_session, n=2)
     client = _client(db_session)
-    with patch("app.api.queues._TaskShim") as shim_cls:
-        shim_cls.return_value = MagicMock()
+    with patch("app.workers.auto_stitch.celery_app") as celery, \
+            patch("app.workers.auto_stitch.chord") as chord_mock:
         r = client.post(f"/api/queues/{q.id}/stitch")
     assert r.status_code == 202
-    calls = [c.args for c in shim_cls.call_args_list]
-    assert ("app.workers.stitch_queue.stitch_queue",) in calls
+    sig_names = [c.args[0] for c in celery.signature.call_args_list]
+    assert "app.workers.stitch_queue.stitch_queue" in sig_names
+    # All pairs ready → no render fan-out, so no chord.
+    chord_mock.assert_not_called()
 
 
 def test_stitch_creates_queue_render_row(db_session: Session):
     q = _seed_locked_queue(db_session, n=2)
     client = _client(db_session)
-    with patch("app.api.queues._TaskShim") as shim_cls:
-        shim_cls.return_value = MagicMock()
+    with patch("app.workers.auto_stitch.celery_app"), \
+            patch("app.workers.auto_stitch.chord"):
         client.post(f"/api/queues/{q.id}/stitch")
     row = db_session.scalar(select(QueueRender).where(QueueRender.queue_id == q.id))
     assert row is not None
@@ -108,8 +112,8 @@ def test_stitch_resets_failed_row_to_pending(db_session: Session):
     ))
     db_session.flush()
     client = _client(db_session)
-    with patch("app.api.queues._TaskShim") as shim_cls:
-        shim_cls.return_value = MagicMock()
+    with patch("app.workers.auto_stitch.celery_app"), \
+            patch("app.workers.auto_stitch.chord"):
         client.post(f"/api/queues/{q.id}/stitch")
     db_session.expire_all()
     row = db_session.scalar(select(QueueRender).where(QueueRender.queue_id == q.id))

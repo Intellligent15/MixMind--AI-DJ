@@ -152,6 +152,7 @@ def transcribe_song(song_id: str) -> str | None:
             assert song is not None
             song.status = SongStatus.ready
             db.commit()
+            _maybe_dispatch_stitch(song_uuid, db)
 
         return str(song_uuid)
 
@@ -237,8 +238,25 @@ def transcribe_song(song_id: str) -> str | None:
         assert song is not None
         song.status = SongStatus.ready
         db.commit()
+        _maybe_dispatch_stitch(song_uuid, db)
 
     from app.workers.align_lyrics import align_lyrics_task
     align_lyrics_task.delay(str(song_uuid))
 
     return str(song_uuid)
+
+
+def _maybe_dispatch_stitch(song_uuid: uuid.UUID, db) -> None:
+    """Phase 10 eager stitch: when this song reaching `ready` was the last
+    one its locked queue was waiting on, fire the render+stitch chord so the
+    continuous mix renders during the Processing state. Best-effort — a
+    failure here must never fail the transcription that just succeeded.
+    """
+    try:
+        from app.workers.auto_stitch import maybe_dispatch_stitch_for_song
+
+        maybe_dispatch_stitch_for_song(song_uuid, db)
+    except Exception:  # pragma: no cover - defensive
+        logger.exception(
+            "transcribe_song: eager stitch dispatch failed for %s", song_uuid
+        )

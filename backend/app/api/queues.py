@@ -344,6 +344,14 @@ def lock_queue(queue_id: uuid.UUID, db: Session = Depends(get_db)) -> Queue:
     from app.api.mix_plans import _seed_mix_plans
     _seed_mix_plans(queue, db)
 
+    # Phase 10 eager stitch: if every song is ALREADY `ready` at lock time
+    # (fully-cached queue), no worker will re-run to fire the completion
+    # hook — so kick the render+stitch chord here. maybe_dispatch_stitch
+    # no-ops when songs are still processing (the normal case), where the
+    # transcribe-completion hook fires it instead.
+    from app.workers.auto_stitch import maybe_dispatch_stitch
+    maybe_dispatch_stitch(queue.id, db)
+
     return queue
 
 
@@ -352,39 +360,18 @@ def lock_queue(queue_id: uuid.UUID, db: Session = Depends(get_db)) -> Queue:
     status_code=status.HTTP_202_ACCEPTED,
 )
 def stitch_queue_route(queue_id: uuid.UUID, db: Session = Depends(get_db)):
-    from app.models.queue_render import QueueRender, QueueRenderStatus
-    
+    """Manual (re)render of the continuous mix. The eager auto-stitch (see
+    auto_stitch.maybe_dispatch_stitch) already fires this chord during the
+    Processing state once every song is ready; this endpoint is the
+    user-triggered recovery / re-render path."""
     queue = db.get(Queue, queue_id)
     if not queue:
         raise HTTPException(status_code=404, detail="queue not found")
     if not queue.locked:
         raise HTTPException(status_code=409, detail="queue must be locked to stitch")
-        
-    render_row = db.scalar(select(QueueRender).where(QueueRender.queue_id == queue_id))
-    if not render_row:
-        render_row = QueueRender(queue_id=queue_id)
-        db.add(render_row)
-    else:
-        render_row.status = QueueRenderStatus.pending
-        render_row.error_text = None
-    db.commit()
-    db.refresh(render_row)
-    
-    from app.models import MixPlan, MixPlanStatus
-    from celery import chord
 
-    mix_plans = db.scalars(select(MixPlan).where(MixPlan.queue_id == queue_id)).all()
-    render_tasks = []
-    for mp in mix_plans:
-        if mp.status != MixPlanStatus.ready:
-            render_tasks.append(_TaskShim("app.workers.render_transition.render_transition").si(str(mp.id)))
-
-    stitch_task = _TaskShim("app.workers.stitch_queue.stitch_queue").si(str(queue_id))
-    
-    if render_tasks:
-        chord(render_tasks)(stitch_task)
-    else:
-        stitch_task.delay()
+    from app.workers.auto_stitch import reset_and_dispatch_stitch
+    reset_and_dispatch_stitch(queue_id, db)
 
     return {"message": "Stitching started"}
 

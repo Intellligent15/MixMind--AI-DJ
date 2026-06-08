@@ -74,6 +74,135 @@ def _get_mix1_sample(T_orig: float, sr: int = 44100) -> int:
     return int(T_orig * sr)
 
 
+def _snap_downbeat(t: float, downbeats: list[float]) -> float:
+    """First downbeat at/after `t` (mirrors the executor's seam snap)."""
+    if not downbeats:
+        return t
+    for d in downbeats:
+        if d >= t:
+            return d
+    return downbeats[-1]
+
+
+def _describe_transition(plan: list[dict]) -> dict:
+    """Summarise a per-pair plan_json for the player's transition indicator:
+    a human label, the per-stem A→B routing, and any layered effects."""
+    tools = [c.get("tool") for c in plan]
+    stems = [
+        {"stem": c.get("stem"), "from": c.get("from_song"), "to": c.get("to_song")}
+        for c in plan
+        if c.get("tool") == "crossfade_stem"
+    ]
+    effects: list[str] = []
+    if "filter_sweep" in tools:
+        effects.append("filter sweep")
+    if "echo_out" in tools:
+        effects.append("echo tail")
+    if "loop_section" in tools:
+        effects.append("loop & build")
+    if "swap_stem" in tools:
+        effects.append("stem swap")
+    if "temporary_pitch_shift" in tools:
+        effects.append("key lift")
+    if "set_tempo_ramp" in tools:
+        effects.append("tempo ramp")
+
+    if "swap_stem" in tools:
+        label = "Stem swap"
+    elif "filter_sweep" in tools:
+        label = "Filter sweep"
+    elif "echo_out" in tools:
+        label = "Echo tail-out"
+    elif "loop_section" in tools:
+        label = "Loop & build"
+    else:
+        label = "Crossfade"
+
+    reasoning = next(
+        (c.get("text") for c in plan if c.get("tool") == "set_reasoning"), None
+    )
+    return {"label": label, "stems": stems, "effects": effects, "reasoning": reasoning}
+
+
+def _build_timeline(
+    song_ids: list,
+    song_meta: dict,
+    mix_plans: list,
+    analyses: dict,
+    render_body_start: list[int],
+    head_full_index: list[int],
+    total_samples: int,
+    sr: int,
+) -> dict:
+    """Map the stitched output back to per-song + per-transition time spans.
+
+    Uses the SAME accumulated offsets the audio loop produced
+    (`render_body_start` / `head_full_index`), so the timeline can't drift
+    from where the audio actually sits. Each render r is the transition from
+    song r to song r+1; its seam (= A's downbeat-snapped seam, in render r's
+    own samples) maps to output sample
+    ``render_body_start[r] + (a_seam_sample_r - head_full_index[r])``.
+    """
+    n = len(song_ids)
+    transitions: list[dict] = []
+    for r in range(len(mix_plans)):
+        plan = mix_plans[r].plan_json or []
+        window = next(
+            (c for c in plan if c.get("tool") == "set_transition_window"), None
+        )
+        an_a = analyses[song_ids[r]]
+        if window is None or not an_a.bpm:
+            continue
+        a_seam_orig = _snap_downbeat(
+            float(window["from_song_time_start"]), list(an_a.downbeats or [])
+        )
+        a_seam_sample = int(round(a_seam_orig * sr))
+        seam_out = render_body_start[r] + (a_seam_sample - head_full_index[r])
+        sec_per_bar_a = (60.0 / an_a.bpm) * an_a.time_signature
+        trans_len = int(round(int(window.get("duration_bars", 0)) * sec_per_bar_a * sr))
+        seam_out = max(0, min(seam_out, total_samples))
+        end_out = max(seam_out, min(seam_out + trans_len, total_samples))
+        desc = _describe_transition(plan)
+        transitions.append(
+            {
+                "index": r,
+                "from_song_id": str(song_ids[r]),
+                "to_song_id": str(song_ids[r + 1]),
+                "start": round(seam_out / sr, 3),
+                "end": round(end_out / sr, 3),
+                "label": desc["label"],
+                "stems": desc["stems"],
+                "effects": desc["effects"],
+                "reasoning": desc["reasoning"],
+            }
+        )
+
+    # Per-song spans: song k owns output from the previous transition's end
+    # to its own outgoing transition's seam. First/last songs bookend.
+    total_sec = round(total_samples / sr, 3)
+    seam_by_idx = {t["index"]: t for t in transitions}
+    songs: list[dict] = []
+    for k in range(n):
+        prev_t = seam_by_idx.get(k - 1)
+        cur_t = seam_by_idx.get(k)
+        start = prev_t["end"] if prev_t else 0.0
+        end = cur_t["start"] if cur_t else total_sec
+        end = max(start, min(end, total_sec))
+        meta = song_meta.get(song_ids[k], {})
+        songs.append(
+            {
+                "index": k,
+                "song_id": str(song_ids[k]),
+                "title": meta.get("title"),
+                "artist": meta.get("artist"),
+                "start": round(start, 3),
+                "end": round(end, 3),
+            }
+        )
+
+    return {"duration": total_sec, "songs": songs, "transitions": transitions}
+
+
 @celery_app.task(name="app.workers.stitch_queue.stitch_queue")
 def stitch_queue(queue_id: str) -> str | None:
     queue_uuid = uuid.UUID(queue_id)
@@ -133,6 +262,16 @@ def stitch_queue(queue_id: str) -> str | None:
                 return None
             analyses[item.song_id] = an
 
+        # Phase 10: capture per-song display metadata for the player timeline
+        # (title/artist) while the session is open — the loop below runs after
+        # the session closes and can't lazy-load relationships.
+        song_ids = [item.song_id for item in items]
+        song_meta = {}
+        for sid in song_ids:
+            s = db.get(Song, sid)
+            if s is not None:
+                song_meta[sid] = {"title": s.title, "artist": s.artist}
+
     # Now stitch!
     sr = 44100
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -161,6 +300,12 @@ def stitch_queue(queue_id: str) -> str | None:
         # buffer. Without this, each iter past the first re-plays a chunk of
         # the middle song before the next junction.
         head_offset = 0
+
+        # Phase 10 timeline accumulators. render_body_start[r] = output sample
+        # where render r's kept body begins; head_full_index[r] = the index
+        # into audios[r] at which that body starts (how much head was trimmed).
+        render_body_start = [0]
+        head_full_index = [0]
 
         for i in range(len(mix_plans) - 1):
             mix0 = stitched[-1] # The accumulated mix so far (or we just accumulate chunks)
@@ -206,6 +351,12 @@ def stitch_queue(queue_id: str) -> str | None:
             # To accumulate cleanly, we replace stitched[-1] with its sliced version
             mix0_sliced = mix0[: S0 - head_offset]
             mix1_sliced = mix1[S1:]
+
+            # Record render r's kept length (before the xfade trims a few ms
+            # off either end — negligible vs the indicator's resolution) so
+            # the timeline knows where render r+1's body lands in the output.
+            render_body_start.append(render_body_start[-1] + mix0_sliced.shape[0])
+            head_full_index.append(S1)
             
             # 50ms crossfade
             xfade_samples = int(0.050 * sr)
@@ -233,10 +384,22 @@ def stitch_queue(queue_id: str) -> str | None:
                 head_offset = S1
 
         final_audio = np.concatenate(stitched)
-        
+
+        # Phase 10: build the player timeline from the accumulated offsets.
+        # Best-effort — a timeline glitch must never fail an otherwise-good
+        # mix render.
+        try:
+            timeline = _build_timeline(
+                song_ids, song_meta, mix_plans, analyses,
+                render_body_start, head_full_index, final_audio.shape[0], sr,
+            )
+        except Exception:
+            logger.exception("stitch_queue: timeline build failed for %s", queue_id)
+            timeline = None
+
         out_dest = tmp / "final.flac"
         sf.write(str(out_dest), final_audio, sr, format="FLAC", subtype="PCM_16")
-        
+
         with open(out_dest, "rb") as f:
             flac_bytes = f.read()
 
@@ -249,6 +412,7 @@ def stitch_queue(queue_id: str) -> str | None:
             row.rendered_audio_path = key
             row.status = QueueRenderStatus.ready
             row.error_text = None
+            row.timeline = timeline
             db.commit()
             
     return queue_id

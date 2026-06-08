@@ -3,7 +3,7 @@ import uuid
 from datetime import datetime
 
 from sqlalchemy import DateTime, Enum, ForeignKey, String, func
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.db import Base
@@ -39,6 +39,16 @@ class QueueRender(Base):
     )
 
     error_text: Mapped[str | None] = mapped_column(String, nullable=True)
+
+    # Phase 10: output-timeline map for the player's transition indicator.
+    # Written by stitch_queue alongside the FLAC. Shape:
+    #   {"duration": float,
+    #    "songs": [{"index", "song_id", "title", "artist", "start", "end"}],
+    #    "transitions": [{"index", "from_song_id", "to_song_id", "start",
+    #                     "end", "label", "stems": [...], "reasoning"}]}
+    # Times are seconds in the stitched-mix timeline. Null until stitched
+    # (and on rows rendered before this column existed — re-stitch to fill).
+    timeline: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False

@@ -558,8 +558,10 @@ def test_render_transition_accepts_per_stem_envelope_plan(pair_with_plan):
         assert row.plan_json == per_stem_plan
 
 
-def test_render_transition_clamps_llm_permanent_pitch_shift(pair_with_plan):
-    """LLM emits pitch_shift=+5; worker must clamp to +2 before persist."""
+def test_render_transition_rejects_llm_permanent_pitch_shift(pair_with_plan):
+    """LLM emits a permanent pitch_shift; validation rejects it (it would
+    break the next stitch junction) and the worker falls back to the
+    deterministic planner, whose plan carries no permanent pitch_shift."""
     storage = AsyncMock()
     async def _write(key, data):
         return f"/abs/{key}"
@@ -576,13 +578,17 @@ def test_render_transition_clamps_llm_permanent_pitch_shift(pair_with_plan):
         patch("app.workers.render_transition.get_storage", return_value=storage),
         patch("app.workers.render_transition.get_llm_provider", return_value=mock_llm_provider),
         patch("app.workers.render_transition.settings.use_llm_planner", True),
+        patch(
+            "app.workers.render_transition.build_pair_plan",
+            return_value=_valid_plan(),
+        ) as mock_fallback,
     ):
         from app.workers.render_transition import render_transition
         result = render_transition(pair_with_plan["plan_id"])
 
     assert result == pair_with_plan["plan_id"]
+    mock_fallback.assert_called_once()  # permanent pitch_shift → deterministic fallback
     with SessionLocal() as db:
         row = db.get(MixPlan, uuid.UUID(pair_with_plan["plan_id"]))
         pitch_calls = [c for c in row.plan_json if c["tool"] == "pitch_shift"]
-        assert len(pitch_calls) == 1
-        assert pitch_calls[0]["semitones"] == 2  # clamped from +5
+        assert pitch_calls == []  # no permanent pitch_shift survives

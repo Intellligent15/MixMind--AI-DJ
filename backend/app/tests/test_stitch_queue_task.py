@@ -150,6 +150,15 @@ def test_stitch_queue_happy_path(locked_queue_with_mixes):
         assert qr.status == QueueRenderStatus.ready
         assert qr.rendered_audio_path == f"queue_mixes/{locked_queue_with_mixes}.flac"
         assert qr.error_text is None
+        # Phase 10: the player timeline is persisted alongside the FLAC.
+        tl = qr.timeline
+        assert tl is not None
+        assert len(tl["songs"]) == 3
+        assert len(tl["transitions"]) == 2
+        for t in tl["transitions"]:
+            assert t["from_song_id"] and t["to_song_id"]
+            assert t["label"]  # human-readable technique
+            assert t["end"] >= t["start"]
 
 
 def test_stitch_queue_atomic_claim_skips_when_already_rendering():
