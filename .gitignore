@@ -35,6 +35,12 @@ node_modules/
 out/
 .turbo/
 *.tsbuildinfo
+
+# Playwright
+/frontend/test-results/
+/frontend/playwright-report/
+/frontend/blob-report/
+/frontend/.playwright/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*

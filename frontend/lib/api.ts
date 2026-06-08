@@ -31,6 +31,9 @@ export type Song = {
   thumbnail_url: string | null;
   audio_path: string | null;
   status: SongStatus;
+  // Reason the song last failed (null otherwise). Surfaced + retryable in
+  // the Processing view.
+  error_text: string | null;
   created_at: string;
   updated_at: string;
   has_stems: boolean;
@@ -237,6 +240,8 @@ export const api = {
   audioUrl: (id: string) => `${API_BASE}/api/songs/${id}/audio`,
   triggerAnalyze: (id: string) =>
     request<Song>(`/api/songs/${id}/analyze`, { method: "POST" }),
+  retrySong: (id: string) =>
+    request<Song>(`/api/songs/${id}/retry`, { method: "POST" }),
   getAnalysis: (id: string) => request<Analysis>(`/api/songs/${id}/analysis`),
 
   triggerSeparate: (id: string) =>

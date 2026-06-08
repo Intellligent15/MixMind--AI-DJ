@@ -3,7 +3,12 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { useQueries, useQuery } from "@tanstack/react-query";
+import {
+  useMutation,
+  useQueries,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
 import {
   api,
   isStatusError,
@@ -94,6 +99,7 @@ const WORKER_STUCK_WARN_MS = 120_000;
 
 export function ProcessingView() {
   const router = useRouter();
+  const queryClient = useQueryClient();
   const queue = useQuery<Queue | null>({
     queryKey: ["queue", "current"],
     queryFn: async () => {
@@ -245,6 +251,29 @@ export function ProcessingView() {
   });
   const mix = mixQuery.data;
 
+  // Retry a failed song: re-dispatch from the stage it died on, then resume
+  // polling (the song's refetchInterval stopped when it hit `failed`).
+  const retrySongMutation = useMutation({
+    mutationFn: (songId: string) => api.retrySong(songId),
+    onSuccess: (_data, songId) => {
+      queryClient.invalidateQueries({ queryKey: ["song", songId] });
+      queryClient.invalidateQueries({ queryKey: ["stems", songId] });
+      queryClient.invalidateQueries({ queryKey: ["transcription", songId] });
+    },
+  });
+
+  // Retry the continuous mix: re-renders pending+failed transitions and
+  // re-stitches (the existing chord recovery path). Covers both a failed
+  // transition and a failed stitch.
+  const retryMixMutation = useMutation({
+    mutationFn: () =>
+      queueId ? api.stitchQueue(queueId) : Promise.resolve({ message: "" }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["mix", queueId] });
+      queryClient.invalidateQueries({ queryKey: ["mix_plans", queueId] });
+    },
+  });
+
   // Honest playback gate (Phase 10):
   //   * The continuous mix is the product, so auto-advancing once it's
   //     `ready` gives the best experience — that's the eager-stitch payoff.
@@ -270,15 +299,26 @@ export function ProcessingView() {
   const transitionCount = mixPlans.length || Math.max(0, items.length - 1);
   const allSongsReady =
     songs.length > 0 && songs.every((s) => s.status === "ready");
+  const anySongFailed = songs.some((s) => s.status === "failed");
+  const anyTransitionFailed = mixPlans.some((p) => p.status === "failed");
+  const mixFailed = mix?.status === "failed";
+  // A mix retry only makes sense once songs are fixed — a failed transition
+  // can't re-render until its two songs are `ready`.
+  const canRetryMix =
+    hasTransitions && (mixFailed || anyTransitionFailed) && !anySongFailed;
   const gateText = canAutoStart
     ? "Ready — starting playback…"
-    : mix?.status === "rendering" || mix?.status === "pending"
-      ? "Rendering continuous mix…"
-      : mix?.status === "failed"
-        ? "Mix render failed — hard-cut playback available"
-        : allSongsReady
-          ? "All songs ready — preparing the mix…"
-          : "Processing songs…";
+    : anySongFailed
+      ? "A song failed to process — retry it below to continue"
+      : mixFailed
+        ? "Mix render failed — retry rendering, or play hard-cut now"
+        : anyTransitionFailed
+          ? "A transition failed — retry rendering below"
+          : mix?.status === "rendering" || mix?.status === "pending"
+            ? "Rendering continuous mix…"
+            : allSongsReady
+              ? "All songs ready — preparing the mix…"
+              : "Processing songs…";
 
   const songTitleById = (id: string) =>
     songs.find((s) => s.id === id)?.title ?? "—";
@@ -332,7 +372,17 @@ export function ProcessingView() {
           >
             {mixReady ? "Open player" : "Play now (hard cut)"}
           </button>
-          {hasTransitions && !mixReady && (
+          {canRetryMix && (
+            <button
+              type="button"
+              onClick={() => retryMixMutation.mutate()}
+              disabled={retryMixMutation.isPending}
+              className="px-4 py-2 border rounded text-sm border-amber-500/60 text-amber-700 dark:text-amber-400 hover:bg-amber-500/10 disabled:opacity-40"
+            >
+              {retryMixMutation.isPending ? "Retrying…" : "Retry rendering"}
+            </button>
+          )}
+          {hasTransitions && !mixReady && !canRetryMix && !anySongFailed && (
             <span className="text-xs opacity-60">
               The mix keeps rendering in the background — the player upgrades
               to it automatically when it&apos;s ready.
@@ -385,6 +435,22 @@ export function ProcessingView() {
                 >
                   {stepLabel}
                 </span>
+                {song.status === "failed" && (
+                  <button
+                    type="button"
+                    onClick={() => retrySongMutation.mutate(song.id)}
+                    disabled={
+                      retrySongMutation.isPending &&
+                      retrySongMutation.variables === song.id
+                    }
+                    className="text-xs px-2 py-1 rounded border border-amber-500/60 text-amber-700 dark:text-amber-400 hover:bg-amber-500/10 disabled:opacity-40"
+                  >
+                    {retrySongMutation.isPending &&
+                    retrySongMutation.variables === song.id
+                      ? "Retrying…"
+                      : "Retry"}
+                  </button>
+                )}
               </div>
               <div className="h-1 bg-black/10 dark:bg-white/10 rounded overflow-hidden">
                 <div
@@ -396,6 +462,11 @@ export function ProcessingView() {
                   style={{ width: `${song.status === "failed" ? 100 : pct}%` }}
                 />
               </div>
+              {song.status === "failed" && song.error_text && (
+                <p className="text-xs text-red-500 break-words">
+                  {song.error_text}
+                </p>
+              )}
               {stuck && (
                 <p className="text-xs text-amber-700 dark:text-amber-400">
                   {song.status === "separating" ? "Separation" : "Transcription"}{" "}
