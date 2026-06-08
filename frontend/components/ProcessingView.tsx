@@ -7,24 +7,26 @@ import { useQueries, useQuery } from "@tanstack/react-query";
 import {
   api,
   isStatusError,
+  type MixPlan,
   type Queue,
+  type QueueRender,
   type Song,
   type SongStatus,
   type Stems,
   type Transcription,
 } from "@/lib/api";
 
-// Songs at or past this point in the pipeline are considered "ready enough"
-// for the playback gate. Stems aren't required for hard-cut playback.
+// Songs at or past this point can be played back immediately via the
+// player's per-song hard-cut fallback (stems/transcription aren't needed to
+// just play a song). Used to enable the "Play now (hard cut)" escape hatch.
 const PLAYABLE_STATUSES: ReadonlyArray<SongStatus> = [
+  "downloaded",
+  "analyzing",
   "analyzed",
   "separating",
   "transcribing",
   "ready",
 ];
-// Playback starts once this many songs from the head of the queue are analyzed.
-// Phase 7+ will replace this gate with "first transition rendered".
-const GATE_ANALYZED = 2;
 
 // Logical pipeline progression. "separated" and "transcribed" aren't
 // SongStatus values — they're derived from the presence of a Stems or
@@ -208,25 +210,78 @@ export function ProcessingView() {
     return () => clearInterval(t);
   }, [songs]);
 
-  const analyzedHeadCount = useMemo(() => {
-    let n = 0;
-    for (const s of songs) {
-      if (PLAYABLE_STATUSES.includes(s.status)) n += 1;
-      else break;
-    }
-    return n;
-  }, [songs]);
+  const queueId = queue.data?.id;
+  const hasTransitions = items.length >= 2;
 
-  const requiredAnalyzed = Math.min(GATE_ANALYZED, songs.length);
-  const gateMet = analyzedHeadCount >= requiredAnalyzed && songs.length > 0;
+  // Per-transition (MixPlan) progress. Plans are seeded at lock; they flip
+  // pending → rendering → ready as the eager auto-stitch renders them (which
+  // only starts once every song is `ready`). Poll until all are terminal.
+  const mixPlansQuery = useQuery<MixPlan[]>({
+    queryKey: ["mix_plans", queueId],
+    queryFn: () => (queueId ? api.listMixPlansForQueue(queueId) : Promise.resolve([])),
+    enabled: !!queueId && hasTransitions,
+    refetchInterval: (q) => {
+      const plans = q.state.data ?? [];
+      if (plans.length === 0) return 1000;
+      const allDone = plans.every(
+        (p) => p.status === "ready" || p.status === "failed"
+      );
+      return allDone ? false : 1000;
+    },
+  });
+  const mixPlans = mixPlansQuery.data ?? [];
+
+  // The stitched continuous mix. Poll while it's being produced.
+  const mixQuery = useQuery<QueueRender | null>({
+    queryKey: ["mix", queueId],
+    queryFn: () => (queueId ? api.getQueueMix(queueId) : Promise.resolve(null)),
+    enabled: !!queueId && hasTransitions,
+    refetchInterval: (q) =>
+      q.state.data?.status === "pending" || q.state.data?.status === "rendering"
+        ? 1000
+        : q.state.data?.status === "ready"
+          ? false
+          : 1500,
+  });
+  const mix = mixQuery.data;
+
+  // Honest playback gate (Phase 10):
+  //   * The continuous mix is the product, so auto-advancing once it's
+  //     `ready` gives the best experience — that's the eager-stitch payoff.
+  //   * A 1-song queue has no transitions/mix, so it can start as soon as
+  //     the song is playable.
+  //   * If a song or the mix fails, the mix never goes `ready`; the
+  //     "Play now (hard cut)" button below is the always-available fallback
+  //     (the player upgrades to the stitched mix if it lands later).
+  const headPlayable =
+    songs.length > 0 && PLAYABLE_STATUSES.includes(songs[0].status);
+  const mixReady = mix?.status === "ready";
+  const readyTransitions = mixPlans.filter((p) => p.status === "ready").length;
+  const canAutoStart = mixReady || (!hasTransitions && headPlayable);
 
   useEffect(() => {
-    if (gateMet) {
-      // Small delay to let the user see the gate flip green before redirect.
+    if (canAutoStart) {
+      // Small delay so the user sees the gate flip green before redirect.
       const t = setTimeout(() => router.push("/player"), 750);
       return () => clearTimeout(t);
     }
-  }, [gateMet, router]);
+  }, [canAutoStart, router]);
+
+  const transitionCount = mixPlans.length || Math.max(0, items.length - 1);
+  const allSongsReady =
+    songs.length > 0 && songs.every((s) => s.status === "ready");
+  const gateText = canAutoStart
+    ? "Ready — starting playback…"
+    : mix?.status === "rendering" || mix?.status === "pending"
+      ? "Rendering continuous mix…"
+      : mix?.status === "failed"
+        ? "Mix render failed — hard-cut playback available"
+        : allSongsReady
+          ? "All songs ready — preparing the mix…"
+          : "Processing songs…";
+
+  const songTitleById = (id: string) =>
+    songs.find((s) => s.id === id)?.title ?? "—";
 
   if (queue.isLoading) {
     return <p className="text-sm opacity-70">Loading…</p>;
@@ -256,17 +311,33 @@ export function ProcessingView() {
 
   return (
     <div className="flex flex-col gap-6">
-      <div className="border rounded p-4 flex items-center gap-4">
-        <div className="flex-1">
-          <p className="text-sm opacity-70">Playback gate</p>
-          <p className="font-medium">
-            {gateMet
-              ? "Ready — starting playback…"
-              : `Waiting for ${analyzedHeadCount}/${requiredAnalyzed} songs analyzed`}
-          </p>
+      <div className="border rounded p-4 flex flex-col gap-3">
+        <div className="flex items-center gap-4">
+          <div className="flex-1">
+            <p className="text-sm opacity-70">Playback gate</p>
+            <p className="font-medium">{gateText}</p>
+          </div>
+          {hasTransitions && (
+            <div className="text-2xl tabular-nums">
+              {readyTransitions}/{transitionCount}
+            </div>
+          )}
         </div>
-        <div className="text-2xl tabular-nums">
-          {analyzedHeadCount}/{requiredAnalyzed}
+        <div className="flex items-center gap-3">
+          <button
+            type="button"
+            onClick={() => router.push("/player")}
+            disabled={!headPlayable}
+            className="px-4 py-2 border rounded text-sm hover:bg-black/5 dark:hover:bg-white/10 disabled:opacity-40"
+          >
+            {mixReady ? "Open player" : "Play now (hard cut)"}
+          </button>
+          {hasTransitions && !mixReady && (
+            <span className="text-xs opacity-60">
+              The mix keeps rendering in the background — the player upgrades
+              to it automatically when it&apos;s ready.
+            </span>
+          )}
         </div>
       </div>
 
@@ -338,6 +409,84 @@ export function ProcessingView() {
           );
         })}
       </ul>
+
+      {hasTransitions && (
+        <section className="flex flex-col gap-2">
+          <p className="text-xs opacity-60">
+            Transitions ({readyTransitions}/{transitionCount} rendered)
+          </p>
+          <ul className="flex flex-col gap-2">
+            {mixPlans.map((mp, idx) => {
+              const label =
+                mp.status === "rendering"
+                  ? "rendering"
+                  : mp.status === "ready"
+                    ? "ready"
+                    : mp.status === "failed"
+                      ? "failed"
+                      : allSongsReady
+                        ? "queued"
+                        : "waiting for songs";
+              const pct =
+                mp.status === "ready"
+                  ? 100
+                  : mp.status === "rendering"
+                    ? 55
+                    : mp.status === "failed"
+                      ? 100
+                      : 8;
+              const badge =
+                mp.status === "failed"
+                  ? "bg-red-500/20"
+                  : mp.status === "ready"
+                    ? "bg-green-500/20"
+                    : "bg-yellow-500/20";
+              return (
+                <li
+                  key={mp.id}
+                  className="border rounded p-3 flex flex-col gap-2"
+                >
+                  <div className="flex items-center gap-3">
+                    <span className="opacity-60 w-6 tabular-nums">
+                      {idx + 1}→{idx + 2}
+                    </span>
+                    <div className="flex-1 min-w-0">
+                      <p className="text-sm truncate">
+                        {songTitleById(mp.from_song_id)}{" "}
+                        <span className="opacity-50">→</span>{" "}
+                        {songTitleById(mp.to_song_id)}
+                      </p>
+                      {mp.status === "failed" && mp.error_text && (
+                        <p className="text-xs text-red-500 truncate">
+                          {mp.error_text}
+                        </p>
+                      )}
+                    </div>
+                    <span className={`text-xs px-2 py-1 rounded ${badge}`}>
+                      {label}
+                    </span>
+                  </div>
+                  <div className="h-1 bg-black/10 dark:bg-white/10 rounded overflow-hidden">
+                    <div
+                      className={
+                        mp.status === "failed"
+                          ? "h-full bg-red-500"
+                          : "h-full bg-green-500 transition-all"
+                      }
+                      style={{ width: `${pct}%` }}
+                    />
+                  </div>
+                </li>
+              );
+            })}
+          </ul>
+          {mix?.status === "failed" && mix.error_text && (
+            <p className="text-xs text-red-500">
+              Continuous mix failed: {mix.error_text}
+            </p>
+          )}
+        </section>
+      )}
     </div>
   );
 }

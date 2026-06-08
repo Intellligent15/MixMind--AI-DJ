@@ -173,12 +173,49 @@ export type VocalSafeRegionsResponse = {
 
 export type QueueRenderStatus = "pending" | "rendering" | "ready" | "failed";
 
+// Stitched-mix output timeline (Phase 10). Times are seconds in the
+// continuous-mix playback timeline, so they map directly onto the player's
+// playhead position.
+export type MixTimelineSong = {
+  index: number;
+  song_id: string;
+  title: string | null;
+  artist: string | null;
+  start: number;
+  end: number;
+};
+
+export type MixTimelineStemRoute = {
+  stem: string | null;
+  from: string | null; // "A" | "B"
+  to: string | null; // "A" | "B"
+};
+
+export type MixTimelineTransition = {
+  index: number;
+  from_song_id: string;
+  to_song_id: string;
+  start: number;
+  end: number;
+  label: string; // human-readable technique, e.g. "Filter sweep"
+  stems: MixTimelineStemRoute[];
+  effects: string[];
+  reasoning: string | null;
+};
+
+export type MixTimeline = {
+  duration: number;
+  songs: MixTimelineSong[];
+  transitions: MixTimelineTransition[];
+};
+
 export type QueueRender = {
   id: string;
   queue_id: string;
   rendered_audio_path: string | null;
   status: QueueRenderStatus;
   error_text: string | null;
+  timeline: MixTimeline | null;
   created_at: string;
   updated_at: string;
 };

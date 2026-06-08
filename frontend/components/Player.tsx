@@ -120,6 +120,61 @@ export function Player() {
   const isMixReady = mixData?.status === "ready";
   const activeMode = isMixReady ? playMode : "queue";
 
+  const songById = useMemo(
+    () => Object.fromEntries(songs.map((s) => [s.id, s])),
+    [songs]
+  );
+
+  // Phase 10 transition indicator + upcoming preview. The stitched-mix
+  // timeline maps output-seconds → which song leads and which transition is
+  // active, so we derive both straight from the playhead `position`.
+  const timeline = mixData?.timeline ?? null;
+  const mixCurrentSong = useMemo(() => {
+    if (activeMode !== "mix" || !timeline?.songs.length) return null;
+    const found = timeline.songs.find(
+      (s) => position >= s.start && position < s.end
+    );
+    if (found) return found;
+    // Past the last boundary (or a sub-second gap) → clamp to nearest end.
+    const last = timeline.songs[timeline.songs.length - 1];
+    return position >= last.start ? last : timeline.songs[0];
+  }, [activeMode, timeline, position]);
+  const mixUpcomingSong = useMemo(() => {
+    if (!timeline || !mixCurrentSong) return null;
+    return (
+      timeline.songs.find((s) => s.index === mixCurrentSong.index + 1) ?? null
+    );
+  }, [timeline, mixCurrentSong]);
+  const activeTransition = useMemo(() => {
+    if (activeMode !== "mix" || !timeline) return null;
+    return (
+      timeline.transitions.find(
+        (t) => position >= t.start && position < t.end
+      ) ?? null
+    );
+  }, [activeMode, timeline, position]);
+
+  // Auto-stitch backstop. The backend fires the eager stitch when the queue
+  // finishes processing, so the mix row normally already exists by the time
+  // the player mounts. This covers the gaps: no row at all, or a prior
+  // render failed, while every song is ready. Fires at most once.
+  const stitchRequestedRef = useRef(false);
+  useEffect(() => {
+    const qid = queueQuery.data?.id;
+    if (!qid || songs.length < 2) return;
+    if (!songs.every((s) => s.status === "ready")) return;
+    if (stitchRequestedRef.current) return;
+    if (mixData == null || mixData.status === "failed") {
+      stitchRequestedRef.current = true;
+      api
+        .stitchQueue(qid)
+        .then(() => mixQuery.refetch())
+        .catch(() => {
+          stitchRequestedRef.current = false;
+        });
+    }
+  }, [songs, mixData, queueQuery.data?.id, mixQuery]);
+
   const handleRenderMix = async () => {
     if (!queueQuery.data) return;
     try {
@@ -357,17 +412,37 @@ export function Player() {
       )}
 
       {activeMode === "mix" ? (
-        <section className="border rounded p-4 flex flex-col gap-2">
-          <p className="text-xs opacity-60">Now playing</p>
-          <p className="font-semibold truncate text-lg">Full DJ Mix</p>
-          <p className="text-sm opacity-70">{songs.length} tracks</p>
-          <a
-            href={api.queueMixAudioUrl(queueQuery.data.id)}
-            download="mix.flac"
-            className="text-blue-400 text-sm hover:underline mt-2 self-start"
-          >
-            Download FLAC
-          </a>
+        <section className="border rounded p-4 flex gap-4">
+          {mixCurrentSong &&
+            songById[mixCurrentSong.song_id]?.thumbnail_url && (
+              // eslint-disable-next-line @next/next/no-img-element
+              <img
+                src={songById[mixCurrentSong.song_id].thumbnail_url!}
+                alt=""
+                className="w-32 h-20 object-cover rounded"
+              />
+            )}
+          <div className="flex-1 min-w-0 flex flex-col gap-1">
+            <p className="text-xs opacity-60">
+              Now playing · continuous mix
+              {mixCurrentSong
+                ? ` · ${mixCurrentSong.index + 1}/${songs.length}`
+                : ""}
+            </p>
+            <p className="font-semibold truncate text-lg">
+              {mixCurrentSong?.title ?? "Full DJ Mix"}
+            </p>
+            <p className="text-sm opacity-70 truncate">
+              {mixCurrentSong?.artist ?? `${songs.length} tracks`}
+            </p>
+            <a
+              href={api.queueMixAudioUrl(queueQuery.data.id)}
+              download="mix.flac"
+              className="text-blue-400 text-sm hover:underline mt-2 self-start"
+            >
+              Download FLAC
+            </a>
+          </div>
         </section>
       ) : (
         <section className="border rounded p-4 flex gap-4">
@@ -385,6 +460,29 @@ export function Player() {
             <p className="text-sm opacity-70 truncate">{current.artist ?? "—"}</p>
             <p className="text-xs opacity-60 mt-1">status: {displayStatus(current)}</p>
           </div>
+        </section>
+      )}
+
+      {activeMode === "mix" && activeTransition && (
+        <section className="border border-blue-500/40 bg-blue-500/10 rounded p-3 flex flex-col gap-1">
+          <p className="text-xs opacity-70">Transition in progress</p>
+          <p className="font-medium">{activeTransition.label}</p>
+          {activeTransition.stems.length > 0 && (
+            <p className="text-xs opacity-80">
+              {activeTransition.stems
+                .map((s) => `${s.stem} ${s.from}→${s.to}`)
+                .join(" · ")}
+            </p>
+          )}
+          {activeTransition.effects.length > 0 && (
+            <p className="text-xs opacity-60">
+              + {activeTransition.effects.join(", ")}
+            </p>
+          )}
+          <p className="text-[11px] opacity-50">
+            A = {songById[activeTransition.from_song_id]?.title ?? "outgoing"} ·
+            B = {songById[activeTransition.to_song_id]?.title ?? "incoming"}
+          </p>
         </section>
       )}
 
@@ -438,6 +536,26 @@ export function Player() {
             <p className="font-medium truncate">{upcoming.title}</p>
             <p className="text-xs opacity-70 truncate">
               {upcoming.artist ?? "—"} · {displayStatus(upcoming)}
+            </p>
+          </div>
+        </section>
+      )}
+
+      {activeMode === "mix" && mixUpcomingSong && (
+        <section className="border rounded p-3 flex items-center gap-3 opacity-80">
+          <span className="text-xs opacity-60">Next up</span>
+          {songById[mixUpcomingSong.song_id]?.thumbnail_url && (
+            // eslint-disable-next-line @next/next/no-img-element
+            <img
+              src={songById[mixUpcomingSong.song_id].thumbnail_url!}
+              alt=""
+              className="w-16 h-10 object-cover rounded"
+            />
+          )}
+          <div className="flex-1 min-w-0">
+            <p className="font-medium truncate">{mixUpcomingSong.title}</p>
+            <p className="text-xs opacity-70 truncate">
+              {mixUpcomingSong.artist ?? "—"}
             </p>
           </div>
         </section>
