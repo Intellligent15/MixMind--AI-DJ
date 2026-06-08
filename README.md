@@ -97,6 +97,7 @@ Stop everything:
 ```bash
 # Ctrl‑C the worker, then:
 ./stop-dev.sh
+docker compose down -v # To full wipe past data from container
 ```
 
 ## Using the app
