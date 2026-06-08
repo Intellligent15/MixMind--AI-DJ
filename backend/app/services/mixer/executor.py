@@ -653,7 +653,16 @@ def render(
         song = fx["song"]
         tool = fx["tool"]
         target = a_stems if song == "A" else b_stems_raw
-        for name in ("vocals", "drums", "bass", "other"):
+        # volume_fade may target a single stem (true EQ-kill, e.g. drop A's
+        # bass early); every other pre-fx applies to the whole song. An
+        # invalid/absent stem falls back to all four.
+        fx_stem = fx.get("stem")
+        names = (
+            (fx_stem,)
+            if tool == "volume_fade" and fx_stem in ("vocals", "drums", "bass", "other")
+            else ("vocals", "drums", "bass", "other")
+        )
+        for name in names:
             if tool == "filter_sweep":
                 target[name] = _apply_filter_sweep(target[name], fx)
             elif tool == "echo_out":

@@ -1308,3 +1308,63 @@ def test_render_new_dsp_tool_missing_key_is_noop_not_crash():
         result = render(plan, a, b)  # must not raise
     decoded, _ = sf.read(io.BytesIO(result.wav_bytes), always_2d=True)
     assert decoded.shape[0] > 0
+
+
+def test_volume_fade_targets_single_stem_when_stem_set():
+    """volume_fade with `stem` kills only that stem (EQ-kill); the others are
+    untouched. A's bass is faded to 0 before the seam; at the seam the bass
+    contribution is gone but vocals/other still carry A's level."""
+    a = _inputs(prefix="A")
+    b = _inputs(prefix="B")
+    sec_per_bar = 2.0  # 120bpm
+    plan = [
+        {"tool": "set_transition_window",
+         "from_song_time_start": sec_per_bar, "to_song_time_start": 0.0,
+         "duration_bars": 1},
+        # Kill A's bass over the first bar (done by the seam at 2.0s).
+        {"tool": "volume_fade", "song": "A", "stem": "bass",
+         "start_time": 0.0, "duration_bars": 1.0,
+         "start_gain": 1.0, "end_gain": 0.0, "bpm": 120.0},
+        *[
+            {"tool": "crossfade_stem", "stem": s,
+             "from_song": "A", "to_song": "B",
+             "start_bar": 0, "duration_bars": 1, "curve": "linear"}
+            for s in ("vocals", "drums", "bass", "other")
+        ],
+    ]
+    with patch("soundfile.read", side_effect=_fake_sf_read()):
+        result = render(plan, a, b)
+    decoded, _ = sf.read(io.BytesIO(result.wav_bytes), always_2d=True)
+    # Pre-seam A sum is vocals+drums+bass+other = 0.2-0.2+0.2+0.2 = 0.4.
+    # With bass killed by the seam, the just-before-seam A sum drops by bass's
+    # 0.2 to ~0.2 (vocals 0.2 - drums 0.2 + bass 0.0 + other 0.2).
+    seam = int(round(sec_per_bar * SR))
+    just_before = decoded[seam - 200, 0]
+    assert just_before == pytest.approx(0.2, abs=1e-3)
+
+
+def test_volume_fade_whole_song_when_no_stem():
+    """Without `stem`, volume_fade fades the entire song (all four stems)."""
+    a = _inputs(prefix="A")
+    b = _inputs(prefix="B")
+    sec_per_bar = 2.0
+    plan = [
+        {"tool": "set_transition_window",
+         "from_song_time_start": sec_per_bar, "to_song_time_start": 0.0,
+         "duration_bars": 1},
+        {"tool": "volume_fade", "song": "A",
+         "start_time": 0.0, "duration_bars": 1.0,
+         "start_gain": 1.0, "end_gain": 0.0, "bpm": 120.0},
+        *[
+            {"tool": "crossfade_stem", "stem": s,
+             "from_song": "A", "to_song": "B",
+             "start_bar": 0, "duration_bars": 1, "curve": "linear"}
+            for s in ("vocals", "drums", "bass", "other")
+        ],
+    ]
+    with patch("soundfile.read", side_effect=_fake_sf_read()):
+        result = render(plan, a, b)
+    decoded, _ = sf.read(io.BytesIO(result.wav_bytes), always_2d=True)
+    seam = int(round(sec_per_bar * SR))
+    # Whole A faded to silence by the seam.
+    assert decoded[seam - 200, 0] == pytest.approx(0.0, abs=1e-3)

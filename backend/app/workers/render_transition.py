@@ -496,7 +496,7 @@ def render_transition(mix_plan_id: str) -> str | None:
             {"tool": "swap_stem", "from_song": "str", "to_song": "str", "stem": "str (vocals|drums|bass|other)", "time": "float (output-timeline seconds)"},
             {"tool": "apply_reverb", "song": "str", "start_time": "float", "tail_duration_bars": "float", "wet_level": "float (0..1)", "bpm": "float"},
             {"tool": "turntable_stop", "song": "str", "start_time": "float", "duration_bars": "float", "bpm": "float"},
-            {"tool": "volume_fade", "song": "str", "start_time": "float", "duration_bars": "float", "start_gain": "float", "end_gain": "float", "bpm": "float"},
+            {"tool": "volume_fade", "song": "str", "start_time": "float", "duration_bars": "float", "start_gain": "float", "end_gain": "float", "bpm": "float", "stem": "str (optional: vocals|drums|bass|other — restrict the fade to one stem; omit to fade the whole song)"},
         ], indent=2)
 
         provider = get_llm_provider()

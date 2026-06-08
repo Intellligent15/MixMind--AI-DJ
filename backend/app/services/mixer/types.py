@@ -8,7 +8,7 @@ Stems rows) — keeps the executor pure (no SQLAlchemy import).
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal, TypedDict
+from typing import Literal, NotRequired, TypedDict
 
 # Tool-call dicts as the LLM (Phase 9) and our hand-built plan generator
 # (Phase 7) both emit. The mixer executor walks these in order.
@@ -216,8 +216,10 @@ class TurntableStop(TypedDict):
 class VolumeFade(TypedDict):
     """Standalone volume automation curve.
     
-    Allows fading a specific song's stems in or out independently
-    of the main A->B crossfade (e.g. killing the bass early).
+    Fades a song's volume in or out independently of the main A->B
+    crossfade. By default it applies to the whole song; set `stem` to target
+    a single stem (a true EQ-kill, e.g. drop A's bass 4 bars early so B's
+    bass hits harder on the drop).
     """
     tool: Literal["volume_fade"]
     song: SongRef
@@ -226,6 +228,8 @@ class VolumeFade(TypedDict):
     start_gain: float
     end_gain: float
     bpm: float
+    # Optional: restrict the fade to one stem. Omit to fade the whole song.
+    stem: NotRequired[StemName]
 
 
 # Phase 9 vocabulary now includes the four DSP additions
