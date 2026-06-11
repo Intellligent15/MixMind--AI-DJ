@@ -19,5 +19,11 @@ class MixPlanRead(BaseModel):
     rendered_audio_path: str | None
     status: MixPlanStatus
     error_text: str | None
+    plan_source: str | None = None
+    style: str | None = None
+    rationale: str | None = None
+    style_hint: str | None = None
+    style_override: str | None = None
+    reroll_nonce: int = 0
     created_at: datetime
     updated_at: datetime
