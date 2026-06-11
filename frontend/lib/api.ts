@@ -159,8 +159,21 @@ export type MixPlan = {
   rendered_audio_path: string | null;
   status: MixPlanStatus;
   error_text: string | null;
+  // Planner v2 telemetry & controls
+  plan_source: string | null;
+  style: string | null;
+  rationale: string | null;
+  style_hint: string | null;
+  style_override: string | null;
+  reroll_nonce: number;
   created_at: string;
   updated_at: string;
+};
+
+export type TransitionStyleInfo = {
+  id: string;
+  description: string;
+  duration_choices: number[];
 };
 
 export type VocalSafeRegion = {
@@ -290,6 +303,16 @@ export const api = {
     request<MixPlan[]>(`/api/queues/${queueId}/mix_plans`),
   triggerRenderMixPlan: (id: string) =>
     request<void>(`/api/mix_plans/${id}/render`, { method: "POST" }),
+  // Throw away a pair's plan and generate a fresh one. Pass a style id to
+  // pin the transition archetype, or "auto" / undefined to let the LLM
+  // choose. Re-renders the pair and re-stitches the mix.
+  rerollMixPlan: (id: string, style?: string) =>
+    request<{ status: string; reroll_nonce: number }>(
+      `/api/mix_plans/${id}/reroll`,
+      { method: "POST", body: JSON.stringify({ style: style ?? null }) }
+    ),
+  listTransitionStyles: () =>
+    request<TransitionStyleInfo[]>(`/api/transition_styles`),
   mixPlanAudioUrl: (id: string) => `${API_BASE}/api/mix_plans/${id}/audio`,
 
   stitchQueue: (queueId: string) =>
