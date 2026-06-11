@@ -16,7 +16,13 @@ from app.models import (
 )
 from app.api.songs import _stream_audio_response
 from app.schemas import MixPlanRead
+from app.services.mixer.decision import (
+    STYLE_DESCRIPTIONS,
+    STYLE_DURATION_CHOICES,
+    TransitionStyle,
+)
 from app.workers import celery_app
+from pydantic import BaseModel
 
 RENDER_TASK = "app.workers.render_transition.render_transition"
 RENDER_GATE = (
@@ -157,3 +163,69 @@ async def get_mix_plan_audio(
             detail=f"audio not available (status={plan.status.value})",
         )
     return await _stream_audio_response(plan.rendered_audio_path, "audio/wav", range)
+
+class RerollRequest(BaseModel):
+    """Optional style pin for the re-roll. Omit (or null) to let the LLM
+    choose freely; "auto" clears a previous pin."""
+
+    style: str | None = None
+
+
+@router.get("/api/transition_styles")
+def list_transition_styles():
+    """The archetype library, for the UI's per-transition style picker."""
+    return [
+        {
+            "id": s.value,
+            "description": STYLE_DESCRIPTIONS[s],
+            "duration_choices": list(STYLE_DURATION_CHOICES[s]),
+        }
+        for s in TransitionStyle
+    ]
+
+
+@router.post(
+    "/api/mix_plans/{mix_plan_id}/reroll",
+    status_code=status.HTTP_202_ACCEPTED,
+)
+def reroll_mix_plan(
+    mix_plan_id: uuid.UUID,
+    body: RerollRequest | None = None,
+    db: Session = Depends(get_db),
+):
+    """Throw away this pair's plan and generate a fresh one.
+
+    Bumps the row's reroll_nonce (part of the LLM cache key, so the new
+    plan is genuinely re-sampled rather than a cache hit), optionally
+    pins the transition style, then re-renders the pair and re-stitches
+    the queue (only this pair re-renders; ready siblings are skipped).
+    """
+    row = db.get(MixPlan, mix_plan_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="mix plan not found")
+    if row.status == MixPlanStatus.rendering:
+        raise HTTPException(status_code=409, detail="mix plan is rendering")
+
+    style = body.style if body else None
+    if style in (None, "", "auto"):
+        row.style_override = None
+    else:
+        legal = {s.value for s in TransitionStyle}
+        if style not in legal:
+            raise HTTPException(
+                status_code=422,
+                detail=f"unknown style {style!r}; one of {sorted(legal)} or 'auto'",
+            )
+        row.style_override = style
+
+    row.reroll_nonce = (row.reroll_nonce or 0) + 1
+    row.plan_json = None
+    row.rendered_audio_path = None
+    row.status = MixPlanStatus.pending
+    row.error_text = None
+    db.commit()
+
+    from app.workers.auto_stitch import reset_and_dispatch_stitch
+
+    reset_and_dispatch_stitch(row.queue_id, db)
+    return {"status": "accepted", "reroll_nonce": row.reroll_nonce}
