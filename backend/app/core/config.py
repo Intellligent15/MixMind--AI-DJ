@@ -43,6 +43,20 @@ class Settings(BaseSettings):
     do_inference_model: str = "openai-gpt-oss-120b"
     llm_provider: str = "gemini"  # gemini | groq | digitalocean
     use_llm_planner: bool = True
+    # Planner architecture. "v2" (default): the LLM picks from
+    # pre-validated seam candidates + a transition-style archetype and a
+    # deterministic expander computes every timestamp. "legacy": the v1
+    # free-form tool-call prompt (now with repair-not-reject validation).
+    planner_version: str = "v2"  # v2 | legacy
+    # Sampling temperature for plan generation. Re-rolls bump a nonce in
+    # the cache key, so >0 keeps re-rolls genuinely different.
+    llm_temperature: float = 0.7
+
+    # Section detector backend. "allin1" uses the All-In-One music
+    # structure model (real verse/chorus labels + neural beats) when the
+    # optional `allin1` package is installed, falling back to librosa
+    # otherwise. See app/services/analysis/sections/allin1_detector.py.
+    section_detector: str = "librosa_laplacian"  # librosa_laplacian | allin1
 
     # Path to a Netscape-format cookies.txt that yt-dlp passes to YouTube.
     # Required on cloud hosts (the droplet) — YouTube's anti-bot system

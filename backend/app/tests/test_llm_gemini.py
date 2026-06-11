@@ -19,7 +19,7 @@ async def test_gemini_provider_caching():
     mock_generate = MagicMock()
     mock_client.models.generate_content = mock_generate
 
-    with patch("app.services.llm.gemini.get_storage", return_value=mock_storage):
+    with patch("app.services.llm.base.get_storage", return_value=mock_storage):
         with patch("app.services.llm.gemini.genai.Client", return_value=mock_client):
             provider = GeminiProvider(api_key="fake")
             plan = await provider.plan_transition(
@@ -46,7 +46,7 @@ async def test_gemini_provider_invalid_json_raises():
     mock_client = MagicMock()
     mock_client.models.generate_content.return_value = mock_response
 
-    with patch("app.services.llm.gemini.get_storage", return_value=mock_storage):
+    with patch("app.services.llm.base.get_storage", return_value=mock_storage):
         with patch("app.services.llm.gemini.genai.Client", return_value=mock_client):
             provider = GeminiProvider(api_key="fake")
             with pytest.raises(ValueError, match="Invalid JSON"):
@@ -65,10 +65,10 @@ async def test_gemini_provider_non_list_raises():
     mock_client = MagicMock()
     mock_client.models.generate_content.return_value = mock_response
 
-    with patch("app.services.llm.gemini.get_storage", return_value=mock_storage):
+    with patch("app.services.llm.base.get_storage", return_value=mock_storage):
         with patch("app.services.llm.gemini.genai.Client", return_value=mock_client):
             provider = GeminiProvider(api_key="fake")
-            with pytest.raises(ValueError, match="Expected JSON list"):
+            with pytest.raises(ValueError, match="Expected JSON object with"):
                 await provider.plan_transition({}, {}, "Tools desc")
             mock_storage.write.assert_not_called()
 
@@ -87,7 +87,7 @@ async def test_gemini_provider_generation():
     mock_client = MagicMock()
     mock_client.models.generate_content.return_value = mock_response
 
-    with patch("app.services.llm.gemini.get_storage", return_value=mock_storage):
+    with patch("app.services.llm.base.get_storage", return_value=mock_storage):
         with patch("app.services.llm.gemini.genai.Client", return_value=mock_client):
             provider = GeminiProvider(api_key="fake")
             plan = await provider.plan_transition(

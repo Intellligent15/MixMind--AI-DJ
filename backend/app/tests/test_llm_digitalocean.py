@@ -18,7 +18,7 @@ async def test_do_provider_caching():
     mock_create = MagicMock()
     mock_client.chat.completions.create = mock_create
 
-    with patch("app.services.llm.digitalocean.get_storage", return_value=mock_storage):
+    with patch("app.services.llm.base.get_storage", return_value=mock_storage):
         with patch("app.services.llm.digitalocean.OpenAI", return_value=mock_client):
             provider = DigitalOceanProvider(api_key="fake")
             plan = await provider.plan_transition(
@@ -47,7 +47,7 @@ async def test_do_provider_generation_unwraps_plan_key():
     mock_client = MagicMock()
     mock_client.chat.completions.create.return_value = mock_response
 
-    with patch("app.services.llm.digitalocean.get_storage", return_value=mock_storage):
+    with patch("app.services.llm.base.get_storage", return_value=mock_storage):
         with patch("app.services.llm.digitalocean.OpenAI", return_value=mock_client):
             provider = DigitalOceanProvider(api_key="fake")
             plan = await provider.plan_transition(
@@ -81,7 +81,7 @@ async def test_do_provider_accepts_raw_list():
     mock_client = MagicMock()
     mock_client.chat.completions.create.return_value = mock_response
 
-    with patch("app.services.llm.digitalocean.get_storage", return_value=mock_storage):
+    with patch("app.services.llm.base.get_storage", return_value=mock_storage):
         with patch("app.services.llm.digitalocean.OpenAI", return_value=mock_client):
             provider = DigitalOceanProvider(api_key="fake")
             plan = await provider.plan_transition({}, {}, "Tools desc")
@@ -105,7 +105,7 @@ async def test_do_provider_recovers_from_stray_leading_brace():
     mock_client = MagicMock()
     mock_client.chat.completions.create.return_value = mock_response
 
-    with patch("app.services.llm.digitalocean.get_storage", return_value=mock_storage):
+    with patch("app.services.llm.base.get_storage", return_value=mock_storage):
         with patch("app.services.llm.digitalocean.OpenAI", return_value=mock_client):
             provider = DigitalOceanProvider(api_key="fake")
             plan = await provider.plan_transition({}, {}, "Tools desc")
@@ -122,7 +122,7 @@ async def test_do_provider_invalid_json_raises():
     mock_client = MagicMock()
     mock_client.chat.completions.create.return_value = mock_response
 
-    with patch("app.services.llm.digitalocean.get_storage", return_value=mock_storage):
+    with patch("app.services.llm.base.get_storage", return_value=mock_storage):
         with patch("app.services.llm.digitalocean.OpenAI", return_value=mock_client):
             provider = DigitalOceanProvider(api_key="fake")
             with pytest.raises(ValueError, match="Invalid JSON"):
@@ -141,9 +141,9 @@ async def test_do_provider_unexpected_shape_raises():
     mock_client = MagicMock()
     mock_client.chat.completions.create.return_value = mock_response
 
-    with patch("app.services.llm.digitalocean.get_storage", return_value=mock_storage):
+    with patch("app.services.llm.base.get_storage", return_value=mock_storage):
         with patch("app.services.llm.digitalocean.OpenAI", return_value=mock_client):
             provider = DigitalOceanProvider(api_key="fake")
-            with pytest.raises(ValueError, match="Expected JSON object"):
+            with pytest.raises(ValueError, match="Expected JSON object with"):
                 await provider.plan_transition({}, {}, "Tools desc")
             mock_storage.write.assert_not_called()

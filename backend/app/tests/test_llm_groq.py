@@ -18,7 +18,7 @@ async def test_groq_provider_caching():
     mock_create = MagicMock()
     mock_client.chat.completions.create = mock_create
 
-    with patch("app.services.llm.groq.get_storage", return_value=mock_storage):
+    with patch("app.services.llm.base.get_storage", return_value=mock_storage):
         with patch("app.services.llm.groq.Groq", return_value=mock_client):
             provider = GroqProvider(api_key="fake")
             plan = await provider.plan_transition(
@@ -47,7 +47,7 @@ async def test_groq_provider_generation_unwraps_plan_key():
     mock_client = MagicMock()
     mock_client.chat.completions.create.return_value = mock_response
 
-    with patch("app.services.llm.groq.get_storage", return_value=mock_storage):
+    with patch("app.services.llm.base.get_storage", return_value=mock_storage):
         with patch("app.services.llm.groq.Groq", return_value=mock_client):
             provider = GroqProvider(api_key="fake")
             plan = await provider.plan_transition(
@@ -81,7 +81,7 @@ async def test_groq_provider_accepts_raw_list():
     mock_client = MagicMock()
     mock_client.chat.completions.create.return_value = mock_response
 
-    with patch("app.services.llm.groq.get_storage", return_value=mock_storage):
+    with patch("app.services.llm.base.get_storage", return_value=mock_storage):
         with patch("app.services.llm.groq.Groq", return_value=mock_client):
             provider = GroqProvider(api_key="fake")
             plan = await provider.plan_transition({}, {}, "Tools desc")
@@ -98,7 +98,7 @@ async def test_groq_provider_invalid_json_raises():
     mock_client = MagicMock()
     mock_client.chat.completions.create.return_value = mock_response
 
-    with patch("app.services.llm.groq.get_storage", return_value=mock_storage):
+    with patch("app.services.llm.base.get_storage", return_value=mock_storage):
         with patch("app.services.llm.groq.Groq", return_value=mock_client):
             provider = GroqProvider(api_key="fake")
             with pytest.raises(ValueError, match="Invalid JSON"):
@@ -117,7 +117,7 @@ async def test_groq_provider_unexpected_shape_raises():
     mock_client = MagicMock()
     mock_client.chat.completions.create.return_value = mock_response
 
-    with patch("app.services.llm.groq.get_storage", return_value=mock_storage):
+    with patch("app.services.llm.base.get_storage", return_value=mock_storage):
         with patch("app.services.llm.groq.Groq", return_value=mock_client):
             provider = GroqProvider(api_key="fake")
             with pytest.raises(ValueError, match="Expected JSON object"):
