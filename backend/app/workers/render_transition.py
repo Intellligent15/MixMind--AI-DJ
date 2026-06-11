@@ -6,18 +6,35 @@ UPDATE WHERE status=pending|failed|ready transitions the row to
 None.
 
 `plan_json` is generated lazily on the first render so we don't burn
-work for plans the user never asks to render — and so Phase 9's LLM
-call (which replaces this generator) also fires lazily.
+work for plans the user never asks to render.
+
+Planner architecture (settings.planner_version):
+
+* "v2" (default) — `planner_v2.build_plan_v2`: pre-computed seam
+  candidates + an LLM-chosen transition archetype, deterministically
+  expanded. The LLM sees song *identity* (title/artist), section
+  structure, and pre-computed pair facts; it never does timestamp math.
+* "legacy" — the v1 free-form tool-call prompt, now run through
+  `validation.repair_plan` (normalize song refs, clamp seams, convert
+  forbidden permanent pitch shifts) before the final `validate_plan`
+  gate, so a fixable slip no longer discards a musical plan.
+
+Either way the worker records `plan_source` / `style` / `rationale` on
+the row — a fallback is never silent again.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import tempfile
 import uuid
+from pathlib import Path
 
 from sqlalchemy import select, update
 
+from app.core.config import settings
 from app.core.db import SessionLocal
 from app.models import (
     Analysis,
@@ -30,14 +47,18 @@ from app.models import (
 )
 from app.models.lyrics import Lyrics, LyricsAlignmentStatus
 from app.services.llm import get_llm_provider
-from app.core.config import settings
+from app.services.mixer.candidates import enrich_sections, max_seam_time
 from app.services.mixer.executor import render
 from app.services.mixer.plan import build_pair_plan
-from app.services.mixer.types import (
-    AnalysisBundle,
-    SongRenderInputs,
+from app.services.mixer.planner_v2 import PlanOutcome, SongMeta, build_plan_v2
+from app.services.mixer.types import AnalysisBundle, SongRenderInputs
+from app.services.mixer.validation import (
+    enforce_revert_after_crossfade,
+    repair_plan,
+    validate_plan,
 )
 from app.services.storage import get_storage
+from app.services.vocal_safety.safety import vocal_safe_regions
 from app.workers import celery_app
 
 logger = logging.getLogger(__name__)
@@ -48,261 +69,11 @@ CLAIMABLE_STATUSES = (
     MixPlanStatus.ready,  # allows re-render of an already-rendered pair
 )
 
-# Permanent pitch shifts beyond ±2 semitones produce pyrubberband artifacts
-# that outweigh the harmonic benefit (see build_pair_plan's matching cap).
-# Enforced post-LLM since the model can still emit larger values despite
-# being told the limit in the system prompt.
-PERMANENT_PITCH_SHIFT_CAP = 2
-
-_LEGAL_TOOLS = {
-    "set_transition_window",
-    "set_tempo_ramp",
-    "temporary_pitch_shift",
-    "pitch_shift",
-    "crossfade_stem",
-    "filter_sweep",
-    "echo_out",
-    "loop_section",
-    "swap_stem",
-    "apply_reverb",
-    "turntable_stop",
-    "volume_fade",
-}
-_CANONICAL_STEMS = {"vocals", "drums", "bass", "other"}
-_LEGAL_SONG_REFS = {"A", "B"}
-# Which fields on each tool carry a song reference. The set is small
-# enough that an explicit map beats reflection over the TypedDicts.
-_SONG_FIELDS_BY_TOOL = {
-    "crossfade_stem": ("from_song", "to_song"),
-    "pitch_shift": ("song",),
-    "temporary_pitch_shift": ("song",),
-    "set_tempo_ramp": ("song",),
-    "filter_sweep": ("song",),
-    "echo_out": ("song",),
-    "loop_section": ("song",),
-    "swap_stem": ("from_song", "to_song"),
-    "apply_reverb": ("song",),
-    "turntable_stop": ("song",),
-    "volume_fade": ("song",),
-}
-
-
-def _validate_llm_plan(plan: list[dict]) -> None:
-    """Raise ValueError if the LLM's plan won't survive the executor.
-
-    Checks the same invariants the executor enforces, up-front, so a
-    malformed plan triggers the deterministic fallback instead of
-    failing the render and stranding the row in `failed`.
-    """
-    if not isinstance(plan, list) or not plan:
-        raise ValueError("LLM plan is not a non-empty list")
-    windows = [c for c in plan if c.get("tool") == "set_transition_window"]
-    if len(windows) != 1:
-        raise ValueError(f"expected 1 set_transition_window, got {len(windows)}")
-    stem_calls = [c for c in plan if c.get("tool") == "crossfade_stem"]
-    if len(stem_calls) != 4:
-        raise ValueError(f"expected 4 crossfade_stem calls, got {len(stem_calls)}")
-    if {c.get("stem") for c in stem_calls} != _CANONICAL_STEMS:
-        raise ValueError("crossfade_stem calls must cover vocals/drums/bass/other")
-    illegal = {c.get("tool") for c in plan} - _LEGAL_TOOLS
-    if illegal:
-        raise ValueError(f"illegal tools in plan: {sorted(illegal)}")
-    # Permanent pitch_shift detunes B for the rest of the song. When B is
-    # later mixed OUT as the next pair's A (which is never pitched), the
-    # stitch junction snaps it back to its real pitch — an audible glitch.
-    # The prompt forbids it; reject here too so a model slip falls back to
-    # the deterministic planner instead of shipping a detuned song. Use
-    # temporary_pitch_shift (which returns B to its key) for clashes.
-    if any(c.get("tool") == "pitch_shift" for c in plan):
-        raise ValueError(
-            "permanent pitch_shift is not allowed (breaks the next stitch "
-            "junction); use temporary_pitch_shift"
-        )
-    # Song refs must be the single-char strings the executor expects.
-    # Models like to drift to "Song A" / "Song B" if the prompt
-    # introduces the songs that way; reject so we fall back instead of
-    # silently rendering with a misnamed field.
-    for call in plan:
-        for field in _SONG_FIELDS_BY_TOOL.get(call.get("tool"), ()):
-            val = call.get(field)
-            if val not in _LEGAL_SONG_REFS:
-                raise ValueError(
-                    f"{call['tool']}.{field}={val!r} must be 'A' or 'B'"
-                )
-
-
-# Maximum crossfade length the deterministic planner uses; we treat
-# it as the worst case the LLM might ask for and reserve room for it.
-_MAX_CROSSFADE_BARS = 16
-# Safety buffer (seconds) past the crossfade end. Absorbs stem-WAV
-# drift vs `Song.duration_seconds` metadata (Demucs trims/pads, yt-dlp
-# rounds), which we've seen reach ~25s in pathological cases.
-_SEAM_SAFETY_SECONDS = 5.0
-
-
-def _max_seam_time(duration: float, bpm: float, time_signature: int) -> float:
-    """Latest seam time that leaves room for a full-length crossfade.
-
-    Returned in original-song seconds. Clamped to 0 if the song is
-    shorter than the reserved tail — in that case the validator will
-    reject any LLM plan and trigger the deterministic fallback (which
-    handles short songs via its own duration-bars clamp).
-    """
-    if not bpm or not duration:
-        return 0.0
-    sec_per_bar = (60.0 / bpm) * time_signature
-    return max(0.0, duration - _MAX_CROSSFADE_BARS * sec_per_bar - _SEAM_SAFETY_SECONDS)
-
-
-def _enrich_sections(sections: list[dict], energy_curve: list[float]) -> list[dict]:
-    """Annotate each section with mean energy, normalized 0..1 over the song.
-
-    The analyzer's section `label`s are opaque cluster IDs (`section_1`
-    …`section_5`) — they tell the LLM nothing about musical role. The
-    energy curve is sampled at 1 Hz, so its index ≈ second; we average
-    it over each section's span and normalize to the song's hottest
-    section. The LLM uses that to read structure (low = intro/breakdown,
-    ~1.0 = drop/chorus), pick a style, and place a musical seam. We drop
-    the meaningless `label` and the standalone energy_curve in favor of
-    this.
-    """
-    if not sections:
-        return []
-    n = len(energy_curve)
-    raw: list[float] = []
-    for s in sections:
-        lo = int(s["start"])
-        hi = max(lo + 1, int(round(s["end"])))
-        window = energy_curve[lo:hi] if n else []
-        raw.append(sum(window) / len(window) if window else 0.0)
-    peak = max(raw) or 1.0
-    return [
-        {"start": round(s["start"], 1), "end": round(s["end"], 1),
-         "energy": round(e / peak, 2)}
-        for s, e in zip(sections, raw)
-    ]
-
-
-def _validate_seam_headroom(
-    plan: list[dict], a: AnalysisBundle, b: AnalysisBundle
-) -> None:
-    """Reject plans whose seam + crossfade extends past either song.
-
-    The executor will gracefully clamp short overlaps, but a clamp from
-    ~30s down to ~4s produces a perceptually abrupt cut — defeats the
-    point of a DJ-style transition. Reject so we fall back to the
-    deterministic planner, which picks seams in A's outro section
-    (where there's room by construction).
-    """
-    window = next((c for c in plan if c.get("tool") == "set_transition_window"), None)
-    if window is None:
-        return  # _validate_llm_plan already rejected
-    duration_bars = window.get("duration_bars", 0)
-    from_t = window.get("from_song_time_start", 0.0)
-    to_t = window.get("to_song_time_start", 0.0)
-    sec_per_bar_a = (60.0 / a.bpm) * a.time_signature if a.bpm else 0.0
-    sec_per_bar_b = (60.0 / b.bpm) * b.time_signature if b.bpm else 0.0
-    crossfade_a = duration_bars * sec_per_bar_a
-    crossfade_b = duration_bars * sec_per_bar_b
-    if from_t + crossfade_a > a.duration - _SEAM_SAFETY_SECONDS:
-        raise ValueError(
-            f"A's seam leaves too little headroom: "
-            f"from={from_t:.1f}s + crossfade={crossfade_a:.1f}s > "
-            f"duration={a.duration:.1f}s - safety={_SEAM_SAFETY_SECONDS}s"
-        )
-    if to_t + crossfade_b > b.duration - _SEAM_SAFETY_SECONDS:
-        raise ValueError(
-            f"B's seam leaves too little headroom: "
-            f"to={to_t:.1f}s + crossfade={crossfade_b:.1f}s > "
-            f"duration={b.duration:.1f}s - safety={_SEAM_SAFETY_SECONDS}s"
-        )
-
-
-def _clamp_pitch_shifts(plan: list[dict]) -> list[dict]:
-    """Clamp permanent `pitch_shift.semitones` to ±PERMANENT_PITCH_SHIFT_CAP."""
-    clamped = []
-    for call in plan:
-        if call.get("tool") == "pitch_shift":
-            n = call.get("semitones", 0)
-            capped = max(-PERMANENT_PITCH_SHIFT_CAP, min(PERMANENT_PITCH_SHIFT_CAP, n))
-            if capped != n:
-                logger.warning(
-                    "render_transition: clamping LLM permanent pitch_shift %s -> %s",
-                    n, capped,
-                )
-                call = {**call, "semitones": capped}
-        clamped.append(call)
-    return clamped
-
-
-def _enforce_revert_after_crossfade(
-    plan: list[dict], b: AnalysisBundle
-) -> list[dict]:
-    """Defer B's tempo ramp / temporary-pitch return until AFTER the A→B
-    crossfade has fully finished.
-
-    B is auto-stretched to A's tempo (and held in A's key) at the seam, so it
-    is beat- and key-locked while A is audible. If the ramp or the pitch
-    return begins *during* the crossfade, B speeds up / flips back to its own
-    key while A is still playing — A's and B's beats drift apart for those
-    bars (the misalignment clears the moment the crossfade ends). We snap any
-    such start up to the crossfade end (the bar where the LAST stem finishes
-    its fade), so the revert only ever happens once the transition is done.
-
-    The deterministic planner already places both at the crossfade end, so
-    this is a no-op there; it's the guard that keeps an LLM plan honest
-    regardless of how well the model followed the prompt. A tempo ramp's
-    `end_time` slides by the same delta to preserve its length (clamped to B's
-    duration so the stretch map can't run past the audio)."""
-    window = next(
-        (c for c in plan if c.get("tool") == "set_transition_window"), None
-    )
-    if window is None:
-        return plan
-    sec_per_bar_b = (60.0 / b.bpm) * b.time_signature if b.bpm else 0.0
-    if sec_per_bar_b <= 0:
-        return plan
-
-    stem_calls = [c for c in plan if c.get("tool") == "crossfade_stem"]
-    if not stem_calls:
-        return plan
-    n_bars = max(
-        int(c.get("start_bar", 0)) + int(c.get("duration_bars", 0))
-        for c in stem_calls
-    )
-    to_start = float(window.get("to_song_time_start", 0.0))
-    crossfade_end_b = to_start + n_bars * sec_per_bar_b
-
-    out: list[dict] = []
-    for call in plan:
-        tool = call.get("tool")
-        if tool == "set_tempo_ramp":
-            start = float(call.get("start_time", 0.0))
-            if start < crossfade_end_b:
-                delta = crossfade_end_b - start
-                end = float(call.get("end_time", start)) + delta
-                end = min(end, b.duration)
-                # Guard against a degenerate (end <= start) ramp if the
-                # crossfade end lands past B's usable tail.
-                if end <= crossfade_end_b:
-                    end = b.duration
-                logger.info(
-                    "render_transition: deferred tempo ramp start %.2f -> %.2f "
-                    "(after crossfade end)",
-                    start, crossfade_end_b,
-                )
-                call = {**call, "start_time": crossfade_end_b, "end_time": end}
-        elif tool == "temporary_pitch_shift":
-            start = float(call.get("start_time", 0.0))
-            if start < crossfade_end_b:
-                logger.info(
-                    "render_transition: deferred pitch return start %.2f -> %.2f "
-                    "(after crossfade end)",
-                    start, crossfade_end_b,
-                )
-                call = {**call, "start_time": crossfade_end_b}
-        out.append(call)
-    return out
+# Back-compat aliases: tests and older callers import these from here.
+_enrich_sections = enrich_sections
+_max_seam_time = max_seam_time
+_validate_llm_plan = validate_plan
+_enforce_revert_after_crossfade = enforce_revert_after_crossfade
 
 
 def _to_bundle(analysis: Analysis, duration: float) -> AnalysisBundle:
@@ -325,6 +96,46 @@ def _stem_paths(stems: Stems) -> dict[str, str]:
         "bass": stems.bass_path,
         "other": stems.other_path,
     }
+
+
+def _bundle_to_legacy_llm_dict(
+    bundle: AnalysisBundle, energy_curve: list[float],
+    title: str, artist: str | None,
+) -> dict:
+    """v1 free-form prompt input — now carrying song identity too."""
+    sec_per_bar = (
+        round((60.0 / bundle.bpm) * bundle.time_signature, 3)
+        if bundle.bpm else 0.0
+    )
+    return {
+        "title": title,
+        "artist": artist,
+        "bpm": bundle.bpm,
+        "key": bundle.key,
+        "camelot_key": bundle.camelot_key,
+        "time_signature": bundle.time_signature,
+        "seconds_per_bar": sec_per_bar,
+        "duration": bundle.duration,
+        "sections": enrich_sections(bundle.sections, energy_curve),
+        "max_seam_time": max_seam_time(
+            bundle.duration, bundle.bpm, bundle.time_signature
+        ),
+    }
+
+
+_LEGACY_TOOLS_SCHEMA = json.dumps([
+    {"tool": "set_transition_window", "from_song_time_start": "float", "to_song_time_start": "float", "duration_bars": "int"},
+    {"tool": "crossfade_stem", "stem": "str", "from_song": "str", "to_song": "str", "start_bar": "int", "duration_bars": "int", "curve": "str", "a_fade_out_bars": "int (optional; bars over which A fades out, <= duration_bars; default duration_bars)"},
+    {"tool": "temporary_pitch_shift", "song": "str", "start_time": "float", "semitones": "float", "fade_in_bars": "int", "hold_bars": "int", "fade_out_bars": "int"},
+    {"tool": "set_tempo_ramp", "song": "str", "start_time": "float", "end_time": "float", "start_bpm": "float", "end_bpm": "float"},
+    {"tool": "filter_sweep", "song": "str", "type": "str (lowpass|highpass)", "start_time": "float", "end_time": "float", "start_cutoff_hz": "float", "end_cutoff_hz": "float"},
+    {"tool": "echo_out", "song": "str", "start_time": "float", "beats": "int", "feedback": "float (0..0.9)", "bpm": "float"},
+    {"tool": "loop_section", "song": "str", "start_time": "float", "beats": "float (may be fractional, e.g. 0.5/0.25, for rapid stutters)", "repeats": "int", "bpm": "float"},
+    {"tool": "swap_stem", "from_song": "str", "to_song": "str", "stem": "str (vocals|drums|bass|other)", "time": "float (output-timeline seconds)"},
+    {"tool": "apply_reverb", "song": "str", "start_time": "float", "tail_duration_bars": "float", "wet_level": "float (0..1)", "bpm": "float"},
+    {"tool": "turntable_stop", "song": "str", "start_time": "float", "duration_bars": "float", "bpm": "float"},
+    {"tool": "volume_fade", "song": "str", "start_time": "float", "duration_bars": "float", "start_gain": "float", "end_gain": "float", "bpm": "float", "stem": "str (optional: vocals|drums|bass|other)"},
+], indent=2)
 
 
 @celery_app.task(name="app.workers.render_transition.render_transition")
@@ -376,7 +187,7 @@ def render_transition(mix_plan_id: str) -> str | None:
             _mark_failed(plan_uuid, "missing analysis or stems")
             return None
 
-        # Fetch optional inputs for LLM planning
+        # Optional inputs for LLM planning.
         a_transcription = db.scalar(select(Transcription).where(Transcription.song_id == a.id))
         b_transcription = db.scalar(select(Transcription).where(Transcription.song_id == b.id))
         a_lyrics = db.scalar(select(Lyrics).where(Lyrics.song_id == a.id))
@@ -388,34 +199,31 @@ def render_transition(mix_plan_id: str) -> str | None:
         a_audio_key = a.audio_path
         b_audio_key = b.audio_path
 
-        # Capture vocal envelope paths to load via storage
+        # Song identity — the model knows real songs; let it use that.
+        a_title, a_artist = a.title, a.artist
+        b_title, b_artist = b.title, b.artist
+
         a_envelope_path = a_stems.vocal_envelope_path
         b_envelope_path = b_stems.vocal_envelope_path
 
-        # LLM-only inputs that don't ride through AnalysisBundle (which
-        # the executor consumes and intentionally stays narrow). Snapshot
-        # them here so the rest of the worker can stay session-free.
-        #
-        # `energy_curve` is sampled at 1Hz in the analyzer. We don't send
-        # the raw curve to the LLM (no timestamps → unusable); instead we
-        # average it per section in `_enrich_sections` so structure and
-        # energy arrive together.
+        # `energy_curve` is sampled at 1Hz in the analyzer; we average it
+        # per section so structure and energy arrive together.
         a_energy_curve = list(a_analysis.energy_curve or [])
         b_energy_curve = list(b_analysis.energy_curve or [])
-        # Per-word lyrics + raw Whisper segments + vocal_segments are
-        # deliberately NOT carried into the LLM input. Reasons:
-        #   - `vocal_safe_regions` already distills "where can/can't I
-        #     cut" from those signals; sending the raw text on top is
-        #     redundant and was the dominant cost in our prompts (we
-        #     hit Groq's 8K TPM limit at ~35K tokens).
-        #   - The LLM plans transitions, not lyric matching, so word-
-        #     level timestamps don't change its decisions.
-        # If a future phase wants lyrics for clever same-word vocal
-        # swaps, add a separate summary field (e.g. chorus hook lyric)
-        # — don't dump the full alignment.
 
-    import json
-    from app.services.vocal_safety.safety import vocal_safe_regions
+        # Set-level pass suggestion (soft), user pin (hard), reroll nonce.
+        style_hint = row.style_hint
+        style_override = row.style_override
+        reroll_nonce = row.reroll_nonce or 0
+
+        # Styles of this queue's other already-planned pairs, ordered, so
+        # the per-pair decision can avoid repeating the same trick.
+        siblings = db.scalars(
+            select(MixPlan).where(
+                MixPlan.queue_id == row.queue_id, MixPlan.id != row.id
+            )
+        ).all()
+        previous_styles = [s.style for s in siblings if s.style]
 
     async def _fetch_safe_regions(transcription, lyrics, envelope_path, duration):
         if not transcription or not envelope_path:
@@ -425,11 +233,11 @@ def render_transition(mix_plan_id: str) -> str | None:
             envelope = json.loads(envelope_data.decode("utf-8"))
         except Exception:
             return []
-        
+
         aligned_words = None
         if lyrics and lyrics.alignment_status == LyricsAlignmentStatus.success:
             aligned_words = lyrics.aligned_words
-            
+
         return vocal_safe_regions(
             transcription_segments=transcription.segments,
             envelope=envelope,
@@ -437,108 +245,105 @@ def render_transition(mix_plan_id: str) -> str | None:
             duration_seconds=duration or 0.0,
         )
 
-    def _bundle_to_llm_dict(bundle: AnalysisBundle, energy_curve) -> dict:
-        sec_per_bar = (
-            round((60.0 / bundle.bpm) * bundle.time_signature, 3)
-            if bundle.bpm else 0.0
-        )
-        return {
-            "bpm": bundle.bpm,
-            "key": bundle.key,
-            "camelot_key": bundle.camelot_key,
-            "time_signature": bundle.time_signature,
-            # Bar length so the LLM can convert section times <-> bars
-            # without us shipping the full downbeats array (which was
-            # ~40% of the prompt and pure noise).
-            "seconds_per_bar": sec_per_bar,
-            "duration": bundle.duration,
-            # Sections carry their normalized mean energy (see
-            # _enrich_sections) — this is the LLM's structural map.
-            "sections": _enrich_sections(bundle.sections, energy_curve),
-            # Latest seam time that leaves a full 16-bar crossfade +
-            # 5s safety buffer in the song. The LLM must keep its
-            # seam at or before this value; the validator rejects
-            # plans that violate it.
-            "max_seam_time": _max_seam_time(
-                bundle.duration, bundle.bpm, bundle.time_signature
-            ),
-        }
-
-    async def _build_plan() -> list[dict]:
+    async def _build_plan() -> PlanOutcome:
         if not settings.use_llm_planner:
-            return build_pair_plan(a_bundle, b_bundle)
+            return PlanOutcome(
+                plan=build_pair_plan(a_bundle, b_bundle),
+                source="deterministic", style=None, rationale=None,
+            )
 
-        a_regions = await _fetch_safe_regions(a_transcription, a_lyrics, a_envelope_path, a.duration_seconds)
-        b_regions = await _fetch_safe_regions(b_transcription, b_lyrics, b_envelope_path, b.duration_seconds)
+        a_regions = await _fetch_safe_regions(
+            a_transcription, a_lyrics, a_envelope_path, a_bundle.duration
+        )
+        b_regions = await _fetch_safe_regions(
+            b_transcription, b_lyrics, b_envelope_path, b_bundle.duration
+        )
+        provider = get_llm_provider()
 
+        if settings.planner_version == "v2":
+            return await build_plan_v2(
+                provider,
+                SongMeta(a_title, a_artist, a_bundle, a_energy_curve, a_regions),
+                SongMeta(b_title, b_artist, b_bundle, b_energy_curve, b_regions),
+                style_hint=style_hint,
+                style_override=style_override,
+                previous_styles=previous_styles,
+                nonce=reroll_nonce,
+            )
+
+        # ---- legacy free-form path, with repair-not-reject ----
         a_llm_input = {
-            "analysis": _bundle_to_llm_dict(a_bundle, a_energy_curve),
+            "analysis": _bundle_to_legacy_llm_dict(
+                a_bundle, a_energy_curve, a_title, a_artist
+            ),
             "vocal_safe_regions": a_regions,
         }
         b_llm_input = {
-            "analysis": _bundle_to_llm_dict(b_bundle, b_energy_curve),
+            "analysis": _bundle_to_legacy_llm_dict(
+                b_bundle, b_energy_curve, b_title, b_artist
+            ),
             "vocal_safe_regions": b_regions,
         }
-
-        # Provide tools schema definition to the LLM. `beat_grid` is
-        # intentionally omitted from per-song inputs — `downbeats` is
-        # enough for the LLM to reason about bars and avoids hundreds
-        # of redundant floats per prompt.
-        tools_schema = json.dumps([
-            {"tool": "set_transition_window", "from_song_time_start": "float", "to_song_time_start": "float", "duration_bars": "int"},
-            {"tool": "crossfade_stem", "stem": "str", "from_song": "str", "to_song": "str", "start_bar": "int", "duration_bars": "int", "curve": "str", "a_fade_out_bars": "int (optional; bars over which A fades out, <= duration_bars; default duration_bars)"},
-            {"tool": "pitch_shift", "song": "str", "semitones": "float"},
-            {"tool": "temporary_pitch_shift", "song": "str", "start_time": "float", "semitones": "float", "fade_in_bars": "int", "hold_bars": "int", "fade_out_bars": "int"},
-            {"tool": "set_tempo_ramp", "song": "str", "start_time": "float", "end_time": "float", "start_bpm": "float", "end_bpm": "float"},
-            {"tool": "filter_sweep", "song": "str", "type": "str (lowpass|highpass)", "start_time": "float", "end_time": "float", "start_cutoff_hz": "float", "end_cutoff_hz": "float"},
-            {"tool": "echo_out", "song": "str", "start_time": "float", "beats": "int", "feedback": "float (0..0.9)", "bpm": "float"},
-            {"tool": "loop_section", "song": "str", "start_time": "float", "beats": "float (may be fractional, e.g. 0.5/0.25, for rapid stutters)", "repeats": "int", "bpm": "float"},
-            {"tool": "swap_stem", "from_song": "str", "to_song": "str", "stem": "str (vocals|drums|bass|other)", "time": "float (output-timeline seconds)"},
-            {"tool": "apply_reverb", "song": "str", "start_time": "float", "tail_duration_bars": "float", "wet_level": "float (0..1)", "bpm": "float"},
-            {"tool": "turntable_stop", "song": "str", "start_time": "float", "duration_bars": "float", "bpm": "float"},
-            {"tool": "volume_fade", "song": "str", "start_time": "float", "duration_bars": "float", "start_gain": "float", "end_gain": "float", "bpm": "float", "stem": "str (optional: vocals|drums|bass|other — restrict the fade to one stem; omit to fade the whole song)"},
-        ], indent=2)
-
-        provider = get_llm_provider()
         try:
-            plan = await provider.plan_transition(a_llm_input, b_llm_input, tools_schema)
-            _validate_llm_plan(plan)
-            _validate_seam_headroom(plan, a_bundle, b_bundle)
-            return _clamp_pitch_shifts(plan)
+            plan = await provider.plan_transition(
+                a_llm_input, b_llm_input, _LEGACY_TOOLS_SCHEMA
+            )
+            repaired = repair_plan(plan, a_bundle, b_bundle)
+            validate_plan(repaired)
+            source = "llm_legacy" if repaired == plan else "llm_legacy_repaired"
+            return PlanOutcome(plan=repaired, source=source, style=None, rationale=None)
         except Exception as exc:
-            logger.error("render_transition: LLM planner failed, falling back to deterministic: %s", exc)
-            return build_pair_plan(a_bundle, b_bundle)
-            
-    plan_json = existing_plan_json or asyncio.run(_build_plan())
-    # Guarantee B's tempo/pitch revert only fires once the crossfade is done,
-    # whatever the source of the plan (fresh LLM, cached, or deterministic).
-    plan_json = _enforce_revert_after_crossfade(plan_json, b_bundle)
+            logger.error(
+                "render_transition: legacy LLM planner failed, falling back "
+                "to deterministic: %s", exc,
+            )
+            return PlanOutcome(
+                plan=build_pair_plan(a_bundle, b_bundle),
+                source="deterministic_fallback", style=None, rationale=None,
+            )
 
-    import tempfile
-    from pathlib import Path
+    if existing_plan_json:
+        outcome = PlanOutcome(
+            plan=existing_plan_json, source="cached", style=None, rationale=None
+        )
+    else:
+        outcome = asyncio.run(_build_plan())
+        logger.info(
+            "render_transition: %s plan source=%s style=%s",
+            mix_plan_id, outcome.source, outcome.style,
+        )
+
+    # Guarantee B's tempo/pitch revert only fires once the crossfade is
+    # done, whatever the source of the plan (fresh, cached, or fallback).
+    plan_json = enforce_revert_after_crossfade(outcome.plan, b_bundle)
 
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
-        
-        async def _download_stems(stems: Stems, prefix: str):
-            paths = {}
-            for k, key in _stem_paths(stems).items():
-                dest = tmp / f"{prefix}_{k}.wav"
+
+        async def _download_inputs():
+            async def _stems(stems: Stems, prefix: str):
+                paths = {}
+                for k, key in _stem_paths(stems).items():
+                    dest = tmp / f"{prefix}_{k}.wav"
+                    await storage.download_file(key, dest)
+                    paths[k] = str(dest)
+                return paths
+
+            async def _original(key: str | None, prefix: str) -> str | None:
+                if not key:
+                    return None
+                dest = tmp / f"{prefix}_original.wav"
                 await storage.download_file(key, dest)
-                paths[k] = str(dest)
-            return paths
+                return str(dest)
 
-        async def _download_original(key: str | None, prefix: str) -> str | None:
-            if not key:
-                return None
-            dest = tmp / f"{prefix}_original.wav"
-            await storage.download_file(key, dest)
-            return str(dest)
+            return (
+                await _stems(a_stems, "a"),
+                await _stems(b_stems, "b"),
+                await _original(a_audio_key, "a"),
+                await _original(b_audio_key, "b"),
+            )
 
-        a_paths = asyncio.run(_download_stems(a_stems, "a"))
-        b_paths = asyncio.run(_download_stems(b_stems, "b"))
-        a_orig = asyncio.run(_download_original(a_audio_key, "a"))
-        b_orig = asyncio.run(_download_original(b_audio_key, "b"))
+        a_paths, b_paths, a_orig, b_orig = asyncio.run(_download_inputs())
 
         a_inputs = SongRenderInputs(
             stem_paths=a_paths, analysis=a_bundle, original_audio_path=a_orig
@@ -566,6 +371,10 @@ def render_transition(mix_plan_id: str) -> str | None:
         row.rendered_audio_path = key
         row.status = MixPlanStatus.ready
         row.error_text = None
+        if outcome.source != "cached":
+            row.plan_source = outcome.source
+            row.style = outcome.style
+            row.rationale = outcome.rationale
         db.commit()
     return mix_plan_id
 
