@@ -70,7 +70,10 @@ async def test_gemini_provider_non_list_raises():
             provider = GeminiProvider(api_key="fake")
             with pytest.raises(ValueError, match="Expected JSON object with"):
                 await provider.plan_transition({}, {}, "Tools desc")
-            mock_storage.write.assert_not_called()
+            # Valid-but-wrong-shape JSON IS cached (it is the model's real
+            # answer; planner-level repair can still salvage it from cache).
+            # Only undecodable JSON is kept out of the cache.
+            mock_storage.write.assert_called_once()
 
 
 @pytest.mark.asyncio
@@ -105,4 +108,7 @@ async def test_gemini_provider_generation():
             assert written_key.startswith("mix_plan_logs/")
             written_bytes = mock_storage.write.call_args[0][1]
             written_data = json.loads(written_bytes.decode("utf-8"))
-            assert written_data["response"] == dummy_plan
+            # The shared base caches the RAW model response (the {"plan": ...}
+            # wrapper), not the unwrapped list — complete_json() is generic
+            # and the unwrap happens a layer above.
+            assert written_data["response"] == {"plan": dummy_plan}

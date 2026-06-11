@@ -62,7 +62,10 @@ async def test_do_provider_generation_unwraps_plan_key():
             written_key = mock_storage.write.call_args[0][0]
             assert written_key.startswith("mix_plan_logs/")
             written_data = json.loads(mock_storage.write.call_args[0][1].decode("utf-8"))
-            assert written_data["response"] == dummy_plan
+            # The shared base caches the RAW model response (the {"plan": ...}
+            # wrapper), not the unwrapped list — complete_json() is generic
+            # and the unwrap happens a layer above.
+            assert written_data["response"] == {"plan": dummy_plan}
             assert written_data["model"] == DEFAULT_MODEL
 
 
@@ -146,4 +149,7 @@ async def test_do_provider_unexpected_shape_raises():
             provider = DigitalOceanProvider(api_key="fake")
             with pytest.raises(ValueError, match="Expected JSON object with"):
                 await provider.plan_transition({}, {}, "Tools desc")
-            mock_storage.write.assert_not_called()
+            # Valid-but-wrong-shape JSON IS cached (it is the model's real
+            # answer; planner-level repair can still salvage it from cache).
+            # Only undecodable JSON is kept out of the cache.
+            mock_storage.write.assert_called_once()

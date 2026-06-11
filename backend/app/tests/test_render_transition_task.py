@@ -225,13 +225,16 @@ def test_enrich_sections_helper():
     # 1 Hz energy curve: 0-10s quiet, 10-20s loud.
     curve = [0.1] * 10 + [0.8] * 10
     sections = [
-        {"start": 0.0, "end": 10.0, "label": "intro"},
+        {"start": 0.0, "end": 10.0, "label": "section_0"},
         {"start": 10.0, "end": 20.0, "label": "drop"},
     ]
     out = _enrich_sections(sections, curve)
     assert out[0]["energy"] == round(0.1 / 0.8, 2)  # quiet section, relative
     assert out[1]["energy"] == 1.0  # hottest section normalizes to 1.0
-    assert "label" not in out[0]  # opaque cluster id dropped
+    # Opaque librosa cluster ids ("section_N") are dropped; meaningful
+    # labels (e.g. from the allin1 detector) are kept for the planner.
+    assert "label" not in out[0]
+    assert out[1]["label"] == "drop"
     assert _enrich_sections([], curve) == []
 
 
@@ -390,6 +393,7 @@ def test_render_transition_llm_planner(pair_with_plan):
         patch("app.workers.render_transition.get_storage", return_value=storage),
         patch("app.workers.render_transition.get_llm_provider", return_value=mock_llm_provider),
         patch("app.workers.render_transition.settings.use_llm_planner", True),
+        patch("app.workers.render_transition.settings.planner_version", "legacy"),
     ):
         from app.workers.render_transition import render_transition
         result = render_transition(pair_with_plan["plan_id"])
@@ -438,6 +442,7 @@ def test_render_transition_llm_planner_fallback(pair_with_plan):
         patch("app.workers.render_transition.get_storage", return_value=storage),
         patch("app.workers.render_transition.get_llm_provider", return_value=mock_llm_provider),
         patch("app.workers.render_transition.settings.use_llm_planner", True),
+        patch("app.workers.render_transition.settings.planner_version", "legacy"),
         patch("app.workers.render_transition.build_pair_plan") as mock_fallback,
     ):
         fallback_plan = _valid_plan()
@@ -454,9 +459,10 @@ def test_render_transition_llm_planner_fallback(pair_with_plan):
 
 
 def test_render_transition_llm_invalid_plan_falls_back(pair_with_plan):
-    """LLM returns a plan that won't pass shape validation (missing stem
-    calls). The worker must fall back to the deterministic planner
-    instead of letting the executor blow up mid-render."""
+    """LLM returns a plan missing 2 of 4 stem calls. Repair-not-reject:
+    the missing crossfade_stem calls are synthesized from the ones
+    present, the (repaired) LLM plan is persisted, and the deterministic
+    fallback is NOT used."""
     storage = AsyncMock()
     async def _write(key, data):
         return f"/abs/{key}"
@@ -481,6 +487,7 @@ def test_render_transition_llm_invalid_plan_falls_back(pair_with_plan):
         patch("app.workers.render_transition.get_storage", return_value=storage),
         patch("app.workers.render_transition.get_llm_provider", return_value=mock_llm_provider),
         patch("app.workers.render_transition.settings.use_llm_planner", True),
+        patch("app.workers.render_transition.settings.planner_version", "legacy"),
         patch("app.workers.render_transition.build_pair_plan") as mock_fallback,
     ):
         fallback_plan = _valid_plan()
@@ -489,10 +496,13 @@ def test_render_transition_llm_invalid_plan_falls_back(pair_with_plan):
         result = render_transition(pair_with_plan["plan_id"])
 
     assert result == pair_with_plan["plan_id"]
-    mock_fallback.assert_called_once()
+    mock_fallback.assert_not_called()  # repaired, not replaced
     with SessionLocal() as db:
         row = db.get(MixPlan, uuid.UUID(pair_with_plan["plan_id"]))
-        assert row.plan_json == fallback_plan
+        stems = {c["stem"] for c in row.plan_json
+                 if c["tool"] == "crossfade_stem"}
+        assert stems == {"vocals", "drums", "bass", "other"}
+        assert row.plan_source == "llm_legacy_repaired"
 
 
 def test_max_seam_time_helper():
@@ -508,9 +518,9 @@ def test_max_seam_time_helper():
 
 
 def test_render_transition_rejects_seam_without_headroom(pair_with_plan):
-    """LLM picks a seam too close to A's end so the executor would clamp
-    the crossfade to ~nothing. Validator rejects → deterministic
-    fallback gets persisted instead."""
+    """LLM picks a seam too close to A's end. Repair-not-reject: the seam
+    is clamped to the latest downbeat inside the headroom budget and the
+    repaired LLM plan is persisted — no deterministic fallback."""
     storage = AsyncMock()
     async def _write(key, data):
         return f"/abs/{key}"
@@ -536,6 +546,7 @@ def test_render_transition_rejects_seam_without_headroom(pair_with_plan):
         patch("app.workers.render_transition.get_storage", return_value=storage),
         patch("app.workers.render_transition.get_llm_provider", return_value=mock_llm_provider),
         patch("app.workers.render_transition.settings.use_llm_planner", True),
+        patch("app.workers.render_transition.settings.planner_version", "legacy"),
         patch("app.workers.render_transition.build_pair_plan") as mock_fallback,
     ):
         fallback_plan = _valid_plan()
@@ -544,15 +555,20 @@ def test_render_transition_rejects_seam_without_headroom(pair_with_plan):
         result = render_transition(pair_with_plan["plan_id"])
 
     assert result == pair_with_plan["plan_id"]
-    mock_fallback.assert_called_once()
+    mock_fallback.assert_not_called()  # repaired, not replaced
     with SessionLocal() as db:
         row = db.get(MixPlan, uuid.UUID(pair_with_plan["plan_id"]))
-        assert row.plan_json == fallback_plan
+        window = row.plan_json[0]
+        assert window["tool"] == "set_transition_window"
+        # max_seam_time = 180 - 16*2 - 5 = 143s; 170s clamps down to it.
+        assert window["from_song_time_start"] <= 143.0
+        assert row.plan_source == "llm_legacy_repaired"
 
 
 def test_render_transition_rejects_wrong_song_refs(pair_with_plan):
-    """LLM uses 'Song A'/'Song B' instead of 'A'/'B' — validator rejects
-    and falls back to the deterministic planner."""
+    """LLM uses 'Song A'/'Song B' instead of 'A'/'B'. Repair-not-reject:
+    the refs are normalized in place and the repaired LLM plan is
+    persisted — no deterministic fallback."""
     storage = AsyncMock()
     async def _write(key, data):
         return f"/abs/{key}"
@@ -577,6 +593,7 @@ def test_render_transition_rejects_wrong_song_refs(pair_with_plan):
         patch("app.workers.render_transition.get_storage", return_value=storage),
         patch("app.workers.render_transition.get_llm_provider", return_value=mock_llm_provider),
         patch("app.workers.render_transition.settings.use_llm_planner", True),
+        patch("app.workers.render_transition.settings.planner_version", "legacy"),
         patch("app.workers.render_transition.build_pair_plan") as mock_fallback,
     ):
         mock_fallback.return_value = _valid_plan()
@@ -584,15 +601,16 @@ def test_render_transition_rejects_wrong_song_refs(pair_with_plan):
         result = render_transition(pair_with_plan["plan_id"])
 
     assert result == pair_with_plan["plan_id"]
-    mock_fallback.assert_called_once()
+    mock_fallback.assert_not_called()  # repaired, not replaced
     with SessionLocal() as db:
         row = db.get(MixPlan, uuid.UUID(pair_with_plan["plan_id"]))
-        # Persisted plan is the deterministic fallback, not the bad LLM one.
+        # Persisted plan is the LLM's, with refs normalized to 'A'/'B'.
         assert all(
             c.get("from_song", "A") == "A" and c.get("to_song", "B") == "B"
             for c in row.plan_json
             if c.get("tool") == "crossfade_stem"
         )
+        assert row.plan_source == "llm_legacy_repaired"
 
 
 def test_validate_llm_plan_accepts_per_stem_envelopes():
@@ -645,6 +663,7 @@ def test_render_transition_accepts_per_stem_envelope_plan(pair_with_plan):
         patch("app.workers.render_transition.get_storage", return_value=storage),
         patch("app.workers.render_transition.get_llm_provider", return_value=mock_llm_provider),
         patch("app.workers.render_transition.settings.use_llm_planner", True),
+        patch("app.workers.render_transition.settings.planner_version", "legacy"),
         patch("app.workers.render_transition.build_pair_plan") as mock_fallback,
     ):
         from app.workers.render_transition import render_transition
@@ -660,7 +679,11 @@ def test_render_transition_accepts_per_stem_envelope_plan(pair_with_plan):
 def test_render_transition_rejects_llm_permanent_pitch_shift(pair_with_plan):
     """LLM emits a permanent pitch_shift; validation rejects it (it would
     break the next stitch junction) and the worker falls back to the
-    deterministic planner, whose plan carries no permanent pitch_shift."""
+    deterministic planner, whose plan carries no permanent pitch_shift.
+
+    UPDATED for repair-not-reject: the permanent pitch_shift is now
+    CONVERTED into the temporary equivalent (clamped to ±2 semitones)
+    instead of discarding the whole plan."""
     storage = AsyncMock()
     async def _write(key, data):
         return f"/abs/{key}"
@@ -677,6 +700,7 @@ def test_render_transition_rejects_llm_permanent_pitch_shift(pair_with_plan):
         patch("app.workers.render_transition.get_storage", return_value=storage),
         patch("app.workers.render_transition.get_llm_provider", return_value=mock_llm_provider),
         patch("app.workers.render_transition.settings.use_llm_planner", True),
+        patch("app.workers.render_transition.settings.planner_version", "legacy"),
         patch(
             "app.workers.render_transition.build_pair_plan",
             return_value=_valid_plan(),
@@ -686,8 +710,13 @@ def test_render_transition_rejects_llm_permanent_pitch_shift(pair_with_plan):
         result = render_transition(pair_with_plan["plan_id"])
 
     assert result == pair_with_plan["plan_id"]
-    mock_fallback.assert_called_once()  # permanent pitch_shift → deterministic fallback
+    mock_fallback.assert_not_called()  # converted, not replaced
     with SessionLocal() as db:
         row = db.get(MixPlan, uuid.UUID(pair_with_plan["plan_id"]))
         pitch_calls = [c for c in row.plan_json if c["tool"] == "pitch_shift"]
         assert pitch_calls == []  # no permanent pitch_shift survives
+        temp = [c for c in row.plan_json
+                if c["tool"] == "temporary_pitch_shift"]
+        assert len(temp) == 1
+        assert temp[0]["semitones"] == 2  # 5 clamped to the ±2 cap
+        assert row.plan_source == "llm_legacy_repaired"
