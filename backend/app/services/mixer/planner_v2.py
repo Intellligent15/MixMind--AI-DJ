@@ -148,6 +148,7 @@ async def build_plan_v2(
     style_hint: str | None = None,
     style_override: str | None = None,
     previous_styles: list[str] | None = None,
+    pair_label: str | None = None,
     nonce: int = 0,
 ) -> PlanOutcome:
     # Lazy import keeps the mixer package importable without the llm
@@ -191,6 +192,10 @@ async def build_plan_v2(
         context["suggested_style"] = style_hint
     if previous_styles:
         context["styles_used_so_far"] = previous_styles
+    if pair_label:
+        # e.g. "transition 3 of 5" — lets the model shape the set's arc
+        # (open gently, peak in the middle, land the closer).
+        context["position_in_set"] = pair_label
 
     user = decision_user_prompt(
         _song_llm_input(a, candidates.out_candidates),

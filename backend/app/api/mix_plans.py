@@ -11,6 +11,8 @@ from app.models import (
     MixPlan,
     MixPlanStatus,
     Queue,
+    QueueRender,
+    QueueRenderStatus,
     Song,
     SongStatus,
 )
@@ -205,6 +207,19 @@ def reroll_mix_plan(
         raise HTTPException(status_code=404, detail="mix plan not found")
     if row.status == MixPlanStatus.rendering:
         raise HTTPException(status_code=409, detail="mix plan is rendering")
+
+    # Refuse while the queue-level stitch is mid-flight: re-rolling would
+    # reset the QueueRender row and fire a second chord, and the two
+    # stitches could interleave (the in-flight one may read this pair's
+    # OLD wav). Let the current stitch land first, then re-roll.
+    queue_render = db.scalar(
+        select(QueueRender).where(QueueRender.queue_id == row.queue_id)
+    )
+    if queue_render is not None and queue_render.status == QueueRenderStatus.rendering:
+        raise HTTPException(
+            status_code=409,
+            detail="queue mix is being stitched; re-roll when it finishes",
+        )
 
     style = body.style if body else None
     if style in (None, "", "auto"):

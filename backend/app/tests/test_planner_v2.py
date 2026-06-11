@@ -374,3 +374,14 @@ def test_planner_v2_passes_nonce_and_context():
     assert call["nonce"] == 3
     assert "wash_out" in call["user"]
     assert "drop_swap" in call["user"]
+
+
+def test_planner_v2_passes_set_position():
+    a, b = _metas()
+    provider = StubProvider(response={
+        "out": "A1", "in": "B1", "style": "smooth_blend", "duration_bars": 16,
+    })
+    asyncio.run(build_plan_v2(
+        provider, a, b, pair_label="transition 2 of 4",
+    ))
+    assert "transition 2 of 4" in provider.calls[0]["user"]

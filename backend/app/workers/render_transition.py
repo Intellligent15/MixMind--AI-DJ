@@ -40,6 +40,7 @@ from app.models import (
     Analysis,
     MixPlan,
     MixPlanStatus,
+    QueueItem,
     Song,
     SongStatus,
     Stems,
@@ -216,14 +217,34 @@ def render_transition(mix_plan_id: str) -> str | None:
         style_override = row.style_override
         reroll_nonce = row.reroll_nonce or 0
 
-        # Styles of this queue's other already-planned pairs, ordered, so
-        # the per-pair decision can avoid repeating the same trick.
-        siblings = db.scalars(
-            select(MixPlan).where(
-                MixPlan.queue_id == row.queue_id, MixPlan.id != row.id
+        # Styles of this queue's other already-planned pairs, in QUEUE
+        # ORDER, so the per-pair decision can avoid repeating the same
+        # trick. The explicit sort matters twice over: the model reads the
+        # set's history in playback order, and the list is part of the LLM
+        # cache key — an unordered query would hash differently from run
+        # to run and cause spurious cache misses.
+        positions = {
+            it.song_id: it.position
+            for it in db.scalars(
+                select(QueueItem).where(QueueItem.queue_id == row.queue_id)
             )
-        ).all()
+        }
+        siblings = sorted(
+            db.scalars(
+                select(MixPlan).where(
+                    MixPlan.queue_id == row.queue_id, MixPlan.id != row.id
+                )
+            ).all(),
+            key=lambda s: positions.get(s.from_song_id, 1_000_000),
+        )
         previous_styles = [s.style for s in siblings if s.style]
+        # 1-based "transition N of M" label for the set context.
+        n_pairs = max(len(positions) - 1, 1)
+        this_pos = positions.get(row.from_song_id)
+        pair_label = (
+            f"transition {this_pos + 1} of {n_pairs}"
+            if this_pos is not None else None
+        )
 
     async def _fetch_safe_regions(transcription, lyrics, envelope_path, duration):
         if not transcription or not envelope_path:
@@ -268,6 +289,7 @@ def render_transition(mix_plan_id: str) -> str | None:
                 style_hint=style_hint,
                 style_override=style_override,
                 previous_styles=previous_styles,
+                pair_label=pair_label,
                 nonce=reroll_nonce,
             )
 
