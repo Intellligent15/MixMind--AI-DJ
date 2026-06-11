@@ -216,6 +216,48 @@ class AnalysisService:
     def analyze(self, audio_path: Path) -> AnalysisResult:
         y, sr = librosa.load(str(audio_path), sr=ANALYSIS_SR, mono=True)
 
+        # Optional neural path: when section_detector="allin1" (and the
+        # package is installed), the All-In-One model supplies bpm, beats,
+        # downbeats, AND functionally-labeled sections in one pass. Key
+        # detection and the energy curve still come from the librosa code
+        # below (allin1 doesn't predict key). Any failure falls through to
+        # the full librosa pipeline.
+        neural = None
+        from app.core.config import settings as _settings
+
+        if _settings.section_detector == "allin1":
+            from app.services.analysis.allin1_source import analyze_with_allin1
+
+            neural = analyze_with_allin1(audio_path)
+            if neural is not None:
+                logger.info(
+                    "analysis: using allin1 for %s (bpm=%.1f, %d sections)",
+                    audio_path, neural.bpm, len(neural.sections),
+                )
+                y_harmonic = librosa.effects.harmonic(y)
+                chroma = librosa.feature.chroma_cens(y=y_harmonic, sr=sr)
+                rms = librosa.feature.rms(y=y_harmonic)[0]
+                n = min(rms.shape[0], chroma.shape[1])
+                weights = rms[:n] / (rms[:n].sum() + 1e-9)
+                chroma_weighted = (chroma[:, :n] * weights[None, :]).sum(axis=1)
+                key_name, camelot = detect_key(chroma_weighted)
+                from app.services.analysis.sections.base import Section as _Sec
+
+                return AnalysisResult(
+                    bpm=neural.bpm,
+                    key=key_name,
+                    camelot_key=camelot,
+                    time_signature=TIME_SIGNATURE,
+                    beat_grid=neural.beats,
+                    downbeats=neural.downbeats,
+                    sections=[
+                        _Sec(s["start"], s["end"], s["label"])
+                        for s in neural.sections
+                    ],
+                    energy_curve=_rms_at_1hz(y, sr),
+                    vocal_segments=[],
+                )
+
         # Compute the onset envelope once and reuse it for beat_track,
         # tempo octave correction, and downbeat phase search.
         onset_env = librosa.onset.onset_strength(y=y, sr=sr)

@@ -74,3 +74,9 @@ target-version = "py311"
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["app/tests"]
+
+[project.optional-dependencies]
+# Neural structure analysis (real verse/chorus labels + joint beat/downbeat
+# tracking). Heavy: pulls torch + natten. GPU strongly recommended.
+# Enable with SECTION_DETECTOR=allin1.
+pro-analysis = ["allin1>=1.1.0"]
