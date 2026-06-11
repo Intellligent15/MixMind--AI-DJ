@@ -27,7 +27,7 @@ from __future__ import annotations
 import logging
 import uuid
 
-from celery import chord
+from celery import chain, chord
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -46,6 +46,7 @@ logger = logging.getLogger(__name__)
 
 RENDER_TASK = "app.workers.render_transition.render_transition"
 STITCH_TASK = "app.workers.stitch_queue.stitch_queue"
+PLAN_SET_TASK = "app.workers.plan_set.plan_set"
 
 # Render-row states that mean "a stitch is already in flight or done."
 # The eager path must not re-dispatch while the row sits here, otherwise a
@@ -76,7 +77,14 @@ def _dispatch_chord(queue_id: uuid.UUID, db: Session) -> None:
         STITCH_TASK, args=[str(queue_id)], immutable=True
     )
     if render_tasks:
-        chord(render_tasks)(stitch_sig)
+        # Set-level pass first (one LLM call assigning each pair a style
+        # hint), then the per-pair renders, then the stitch. plan_set is
+        # failure-tolerant — on any error it logs and returns, and the
+        # renders proceed without hints.
+        plan_set_sig = celery_app.signature(
+            PLAN_SET_TASK, args=[str(queue_id)], immutable=True
+        )
+        chain(plan_set_sig, chord(render_tasks, stitch_sig)).delay()
     else:
         stitch_sig.delay()
 

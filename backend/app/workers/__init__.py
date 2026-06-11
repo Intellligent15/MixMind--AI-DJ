@@ -22,6 +22,7 @@ celery_app = Celery(
         "app.workers.analyze",
         "app.workers.separate",
         "app.workers.transcribe",
+        "app.workers.plan_set",
         "app.workers.render_transition",
         "app.workers.stitch_queue",
         "app.workers.fetch_lyrics",
